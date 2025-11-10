@@ -209,43 +209,48 @@ def find_pdf_for_archivo_and_period(archivo_norm: str, period_label: str) -> Opt
     """
     Dado el CUIL (archivo_norm) y un período 'mm/aaaa',
     devuelve el fileId del PDF en Drive para ese período, o None si no existe.
+
+    En vez de asumir nombre exacto de carpeta, busca todos los PDFs con ese nombre
+    y se queda con el que esté en una carpeta cuyo nombre mapee a ese período
+    vía period_folder_to_label.
     """
     service = build_drive_service()
 
     filename = f"{archivo_norm}.pdf"
-    folder_name = period_label_to_folder(period_label)
 
-    # Buscamos la carpeta del período bajo la raíz
-    res = service.files().list(
-        q=(
-            f"name = '{folder_name}' and mimeType = 'application/vnd.google-apps.folder' "
-            f"and '{DRIVE_RECIBOS_ROOT_ID}' in parents and trashed = false"
-        ),
-        fields="files(id, name)",
-        pageSize=10,
+    # Buscamos todos los archivos con ese nombre en todo el Drive
+    results = service.files().list(
+        q=f"name = '{filename}' and mimeType = 'application/pdf' and trashed = false",
+        fields="files(id, name, parents)",
+        pageSize=1000,
     ).execute()
 
-    folders = res.get("files", [])
-    if not folders:
-        return None
+    files = results.get("files", [])
 
-    folder_id = folders[0]["id"]
+    print("DEBUG find_pdf_for_archivo_and_period")
+    print("  archivo_norm:", archivo_norm)
+    print("  period_label buscado:", period_label)
+    print("  cantidad de archivos encontrados:", len(files))
 
-    # Buscamos el archivo dentro de esa carpeta
-    res_files = service.files().list(
-        q=(
-            f"name = '{filename}' and mimeType = 'application/pdf' "
-            f"and '{folder_id}' in parents and trashed = false"
-        ),
-        fields="files(id, name)",
-        pageSize=10,
-    ).execute()
+    for f in files:
+        parents = f.get("parents", [])
+        if not parents:
+            continue
+        parent_id = parents[0]
+        folder = service.files().get(
+            fileId=parent_id,
+            fields="id, name, parents",
+        ).execute()
+        folder_name = folder.get("name", "")
+        label = period_folder_to_label(folder_name)
+        print("   - file:", f.get("id"), f.get("name"),
+              "| carpeta:", folder_name, "| label:", label)
+        if label == period_label:
+            print("  -> match encontrado, devolviendo file_id:", f.get("id"))
+            return f.get("id")
 
-    pdfs = res_files.get("files", [])
-    if not pdfs:
-        return None
-
-    return pdfs[0]["id"]
+    print("  -> no se encontró PDF para ese período")
+    return None
 
 
 def build_drive_public_link(file_id: str) -> str:
