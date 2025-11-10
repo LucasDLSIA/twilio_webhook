@@ -45,18 +45,27 @@ SESSIONS: Dict[str, Dict] = {}
 
 def normalize_phone(whatsapp_from: str) -> str:
     """
-    Recibe algo tipo 'whatsapp:+54911....' o '+54 9 11 ...'
-    y devuelve un número E.164 prolijo, idealmente +549...
-    (acá podés ajustar a la lógica que ya tenías).
+    Normaliza el teléfono que viene de Twilio a la misma forma que usamos en el Excel:
+    últimos 10 dígitos.
     """
-    # quitar prefijo "whatsapp:"
-    num = whatsapp_from.replace("whatsapp:", "")
-    # sacar espacios, guiones, paréntesis
-    num = re.sub(r"[^\d+]", "", num)
+    return canonicalize_phone(whatsapp_from)
 
-    # si ya viene con +54, asumimos que está bien
-    # (podés hacer la lógica de agregar el 9 si falta, etc.)
-    return num
+
+def canonicalize_phone(num: str) -> str:
+    """
+    Deja el teléfono en un formato comparable:
+    - Saca todo lo que no sea dígito.
+    - Se queda con los últimos 10 dígitos (ej: 11XXXXXXXX).
+    """
+    if not num:
+        return ""
+    num = str(num)
+    num = num.replace("whatsapp:", "")
+    # Solo dígitos
+    digits = re.sub(r"\D", "", num)
+    # Nos quedamos con los últimos 10 (si tiene menos, devuelve lo que haya)
+    return digits[-10:] if len(digits) > 10 else digits
+
 
 
 def build_drive_service():
@@ -94,9 +103,8 @@ def download_envios_excel() -> pd.DataFrame:
         raise ValueError("El Excel de envíos debe tener columnas 'telefono' y 'archivo'")
 
     # Normalizamos teléfono
-    df["telefono_norm"] = df["telefono"].astype(str).apply(
-        lambda t: re.sub(r"[^\d+]", "", t)
-    )
+    df["telefono_norm"] = df["telefono"].apply(canonicalize_phone)
+
 
     # Normalizamos archivo (CUIL sin .pdf)
     df["archivo_norm"] = df["archivo"].astype(str).str.strip()
@@ -185,6 +193,15 @@ def list_periods_for_archivo(archivo_norm: str) -> List[str]:
 
     # Ordenamos de más nuevo a más viejo
     ordered = sorted(list(periods), key=period_sort_key, reverse=True)
+
+    print("DEBUG list_periods_for_archivo")
+    print("  archivo_norm:", archivo_norm)
+    print("  filename buscado:", filename)
+    print("  cantidad de archivos encontrados:", len(files))
+    for f in files:
+        print("   - file:", f.get("id"), f.get("name"), "parents:", f.get("parents"))
+    print("  periods detectados:", periods)
+
     return ordered
 
 
@@ -339,6 +356,17 @@ def handle_view_current(telefono_whatsapp: str) -> Response:
     envios_df = download_envios_excel()
 
     archivo_norm = get_archivo_for_phone(telefono_norm, envios_df)
+
+    print("DEBUG handle_show_periods_menu")
+    print("  telefono_whatsapp:", telefono_whatsapp)
+    print("  telefono_norm:", telefono_norm)
+    try:
+        print("  Primeras filas de envios_df (telefono, telefono_norm, archivo_norm):")
+        print(envios_df[["telefono", "telefono_norm", "archivo_norm"]].head(20))
+    except Exception as e:
+        print("  Error mostrando envios_df:", e)
+    print("  archivo_norm encontrado:", archivo_norm)
+
     if not archivo_norm:
         # No hay registro para este teléfono en el Excel
         # En Camino A decidiste NO responder nada
