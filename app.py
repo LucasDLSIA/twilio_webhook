@@ -292,11 +292,18 @@ def twiml_message(text: str) -> Response:
 
 def twiml_message_with_link(text: str, link: str) -> Response:
     """
-    Devuelve un Response con TwiML <Message> que incluye el link.
-    (Se puede cambiar por Media si después querés adjuntar el PDF como MediaUrl)
+    Envía un mensaje de WhatsApp con texto + PDF adjunto (Media).
+    Twilio va a obtener el archivo desde `link`, así que
+    el archivo de Drive debe estar compartido como 'cualquiera con el enlace'.
     """
-    full_text = f"{text}\n{link}"
-    return twiml_message(full_text)
+    twiml = f"""<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+    <Message>
+        <Body>{text}</Body>
+        <Media>{link}</Media>
+    </Message>
+</Response>"""
+    return Response(twiml, mimetype="text/xml")
 
 
 def send_period_menu_via_text(
