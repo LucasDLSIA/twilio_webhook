@@ -36,6 +36,10 @@ TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
 TWILIO_WHATSAPP_FROM = os.getenv("TWILIO_WHATSAPP_FROM")
 
 PERIODO_ACTUAL = os.getenv("PERIODO_ACTUAL")
+# === Plantilla WhatsApp ===
+TWILIO_CONTENT_SID   = os.getenv("TWILIO_TEMPLATE_SID")  # Content SID de tu plantilla (HX...)
+STATUS_CALLBACK_URL  = os.getenv("STATUS_CALLBACK_URL", f"{os.getenv('PUBLIC_BASE_URL','https://twilio-webhook-lddc.onrender.com').rstrip('/')}/twilio/status")
+
 
 twilio_client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
 
@@ -70,6 +74,7 @@ def canonicalize_phone(num: str) -> str:
     # Nos quedamos con los últimos 10 (si tiene menos, devuelve lo que haya)
     return digits[-10:] if len(digits) > 10 else digits
 
+
 def ensure_anyone_reader(file_id: str) -> None:
     """Se asegura de que el file sea accesible públicamente por link."""
     service = build_drive_service()
@@ -80,6 +85,7 @@ def ensure_anyone_reader(file_id: str) -> None:
         ).execute()
     except Exception as e:
         print("WARN ensure_anyone_reader:", e)
+
 
 def get_drive_download_url(file_id: str) -> str:
     """
@@ -311,6 +317,36 @@ def find_pdf_for_archivo_and_period(archivo_norm: str, period_label: str) -> Opt
     return None
 
 
+def norm_period_label(s: str) -> str:
+    """
+    Normaliza un período a 'mm/aaaa'. Acepta 'mm/aaaa', 'mm-aaaa', 'm/aaaa', 'm-aaaa'
+    y también 'mmaaaa' o 'mmyyyy'.
+    """
+    if not s:
+        return ""
+    s = str(s).strip()
+    # formatos con separador
+    m = re.match(r"^(\d{1,2})[/-](\d{4})$", s)
+    if m:
+        mm, yyyy = m.groups()
+        return f"{int(mm):02d}/{yyyy}"
+
+    # formatos pegados tipo mmyyyy
+    m = re.match(r"^(\d{1,2})(\d{4})$", s)
+    if m:
+        mm, yyyy = m.groups()
+        return f"{int(mm):02d}/{yyyy}"
+
+    # si ya viene mm/aaaa correcto, lo dejamos
+    m = re.match(r"^\d{2}/\d{4}$", s)
+    if m:
+        return s
+
+    # último recurso: devolvemos tal cual
+    return s
+
+
+
 def build_drive_public_link(file_id: str) -> str:
     """
     Devuelve un link "descargable" de Drive.
@@ -332,37 +368,134 @@ def get_session(telefono_norm: str) -> Dict:
         }
     return SESSIONS[telefono_norm]
 
+
+def normalize_to_whatsapp_e164(s: str) -> str:
+    s = (s or "").strip()
+    # si ya viene con prefijo 'whatsapp:' lo dejamos
+    if s.startswith("whatsapp:"):
+        return s
+    # si viene sólo +54911... le agregamos el prefijo
+    if s.startswith("+"):
+        return "whatsapp:" + s
+    # último recurso: quitar espacios/guiones y asumir +
+    digits = re.sub(r"[^\d+]", "", s)
+    if digits.startswith("+"):
+        return "whatsapp:" + digits
+    return "whatsapp:+" + digits
+
+
+import pandas as pd
+from io import BytesIO
+
+def read_envios_rows() -> list[dict]:
+    """
+    Lee el archivo de envíos desde Drive (mismo que usa download_envios_excel)
+    y devuelve una lista de dicts con claves: 'CUIL', 'Telefono', 'Archivo', etc.
+    """
+    try:
+        df = download_envios_excel()
+        if df is None or df.empty:
+            print("WARN: no se pudo leer el archivo de envíos (vacío o inexistente).")
+            return []
+
+        # Normalizamos columnas comunes
+        df.columns = [str(c).strip().capitalize() for c in df.columns]
+        expected_cols = {"Cuil", "Telefono", "Archivo"}
+        cols_ok = expected_cols.intersection(df.columns)
+        if not cols_ok:
+            print("WARN: no se encontraron las columnas esperadas en el Excel de envíos.")
+        return df.to_dict(orient="records")
+
+    except Exception as e:
+        print(f"ERROR en read_envios_rows(): {e}")
+        return []
+
+
+
+def find_archivo_by_phone(to_whatsapp: str) -> str | None:
+    """
+    Buscar en ENVIOS_FILE_ID el archivo_norm (CUIL) por teléfono.
+    Compara flexible: ignora espacios/guiones.
+    """
+    rows = read_envios_rows()
+    # normalizamos: quitamos todo menos dígitos para comparar
+    want = re.sub(r"\D", "", to_whatsapp)
+    for r in rows:
+        tel = r.get("telefono", "")
+        arc = r.get("archivo_norm", "") or r.get("archivo", "")
+        if not tel or not arc:
+            continue
+        tclean = re.sub(r"\D", "", tel)
+        if tclean.endswith(want) or want.endswith(tclean):
+            return arc.strip()
+    return None
+
+
 import json
-TWILIO_CONTENT_SID = os.getenv("TWILIO_CONTENT_SID")
-STATUS_CALLBACK_URL = os.getenv("STATUS_CALLBACK_URL")
+import re
 
-def send_template(to_phone: str, period_label: str, archivo_norm: str | None = None):
-    if not TWILIO_CONTENT_SID:
-        raise RuntimeError("Falta TWILIO_CONTENT_SID")
-    vars_dict = {"1": period_label}           # {{1}} en plantilla = período
-    if archivo_norm: vars_dict["2"] = archivo_norm  # {{2}} opcional = CUIL
+def send_template(to_phone: str, period_label: str, cuil: str | None = None) -> str | None:
+    """
+    Envía la plantilla de WhatsApp (Content API) con variables:
+      {{1}} = período (mm/aaaa)
+      {{2}} = cuil (opcional)
+    Devuelve MessageSid o None si falla.
+    """
+    try:
+        vars_dict = {"1": period_label}
+        if cuil:
+            vars_dict["2"] = cuil
 
-    twilio_client.messages.create(
-        from_=TWILIO_WHATSAPP_FROM,
-        to="+5491136222572",                          # ej: "whatsapp:+54911...."
-        content_sid=TWILIO_CONTENT_SID,
-        content_variables=json.dumps(vars_dict),
-        status_callback=STATUS_CALLBACK_URL,  # lo implementamos en Bloque 2
-    )
+        msg = twilio_client.messages.create(
+            from_=TWILIO_WHATSAPP_FROM,
+            to=to_phone,                  # ⚠️ usar siempre el destino que llega
+            content_sid=TWILIO_CONTENT_SID,
+            content_variables=json.dumps(vars_dict),
+            status_callback=STATUS_CALLBACK_URL,
+        )
+        print("DEBUG send_template OK:", msg.sid)
+        return msg.sid
+    except Exception as e:
+        print("ERROR send_template Twilio:", e)
+        return None
 
 @app.route("/admin/send_template_one", methods=["POST"])
 def admin_send_template_one():
-    to = request.form.get("to")       # ej: whatsapp:+54911xxxxxxx
-    period = request.form.get("period")  # ej: 10/2025
-    if not to or not period:
-        return "Falta 'to' o 'period'", 400
+    to = normalize_to_whatsapp_e164(request.form.get("to",""))
+    period_raw = request.form.get("period") or PERIODO_ACTUAL or ""
+    cuil = request.form.get("cuil")  # opcional
 
-    # opcional: personalizar con CUIL si existe en Excel
-    envios_df = download_envios_excel()
-    archivo_norm = get_archivo_for_phone(normalize_phone(to), envios_df)
+    if not to or not period_raw:
+        return {"ok": False, "error": "faltan params"}, 400
 
-    send_template(to, period, archivo_norm)
-    return "OK", 200
+    period_lbl = norm_period_label(period_raw)
+    if not cuil:
+        cuil = find_archivo_by_phone(to)
+
+    # 1) Enviar plantilla
+    sid = send_template(to, period_lbl, cuil)
+    if not sid:
+        return {"ok": False, "error": "no se pudo enviar la plantilla"}, 500
+
+    # 2) (opcional) Enviar PDF del período actual sin esperar botón
+    try:
+        envios_df = download_envios_excel()
+        archivo_norm = cuil or get_archivo_for_phone(canonicalize_phone(to), envios_df)
+        if archivo_norm:
+            pdf_id = find_pdf_for_archivo_and_period(archivo_norm, period_lbl)
+            if pdf_id:
+                media_url = build_media_url_for_twilio(pdf_id)
+                twilio_client.messages.create(
+                    from_=TWILIO_WHATSAPP_FROM,
+                    to=to,
+                    body=f"✅ Acá tenés tu recibo del período {period_lbl}.",
+                    media_url=[media_url],
+                    status_callback=STATUS_CALLBACK_URL,
+                )
+    except Exception as e:
+        print("WARN: no se pudo enviar el PDF en el admin endpoint:", e)
+
+    return {"ok": True, "sid": sid}, 200
 
 @app.route("/twilio/status", methods=["POST"])
 def twilio_status():
@@ -447,20 +580,13 @@ def send_period_menu_via_text(
 # ==========================
 
 def handle_view_current(telefono_whatsapp: str) -> Response:
-    """
-    Camino A:
-    - payload VIEW_CURRENT
-    - envía el recibo del PERIODO_ACTUAL, si existe
-    - si no existe, no envía nada visible
-    """
     if not PERIODO_ACTUAL:
-        # Sin período actual configurado, no respondemos nada
         return Response('<?xml version="1.0" encoding="UTF-8"?><Response></Response>',
                         mimetype="text/xml")
 
+    period_lbl = norm_period_label(PERIODO_ACTUAL)  # <- normalización
     telefono_norm = normalize_phone(telefono_whatsapp)
     envios_df = download_envios_excel()
-
     archivo_norm = get_archivo_for_phone(telefono_norm, envios_df)
 
     print("DEBUG handle_show_periods_menu")
@@ -479,18 +605,14 @@ def handle_view_current(telefono_whatsapp: str) -> Response:
         return Response('<?xml version="1.0" encoding="UTF-8"?><Response></Response>',
                         mimetype="text/xml")
 
-    pdf_id = find_pdf_for_archivo_and_period(archivo_norm, PERIODO_ACTUAL)
+    pdf_id = find_pdf_for_archivo_and_period(archivo_norm, period_lbl)
     if not pdf_id:
-        # No está el archivo en Drive → silencio
         return Response('<?xml version="1.0" encoding="UTF-8"?><Response></Response>',
                         mimetype="text/xml")
-    text = f"✅ Acá tenés tu recibo del período {PERIODO_ACTUAL}."
-
-
-    # link = build_drive_public_link(pdf_id)   # o get_drive_download_url(pdf_id)
+    text = f"✅ Acá tenés tu recibo del período {period_lbl}."
     link = build_media_url_for_twilio(pdf_id)
-    print("DEBUG final_media_link:", link)
     return twiml_message_with_link(text, link)
+
 
 
 
@@ -655,12 +777,12 @@ def twilio_webhook():
 
     # 1) Si viene ButtonPayload, damos prioridad (Camino A en este ejemplo)
     if btn_payload:
-        if btn_payload == "VIEW_CURRENT":
+        if btn_payload in ("VIEW_CURRENT", "VIEW_NOW"):  # <- aceptar ambos
             return handle_view_current(from_whatsapp)
-        # Si en el futuro querés manejar otros payloads, lo hacés acá.
-        # Por ahora, cualquier otro payload inesperado:
+        # otros payloads...
         return Response('<?xml version="1.0" encoding="UTF-8"?><Response></Response>',
                         mimetype="text/xml")
+
 
     # 2) Si no hay payload, vemos el estado de la sesión del usuario (Camino B)
     telefono_norm = normalize_phone(from_whatsapp)
