@@ -59,20 +59,14 @@ def normalize_phone(whatsapp_from: str) -> str:
     return canonicalize_phone(whatsapp_from)
 
 
-def canonicalize_phone(num: str) -> str:
-    """
-    Deja el teléfono en un formato comparable:
-    - Saca todo lo que no sea dígito.
-    - Se queda con los últimos 10 dígitos (ej: 11XXXXXXXX).
-    """
-    if not num:
-        return ""
-    num = str(num)
-    num = num.replace("whatsapp:", "")
-    # Solo dígitos
-    digits = re.sub(r"\D", "", num)
-    # Nos quedamos con los últimos 10 (si tiene menos, devuelve lo que haya)
-    return digits[-10:] if len(digits) > 10 else digits
+def canonicalize_phone(x) -> str:
+    """Deja solo + y dígitos. Acepta int/float/str."""
+    raw = s(x)
+    # reemplazar comas/puntos decimales si vinieron por Excel
+    raw = raw.replace(",", "").replace(".0", "")
+    # quitar espacios y caracteres no numéricos salvo +
+    keep = ["+", *"0123456789"]
+    return "".join(ch for ch in raw if ch in keep)
 
 
 def ensure_anyone_reader(file_id: str) -> None:
@@ -434,19 +428,13 @@ import json
 import pandas as pd
 
 def resolve_name_for_phone(phone_e164: str) -> str:
-    """
-    Busca el nombre en el Excel de envíos por número de teléfono.
-    Devuelve string (puede ser vacío si no lo encuentra).
-    """
-    rows = read_envios_rows()  # tu función que lee el Excel de envíos
-    # normalizamos para comparar
-    p = canonicalize_phone(phone_e164)
+    rows = read_envios_rows()
+    target = canonicalize_phone(phone_e164)
     for r in rows:
-        tel = canonicalize_phone(str(r.get("Telefono") or r.get("Teléfono") or ""))
-        if tel and tel == p:
-            # probamos varias columnas típicas de nombre
+        tel = canonicalize_phone(r.get("Telefono") or r.get("Teléfono"))
+        if tel and tel == target:
             for k in ("Nombre", "Nombre y apellido", "Apellido y nombre", "Empleado", "Persona"):
-                v = (r.get(k) or "").strip()
+                v = s(r.get(k))
                 if v:
                     return v
     return ""
@@ -553,21 +541,17 @@ def admin_send_template_all():
 
         for r in rows:
             # columnas esperadas
-            telefono = r.get("Telefono") or r.get("Teléfono")
-            archivo  = r.get("Archivo") or r.get("CUIL") or r.get("Cuil")
-            nombre   = (
+            # columnas esperadas
+            telefono = s(r.get("Telefono") or r.get("Teléfono"))
+            archivo  = s(r.get("Archivo")  or r.get("CUIL") or r.get("Cuil"))
+            nombre   = s(
                 r.get("Nombre") or
                 r.get("Nombre y apellido") or
                 r.get("Apellido y nombre") or
                 r.get("Empleado") or
-                r.get("Persona") or
-                ""
+                r.get("Persona")
             )
-            telefono = (telefono or "").strip()
-            archivo  = (str(archivo) or "").strip()
-            nombre   = (nombre or "").strip()
 
-            # Validaciones mínimas
             if not telefono:
                 skipped.append({"reason": "sin_telefono", "row": r})
                 continue
@@ -577,7 +561,7 @@ def admin_send_template_all():
 
             # Canonicalizar y prefijo WhatsApp
             try:
-                to = normalize_to_whatsapp_e164(telefono)
+                to = normalize_to_whatsapp_e164(telefono)   # ahora telefono es str
             except Exception:
                 skipped.append({"reason": "telefono_invalido", "row": r})
                 continue
@@ -587,7 +571,6 @@ def admin_send_template_all():
             if not pdf_id:
                 skipped.append({"reason": "sin_pdf_periodo", "row": r})
                 continue
-
             # Si es dry_run no enviamos, solo listamos candidatos
             if dry_run:
                 sent.append({"to": to, "name": nombre, "archivo": archivo, "period": period_lbl, "dry_run": True})
@@ -654,6 +637,11 @@ def twiml_message_with_link(text: str, link: str) -> Response:
 </Response>"""
     return Response(twiml, mimetype="text/xml")
 
+def s(x) -> str:
+    """Convierte a string y hace strip sin romper si x es int/float/None."""
+    if x is None:
+        return ""
+    return str(x).strip()
 
 
 def send_period_menu_via_text(
