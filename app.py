@@ -501,8 +501,8 @@ def send_template(to_phone: str, period_label: str, cuil: str | None = None) -> 
         return None
 
 
-@app.route("/admin/send_template_one", methods=["POST"])
-def admin_send_template_one():
+#@app.route("/admin/send_template_one", methods=["POST"])
+#def admin_send_template_one():
     to = normalize_to_whatsapp_e164(request.form.get("to", ""))
     # period puede seguir viniendo para tu logging o trazabilidad, pero NO lo usamos para la plantilla
     period_raw = request.form.get("period") or PERIODO_ACTUAL or ""
@@ -526,6 +526,98 @@ def admin_send_template_one():
 def empty_twiml():
     return Response('<?xml version="1.0" encoding="UTF-8"?><Response></Response>',
                     mimetype="text/xml")
+
+
+@app.route("/admin/send_template_all", methods=["POST"])
+def admin_send_template_all():
+    """
+    Envia la plantilla a todas las personas que:
+      - Tienen telefono válido
+      - Tienen 'Archivo' asignado en el Excel de envíos
+      - Existe PDF para ese 'Archivo' en el periodo elegido (por defecto PERIODO_ACTUAL)
+    No envía el PDF acá. Ese se envía cuando el usuario toca el botón (VIEW_NOW) en el webhook.
+    """
+    try:
+        period_raw = request.form.get("period") or PERIODO_ACTUAL or ""
+        period_lbl = norm_period_label(period_raw)
+        dry_run    = (request.form.get("dry_run") or "").lower() in ("1","true","yes","y")
+        limit      = int(request.form.get("limit") or 0)  # 0 = sin límite
+
+        rows = read_envios_rows()
+        if not rows:
+            return {"ok": False, "error": "no hay filas de envíos"}, 400
+
+        sent = []
+        skipped = []
+        total = 0
+
+        for r in rows:
+            # columnas esperadas
+            telefono = r.get("Telefono") or r.get("Teléfono")
+            archivo  = r.get("Archivo") or r.get("CUIL") or r.get("Cuil")
+            nombre   = (
+                r.get("Nombre") or
+                r.get("Nombre y apellido") or
+                r.get("Apellido y nombre") or
+                r.get("Empleado") or
+                r.get("Persona") or
+                ""
+            )
+            telefono = (telefono or "").strip()
+            archivo  = (str(archivo) or "").strip()
+            nombre   = (nombre or "").strip()
+
+            # Validaciones mínimas
+            if not telefono:
+                skipped.append({"reason": "sin_telefono", "row": r})
+                continue
+            if not archivo:
+                skipped.append({"reason": "sin_archivo", "row": r})
+                continue
+
+            # Canonicalizar y prefijo WhatsApp
+            try:
+                to = normalize_to_whatsapp_e164(telefono)
+            except Exception:
+                skipped.append({"reason": "telefono_invalido", "row": r})
+                continue
+
+            # Verificar existencia de PDF para el periodo
+            pdf_id = find_pdf_for_archivo_and_period(archivo, period_lbl)
+            if not pdf_id:
+                skipped.append({"reason": "sin_pdf_periodo", "row": r})
+                continue
+
+            # Si es dry_run no enviamos, solo listamos candidatos
+            if dry_run:
+                sent.append({"to": to, "name": nombre, "archivo": archivo, "period": period_lbl, "dry_run": True})
+                total += 1
+            else:
+                # Enviar plantilla con {{1}} = nombre
+                sid = send_template_with_name(to, nombre)
+                if sid:
+                    sent.append({"to": to, "name": nombre, "archivo": archivo, "period": period_lbl, "sid": sid})
+                    total += 1
+                else:
+                    skipped.append({"reason": "twilio_error_envio_plantilla", "row": r})
+
+            # Límite opcional para pruebas
+            if limit and total >= limit:
+                break
+
+        return {
+            "ok": True,
+            "period": period_lbl,
+            "dry_run": dry_run,
+            "sent_count": len(sent),
+            "skipped_count": len(skipped),
+            "sent": sent[:200],        # recorta para no explotar la respuesta
+            "skipped": skipped[:200]
+        }, 200
+
+    except Exception as e:
+        print("ERROR /admin/send_template_all:", e)
+        return {"ok": False, "error": str(e)}, 500
 
 
 @app.route("/twilio/status", methods=["POST"])
