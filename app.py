@@ -540,11 +540,19 @@ def admin_send_template_all():
         total = 0
 
         for r in rows:
-            # columnas esperadas
+           for r in rows:
             # columnas esperadas
             telefono = s(r.get("Telefono") or r.get("Teléfono"))
-            archivo  = s(r.get("Archivo")  or r.get("CUIL") or r.get("Cuil"))
-            nombre   = s(
+
+            # OJO: usamos Archivo_norm si existe, si no, caemos a Archivo/CUIL/Cuil
+            archivo_norm = s(
+                r.get("Archivo_norm") or
+                r.get("Archivo") or
+                r.get("CUIL") or
+                r.get("Cuil")
+            )
+
+            nombre = s(
                 r.get("Nombre") or
                 r.get("Nombre y apellido") or
                 r.get("Apellido y nombre") or
@@ -552,41 +560,55 @@ def admin_send_template_all():
                 r.get("Persona")
             )
 
+            # Validaciones mínimas
             if not telefono:
                 skipped.append({"reason": "sin_telefono", "row": r})
                 continue
-            if not archivo:
-                skipped.append({"reason": "sin_archivo", "row": r})
+            if not archivo_norm:
+                skipped.append({"reason": "sin_archivo_norm", "row": r})
                 continue
 
             # Canonicalizar y prefijo WhatsApp
             try:
-                to = normalize_to_whatsapp_e164(telefono)   # ahora telefono es str
+                to = normalize_to_whatsapp_e164(telefono)
             except Exception:
                 skipped.append({"reason": "telefono_invalido", "row": r})
                 continue
 
-            # Verificar existencia de PDF para el periodo
-            pdf_id = find_pdf_for_archivo_and_period(archivo, period_lbl)
+            # ✅ acá sí chequeamos si existe PDF para ese período
+            pdf_id = find_pdf_for_archivo_and_period(archivo_norm, period_lbl)
             if not pdf_id:
                 skipped.append({"reason": "sin_pdf_periodo", "row": r})
                 continue
+
             # Si es dry_run no enviamos, solo listamos candidatos
             if dry_run:
-                sent.append({"to": to, "name": nombre, "archivo": archivo, "period": period_lbl, "dry_run": True})
+                sent.append({
+                    "to": to,
+                    "name": nombre,
+                    "archivo_norm": archivo_norm,
+                    "period": period_lbl,
+                    "dry_run": True
+                })
                 total += 1
             else:
                 # Enviar plantilla con {{1}} = nombre
                 sid = send_template_with_name(to, nombre)
                 if sid:
-                    sent.append({"to": to, "name": nombre, "archivo": archivo, "period": period_lbl, "sid": sid})
+                    sent.append({
+                        "to": to,
+                        "name": nombre,
+                        "archivo_norm": archivo_norm,
+                        "period": period_lbl,
+                        "sid": sid
+                    })
                     total += 1
                 else:
                     skipped.append({"reason": "twilio_error_envio_plantilla", "row": r})
 
-            # Límite opcional para pruebas
             if limit and total >= limit:
                 break
+
 
         return {
             "ok": True,
