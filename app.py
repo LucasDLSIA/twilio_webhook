@@ -99,11 +99,10 @@ def is_url_fetchable(url: str) -> bool:
 
 
 def build_drive_service():
-    creds = service_account.Credentials.from_service_account_file(
-        GOOGLE_SERVICE_ACCOUNT_FILE,
-        scopes=["https://www.googleapis.com/auth/drive.readonly"],
-    )
-    return build("drive", "v3", credentials=creds)
+    # reutiliza el mismo mecanismo que usan _drive_service/_google_creds
+    from googleapiclient.discovery import build
+    creds = _google_creds()
+    return build("drive", "v3", credentials=creds, cache_discovery=False)
 
 
 def download_envios_excel() -> pd.DataFrame:
@@ -269,12 +268,13 @@ def send_template(to_phone: str, period_label: str, archivo_norm: str | None = N
     if archivo_norm: vars_dict["2"] = archivo_norm  # {{2}} opcional = CUIL
 
     twilio_client.messages.create(
-        from_=TWILIO_WHATSAPP_FROM,
-        to="+5491136222572",                          # ej: "whatsapp:+54911...."
-        content_sid=TWILIO_CONTENT_SID,
-        content_variables=json.dumps(vars_dict),
-        status_callback=STATUS_CALLBACK_URL,  # lo implementamos en Bloque 2
-    )
+    from_=TWILIO_WHATSAPP_FROM,
+    to=to_phone,  # ej: "whatsapp:+54911...."
+    content_sid=TWILIO_CONTENT_SID,
+    content_variables=json.dumps(vars_dict),
+    status_callback=STATUS_CALLBACK_URL,
+)
+
 
 @app.route("/admin/send_template_one", methods=["POST"])
 def admin_send_template_one():
@@ -572,10 +572,14 @@ GOOGLE_SCOPES = [
 ]
 
 def _google_creds():
-    # Render: configurá Service_account.json apuntando al JSON de la service account
-    path = os.environ.get("Service_account.json")
+    # 1) Usar env estándar si existe
+    path = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS")
+    # 2) Fallback: si no está set, usá el que ya definiste arriba (GOOGLE_SERVICE_ACCOUNT_FILE)
     if not path:
-        raise RuntimeError("Falta Service_account.json")
+        path = GOOGLE_SERVICE_ACCOUNT_FILE  # "/etc/secrets/Service_account.json" o "Service_account.json"
+    if not path or not os.path.exists(path):
+        raise RuntimeError(f"No encuentro credencial de Google en: {path}. "
+                           "Seteá GOOGLE_APPLICATION_CREDENTIALS o verificá el Secret File.")
     return service_account.Credentials.from_service_account_file(path, scopes=GOOGLE_SCOPES)
 
 def _drive_service():
