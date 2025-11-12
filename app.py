@@ -430,9 +430,50 @@ def find_archivo_by_phone(to_whatsapp: str) -> str | None:
             return arc.strip()
     return None
 
-
 import json
-import re
+import pandas as pd
+
+def resolve_name_for_phone(phone_e164: str) -> str:
+    """
+    Busca el nombre en el Excel de envíos por número de teléfono.
+    Devuelve string (puede ser vacío si no lo encuentra).
+    """
+    rows = read_envios_rows()  # tu función que lee el Excel de envíos
+    # normalizamos para comparar
+    p = canonicalize_phone(phone_e164)
+    for r in rows:
+        tel = canonicalize_phone(str(r.get("Telefono") or r.get("Teléfono") or ""))
+        if tel and tel == p:
+            # probamos varias columnas típicas de nombre
+            for k in ("Nombre", "Nombre y apellido", "Apellido y nombre", "Empleado", "Persona"):
+                v = (r.get(k) or "").strip()
+                if v:
+                    return v
+    return ""
+
+def send_template_with_name(to_e164: str, name: str) -> str | None:
+    """
+    Envía la plantilla de WhatsApp usando la variable {{1}} = nombre.
+    Devuelve el SID del mensaje o None si falla.
+    """
+    try:
+        # Si usás Content API (ContentSid), seteá ContentVariables con el nombre
+        # name puede venir vacío; si tu plantilla requiere el campo, puedes poner un fallback "!"
+        variables = json.dumps({"1": name or "!"})
+
+        msg = twilio_client.messages.create(
+            from_=TWILIO_WHATSAPP_FROM,
+            to=to_e164,
+            content_sid=TWILIO_CONTENT_SID,       # <-- tu ContentSid (HXxxxxxxxx)
+            content_variables=variables,
+            # Si usás MessagingServiceSid, incluí messaging_service_sid=...
+            status_callback=STATUS_CALLBACK_URL,
+        )
+        return msg.sid
+    except Exception as e:
+        print("ERROR send_template_with_name:", e)
+        return None
+
 
 def send_template(to_phone: str, period_label: str, cuil: str | None = None) -> str | None:
     """
@@ -459,43 +500,33 @@ def send_template(to_phone: str, period_label: str, cuil: str | None = None) -> 
         print("ERROR send_template Twilio:", e)
         return None
 
+
 @app.route("/admin/send_template_one", methods=["POST"])
 def admin_send_template_one():
-    to = normalize_to_whatsapp_e164(request.form.get("to",""))
+    to = normalize_to_whatsapp_e164(request.form.get("to", ""))
+    # period puede seguir viniendo para tu logging o trazabilidad, pero NO lo usamos para la plantilla
     period_raw = request.form.get("period") or PERIODO_ACTUAL or ""
-    cuil = request.form.get("cuil")  # opcional
 
-    if not to or not period_raw:
-        return {"ok": False, "error": "faltan params"}, 400
+    if not to:
+        return {"ok": False, "error": "falta 'to'"}, 400
 
-    period_lbl = norm_period_label(period_raw)
-    if not cuil:
-        cuil = find_archivo_by_phone(to)
+    # buscamos el NOMBRE para la plantilla {{1}}
+    try:
+        name = resolve_name_for_phone(to)  # <- ver helper más abajo
+    except Exception:
+        name = ""  # si no hay nombre, mandamos vacío (mejor que fallar)
 
-    # 1) Enviar plantilla
-    sid = send_template(to, period_lbl, cuil)
+    sid = send_template_with_name(to, name)  # <- ver helper más abajo
     if not sid:
         return {"ok": False, "error": "no se pudo enviar la plantilla"}, 500
 
-    # 2) (opcional) Enviar PDF del período actual sin esperar botón
-    try:
-        envios_df = download_envios_excel()
-        archivo_norm = cuil or get_archivo_for_phone(canonicalize_phone(to), envios_df)
-        if archivo_norm:
-            pdf_id = find_pdf_for_archivo_and_period(archivo_norm, period_lbl)
-            if pdf_id:
-                media_url = build_media_url_for_twilio(pdf_id)
-                twilio_client.messages.create(
-                    from_=TWILIO_WHATSAPP_FROM,
-                    to=to,
-                    body=f"✅ Acá tenés tu recibo del período {period_lbl}.",
-                    media_url=[media_url],
-                    status_callback=STATUS_CALLBACK_URL,
-                )
-    except Exception as e:
-        print("WARN: no se pudo enviar el PDF en el admin endpoint:", e)
-
+    # IMPORTANTE: NO enviar PDF acá.
     return {"ok": True, "sid": sid}, 200
+
+def empty_twiml():
+    return Response('<?xml version="1.0" encoding="UTF-8"?><Response></Response>',
+                    mimetype="text/xml")
+
 
 @app.route("/twilio/status", methods=["POST"])
 def twilio_status():
@@ -580,38 +611,30 @@ def send_period_menu_via_text(
 # ==========================
 
 def handle_view_current(telefono_whatsapp: str) -> Response:
-    if not PERIODO_ACTUAL:
-        return Response('<?xml version="1.0" encoding="UTF-8"?><Response></Response>',
-                        mimetype="text/xml")
+    period_lbl = norm_period_label(PERIODO_ACTUAL)
+    tel_norm = canonicalize_phone(telefono_whatsapp)
 
-    period_lbl = norm_period_label(PERIODO_ACTUAL)  # <- normalización
-    telefono_norm = normalize_phone(telefono_whatsapp)
     envios_df = download_envios_excel()
-    archivo_norm = get_archivo_for_phone(telefono_norm, envios_df)
-
-    print("DEBUG handle_show_periods_menu")
-    print("  telefono_whatsapp:", telefono_whatsapp)
-    print("  telefono_norm:", telefono_norm)
-    try:
-        print("  Primeras filas de envios_df (telefono, telefono_norm, archivo_norm):")
-        print(envios_df[["telefono", "telefono_norm", "archivo_norm"]].head(20))
-    except Exception as e:
-        print("  Error mostrando envios_df:", e)
-    print("  archivo_norm encontrado:", archivo_norm)
-
+    archivo_norm = get_archivo_for_phone(tel_norm, envios_df)  # tu mapping a "Archivo"/CUIL
     if not archivo_norm:
-        # No hay registro para este teléfono en el Excel
-        # En Camino A decidiste NO responder nada
-        return Response('<?xml version="1.0" encoding="UTF-8"?><Response></Response>',
-                        mimetype="text/xml")
+        return empty_twiml()
 
     pdf_id = find_pdf_for_archivo_and_period(archivo_norm, period_lbl)
     if not pdf_id:
-        return Response('<?xml version="1.0" encoding="UTF-8"?><Response></Response>',
-                        mimetype="text/xml")
-    text = f"✅ Acá tenés tu recibo del período {period_lbl}."
+        return empty_twiml()
+
     link = build_media_url_for_twilio(pdf_id)
-    return twiml_message_with_link(text, link)
+    txt  = f"✅ Acá tenés tu recibo del período {period_lbl}."
+
+    # responder con TwiML que incluye el link
+    twiml = f"""<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+  <Message>
+    <Body>{txt}</Body>
+    <Media>{link}</Media>
+  </Message>
+</Response>"""
+    return Response(twiml, mimetype="text/xml")
 
 
 
@@ -770,37 +793,16 @@ def media_proxy(file_id):
 
 @app.route("/twilio/webhook", methods=["POST"])
 def twilio_webhook():
-    from_whatsapp = request.values.get("From", "")
-    body = request.values.get("Body", "").strip()
-    btn_text = request.values.get("ButtonText", "")
-    btn_payload = request.values.get("ButtonPayload", "")
+    from_whatsapp = request.form.get("From", "")
+    btn_payload   = request.form.get("ButtonPayload", "")  # Twilio Content API
 
-    # 1) Si viene ButtonPayload, damos prioridad (Camino A en este ejemplo)
-    if btn_payload:
-        if btn_payload in ("VIEW_CURRENT", "VIEW_NOW"):  # <- aceptar ambos
-            return handle_view_current(from_whatsapp)
-        # otros payloads...
-        return Response('<?xml version="1.0" encoding="UTF-8"?><Response></Response>',
-                        mimetype="text/xml")
+    # 1) Solo si viene botón "VIEW_NOW", disparamos el PDF del período actual
+    if btn_payload in ("VIEW_NOW", "VIEW_CURRENT"):
+        return handle_view_current(from_whatsapp)  # <- tu función que arma y manda el PDF
 
-
-    # 2) Si no hay payload, vemos el estado de la sesión del usuario (Camino B)
-    telefono_norm = normalize_phone(from_whatsapp)
-    session = get_session(telefono_norm)
-
-    if session.get("state") == "WAITING_OPTION" and body:
-        # Interpreto que está respondiendo al menú
-        return handle_menu_option(from_whatsapp, body)
-
-    # 3) Cualquier mensaje de texto nuevo → mostramos o arrancamos el menú de períodos
-    if body:
-        return handle_show_periods_menu(from_whatsapp)
-
-    # 4) Caso raro: ni botón ni texto
-    return twiml_message(
-        "👋 Para ver tu recibo, escribí un mensaje (por ejemplo 'recibo') y te "
-        "voy a mostrar los períodos disponibles."
-    )
+    # 2) Si querés, podés ignorar cualquier otro payload o texto
+    #    o responder con un mensaje guía.
+    return empty_twiml()
 
 
 if __name__ == "__main__":
