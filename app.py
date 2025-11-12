@@ -2,6 +2,7 @@
 import os
 import io
 import re
+import requests
 from typing import Dict, Tuple, Optional, List
 
 import pandas as pd
@@ -66,6 +67,60 @@ def canonicalize_phone(num: str) -> str:
     # Nos quedamos con los últimos 10 (si tiene menos, devuelve lo que haya)
     return digits[-10:] if len(digits) > 10 else digits
 
+def ensure_anyone_reader(file_id: str) -> None:
+    """Se asegura de que el file sea accesible públicamente por link."""
+    service = build_drive_service()
+    try:
+        service.permissions().create(
+            fileId=file_id,
+            body={"role": "reader", "type": "anyone"},
+        ).execute()
+    except Exception as e:
+        print("WARN ensure_anyone_reader:", e)
+
+def get_drive_download_url(file_id: str) -> str:
+    """
+    Intenta devolver un link de descarga directo (webContentLink).
+    Si no existe, intenta abrir permisos y reintentar.
+    Si sigue sin estar, cae a uc?export=download.
+    """
+    service = build_drive_service()
+
+    def _fetch_links() -> tuple[str | None, str | None, str | None]:
+        info = service.files().get(
+            fileId=file_id,
+            fields="id, name, mimeType, size, webViewLink, webContentLink",
+        ).execute()
+        return info.get("webContentLink"), info.get("webViewLink"), info.get("size")
+
+    wcl, wvl, size = _fetch_links()
+    print("DEBUG get_drive_download_url pre:", {"webContentLink": wcl, "webViewLink": wvl, "size": size})
+
+    if not wcl:
+        ensure_anyone_reader(file_id)
+        wcl, wvl, size = _fetch_links()
+        print("DEBUG get_drive_download_url post:", {"webContentLink": wcl, "webViewLink": wvl, "size": size})
+
+    if wcl:
+        return wcl
+
+    # Fallback estable
+    return f"https://drive.google.com/uc?export=download&id={file_id}"
+
+
+def is_url_fetchable(url: str) -> bool:
+    """HEAD/GET rápido para ver si Twilio podría bajarlo (seguimos redirects)."""
+    try:
+        r = requests.head(url, allow_redirects=True, timeout=8)
+        print("DEBUG is_url_fetchable HEAD:", r.status_code, "final_url:", r.url)
+        if r.status_code == 405:  # Algunos endpoints no aceptan HEAD
+            r = requests.get(url, stream=True, allow_redirects=True, timeout=8)
+            print("DEBUG is_url_fetchable GET:", r.status_code, "final_url:", r.url)
+            return 200 <= r.status_code < 300
+        return 200 <= r.status_code < 300
+    except Exception as e:
+        print("DEBUG is_url_fetchable EXC:", e)
+        return False
 
 
 def build_drive_service():
@@ -291,11 +346,6 @@ def twiml_message(text: str) -> Response:
 
 
 def twiml_message_with_link(text: str, link: str) -> Response:
-    """
-    Envía un mensaje de WhatsApp con texto + PDF adjunto (Media).
-    Twilio va a obtener el archivo desde `link`, así que
-    el archivo de Drive debe estar compartido como 'cualquiera con el enlace'.
-    """
     twiml = f"""<?xml version="1.0" encoding="UTF-8"?>
 <Response>
     <Message>
@@ -304,6 +354,7 @@ def twiml_message_with_link(text: str, link: str) -> Response:
     </Message>
 </Response>"""
     return Response(twiml, mimetype="text/xml")
+
 
 
 def send_period_menu_via_text(
@@ -391,7 +442,10 @@ def handle_view_current(telefono_whatsapp: str) -> Response:
         return Response('<?xml version="1.0" encoding="UTF-8"?><Response></Response>',
                         mimetype="text/xml")
 
-    link = build_drive_public_link(pdf_id)
+    link = get_drive_download_url(pdf_id)
+    print("DEBUG final_media_link:", link)
+    print("DEBUG fetchable?:", is_url_fetchable(link))
+
     text = f"✅ Acá tenés tu recibo de sueldo del período {PERIODO_ACTUAL}."
     return twiml_message_with_link(text, link)
 
@@ -420,7 +474,10 @@ def handle_period_selection(
             "Probá más tarde o contactá con RRHH."
         )
 
-    link = build_drive_public_link(pdf_id)
+    link = get_drive_download_url(pdf_id)
+    print("DEBUG final_media_link:", link)
+    print("DEBUG fetchable?:", is_url_fetchable(link))
+
     text = f"✅ Acá tenés tu recibo de sueldo del período {period_label}."
     return twiml_message_with_link(text, link)
 
