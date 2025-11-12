@@ -35,8 +35,7 @@ TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID")
 TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
 TWILIO_WHATSAPP_FROM = os.getenv("TWILIO_WHATSAPP_FROM")
 
-# Período actual para Camino A (formato mm/aaaa)
-PERIODO_ACTUAL = "10/2025"  # ej. "10/2025"
+PERIODO_ACTUAL = os.getenv("PERIODO_ACTUAL")
 
 twilio_client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
 
@@ -82,34 +81,6 @@ def ensure_anyone_reader(file_id: str) -> None:
     except Exception as e:
         print("WARN ensure_anyone_reader:", e)
 
-def get_drive_download_url(file_id: str) -> str:
-    """
-    Intenta devolver un link de descarga directo (webContentLink).
-    Si no existe, intenta abrir permisos y reintentar.
-    Si sigue sin estar, cae a uc?export=download.
-    """
-    service = build_drive_service()
-
-    def _fetch_links() -> tuple[str | None, str | None, str | None]:
-        info = service.files().get(
-            fileId=file_id,
-            fields="id, name, mimeType, size, webViewLink, webContentLink",
-        ).execute()
-        return info.get("webContentLink"), info.get("webViewLink"), info.get("size")
-
-    wcl, wvl, size = _fetch_links()
-    print("DEBUG get_drive_download_url pre:", {"webContentLink": wcl, "webViewLink": wvl, "size": size})
-
-    if not wcl:
-        ensure_anyone_reader(file_id)
-        wcl, wvl, size = _fetch_links()
-        print("DEBUG get_drive_download_url post:", {"webContentLink": wcl, "webViewLink": wvl, "size": size})
-
-    if wcl:
-        return wcl
-
-    # Fallback estable
-    return f"https://drive.google.com/uc?export=download&id={file_id}"
 
 
 def is_url_fetchable(url: str) -> bool:
@@ -264,52 +235,6 @@ def list_periods_for_archivo(archivo_norm: str) -> List[str]:
     return ordered
 
 
-def find_pdf_for_archivo_and_period(archivo_norm: str, period_label: str) -> Optional[str]:
-    """
-    Dado el CUIL (archivo_norm) y un período 'mm/aaaa',
-    devuelve el fileId del PDF en Drive para ese período, o None si no existe.
-
-    En vez de asumir nombre exacto de carpeta, busca todos los PDFs con ese nombre
-    y se queda con el que esté en una carpeta cuyo nombre mapee a ese período
-    vía period_folder_to_label.
-    """
-    service = build_drive_service()
-
-    filename = f"{archivo_norm}.pdf"
-
-    # Buscamos todos los archivos con ese nombre en todo el Drive
-    results = service.files().list(
-        q=f"name = '{filename}' and mimeType = 'application/pdf' and trashed = false",
-        fields="files(id, name, parents)",
-        pageSize=1000,
-    ).execute()
-
-    files = results.get("files", [])
-
-    print("DEBUG find_pdf_for_archivo_and_period")
-    print("  archivo_norm:", archivo_norm)
-    print("  period_label buscado:", period_label)
-    print("  cantidad de archivos encontrados:", len(files))
-
-    for f in files:
-        parents = f.get("parents", [])
-        if not parents:
-            continue
-        parent_id = parents[0]
-        folder = service.files().get(
-            fileId=parent_id,
-            fields="id, name, parents",
-        ).execute()
-        folder_name = folder.get("name", "")
-        label = period_folder_to_label(folder_name)
-        print("   - file:", f.get("id"), f.get("name"),
-              "| carpeta:", folder_name, "| label:", label)
-        if label == period_label:
-            print("  -> match encontrado, devolviendo file_id:", f.get("id"))
-            return f.get("id")
-
-    print("  -> no se encontró PDF para ese período")
-    return None
 
 
 def build_drive_public_link(file_id: str) -> str:
@@ -332,6 +257,46 @@ def get_session(telefono_norm: str) -> Dict:
             "options_map": {},
         }
     return SESSIONS[telefono_norm]
+
+import json
+TWILIO_CONTENT_SID = os.getenv("TWILIO_CONTENT_SID")
+STATUS_CALLBACK_URL = os.getenv("STATUS_CALLBACK_URL")
+
+def send_template(to_phone: str, period_label: str, archivo_norm: str | None = None):
+    if not TWILIO_CONTENT_SID:
+        raise RuntimeError("Falta TWILIO_CONTENT_SID")
+    vars_dict = {"1": period_label}           # {{1}} en plantilla = período
+    if archivo_norm: vars_dict["2"] = archivo_norm  # {{2}} opcional = CUIL
+
+    twilio_client.messages.create(
+        from_=TWILIO_WHATSAPP_FROM,
+        to="+5491136222572",                          # ej: "whatsapp:+54911...."
+        content_sid=TWILIO_CONTENT_SID,
+        content_variables=json.dumps(vars_dict),
+        status_callback=STATUS_CALLBACK_URL,  # lo implementamos en Bloque 2
+    )
+
+@app.route("/admin/send_template_one", methods=["POST"])
+def admin_send_template_one():
+    to = request.form.get("to")       # ej: whatsapp:+54911xxxxxxx
+    period = request.form.get("period")  # ej: 10/2025
+    if not to or not period:
+        return "Falta 'to' o 'period'", 400
+
+    # opcional: personalizar con CUIL si existe en Excel
+    envios_df = download_envios_excel()
+    archivo_norm = get_archivo_for_phone(normalize_phone(to), envios_df)
+
+    send_template(to, period, archivo_norm)
+    return "OK", 200
+
+@app.route("/twilio/status", methods=["POST"])
+def twilio_status():
+    data = request.form.to_dict()
+    print("STATUS CALLBACK:", data)
+    # data["MessageStatus"] puede ser: queued/sent/delivered/read/failed
+    # data["To"], data["From"], data["MessageSid"]
+    return ("", 204)
 
 
 # ==========================
@@ -569,6 +534,328 @@ def handle_menu_option(telefono_whatsapp: str, body: str) -> Response:
     session["state"] = "IDLE"
     session["options_map"] = {}
     return handle_period_selection(telefono_whatsapp, period_label)
+
+# ==================================================================================================================================
+# ==== Pegar en tu app.py (APP PRINCIPAL en Render) ====
+import os
+import io
+import re
+import json
+import csv
+from typing import List, Dict, Optional
+
+from flask import request, jsonify
+
+# Google APIs
+from google.oauth2 import service_account
+from googleapiclient.discovery import build
+from googleapiclient.http import MediaIoBaseDownload
+
+# Datos
+import pandas as pd
+
+# Twilio (para enviar el PDF desde esta app)
+from twilio.rest import Client as TwilioClient
+
+# ==========
+# ENV
+# ==========
+
+twilio_client = TwilioClient(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
+
+# ==========
+# Google creds + services
+# ==========
+GOOGLE_SCOPES = [
+    "https://www.googleapis.com/auth/drive.readonly",
+    "https://www.googleapis.com/auth/spreadsheets.readonly",
+]
+
+def _google_creds():
+    # Render: configurá Service_account.json apuntando al JSON de la service account
+    path = os.environ.get("Service_account.json")
+    if not path:
+        raise RuntimeError("Falta Service_account.json")
+    return service_account.Credentials.from_service_account_file(path, scopes=GOOGLE_SCOPES)
+
+def _drive_service():
+    return build("drive", "v3", credentials=_google_creds(), cache_discovery=False)
+
+def _sheets_service():
+    return build("sheets", "v4", credentials=_google_creds(), cache_discovery=False)
+
+# ==========
+# Helpers: período
+# ==========
+PERIOD_RXES = [
+    re.compile(r"^(?P<mm>\d{2})[-/](?P<yyyy>\d{4})$"),  # 10-2025 o 10/2025
+    re.compile(r"^(?P<yyyy>\d{4})[-/](?P<mm>\d{2})$"),  # 2025-10 o 2025/10
+]
+
+def norm_period_label(p: str) -> str:
+    """Convierte varias formas a label lógico mm/aaaa."""
+    p = (p or "").strip()
+    for rx in PERIOD_RXES:
+        m = rx.match(p)
+        if m:
+            mm = m.group("mm")
+            yyyy = m.group("yyyy")
+            return f"{mm}/{yyyy}"
+    return p
+
+def folder_name_from_period(p: str) -> str:
+    """De label lógico mm/aaaa a nombre de carpeta real mm-aaaa."""
+    lbl = norm_period_label(p)
+    if re.match(r"^\d{2}/\d{4}$", lbl):
+        mm, yyyy = lbl.split("/")
+        return f"{mm}-{yyyy}"
+    return p
+
+# ==========
+# Helpers: Drive
+# ==========
+def _drive_get(file_id: str, fields: str):
+    svc = _drive_service()
+    return svc.files().get(fileId=file_id, fields=fields).execute()
+
+def _drive_list(q: str, fields: str = "files(id,name,parents,mimeType)", page_size: int = 1000, spaces: str = "drive"):
+    svc = _drive_service()
+    results = []
+    page_token = None
+    while True:
+        resp = svc.files().list(
+            q=q,
+            spaces=spaces,
+            fields=f"nextPageToken, {fields}",
+            pageSize=page_size,
+            pageToken=page_token
+        ).execute()
+        results.extend(resp.get("files", []))
+        page_token = resp.get("nextPageToken")
+        if not page_token:
+            break
+    return results
+
+def _drive_download_bytes(file_id: str) -> bytes:
+    svc = _drive_service()
+    req = svc.files().get_media(fileId=file_id)
+    buf = io.BytesIO()
+    downloader = MediaIoBaseDownload(buf, req)
+    done = False
+    while not done:
+        status, done = downloader.next_chunk()
+    buf.seek(0)
+    return buf.read()
+
+def _drive_web_links(file_id: str) -> Dict[str, Optional[str]]:
+    meta = _drive_get(file_id, "id,name,webViewLink,webContentLink,size,mimeType,parents")
+    return {
+        "webViewLink": meta.get("webViewLink"),
+        "webContentLink": meta.get("webContentLink"),
+        "mimeType": meta.get("mimeType"),
+        "parents": meta.get("parents", []),
+        "name": meta.get("name"),
+        "size": meta.get("size"),
+    }
+
+# ==========
+# Leer ENVIOS_FILE_ID (Google Sheet o Excel/CSV)
+# ==========
+def read_envios_rows() -> List[Dict[str, str]]:
+    """Devuelve [{'telefono':..., 'archivo_norm':...}, ...]"""
+    if not ENVIOS_FILE_ID:
+        raise RuntimeError("Falta ENVIOS_FILE_ID")
+
+    meta = _drive_get(ENVIOS_FILE_ID, "id,name,mimeType")
+    mime = meta.get("mimeType", "")
+    rows: List[Dict[str, str]] = []
+
+    if mime == "application/vnd.google-apps.spreadsheet":
+        # Google Sheet → Sheets API
+        sh = _sheets_service().spreadsheets()
+        # Tomamos la primera hoja completa
+        sheet = sh.get(spreadsheetId=ENVIOS_FILE_ID).execute()
+        title = sheet["sheets"][0]["properties"]["title"]
+        vr = _sheets_service().spreadsheets().values().get(
+            spreadsheetId=ENVIOS_FILE_ID, range=f"{title}!A:Z"
+        ).execute()
+        values = vr.get("values", [])
+        if not values:
+            return rows
+        headers = [h.strip().lower() for h in values[0]]
+        idx_tel = next((i for i,h in enumerate(headers) if h in ("telefono","teléfono","phone","to")), None)
+        idx_arc = next((i for i,h in enumerate(headers) if h in ("archivo","archivo_norm","cuil")), None)
+        if idx_tel is None or idx_arc is None:
+            return rows
+        for line in values[1:]:
+            tel = str(line[idx_tel]).strip() if idx_tel < len(line) else ""
+            arc = str(line[idx_arc]).strip() if idx_arc < len(line) else ""
+            if tel and arc:
+                rows.append({"telefono": tel, "archivo_norm": arc})
+        return rows
+
+    # Si es un archivo subido (xlsx/csv)
+    blob = _drive_download_bytes(ENVIOS_FILE_ID)
+    # Intentamos pandas excel -> si falla, csv
+    try:
+        df = pd.read_excel(io.BytesIO(blob))
+    except Exception:
+        try:
+            df = pd.read_csv(io.BytesIO(blob))
+        except Exception:
+            # último recurso: CSV manual
+            text = blob.decode("utf-8", errors="ignore")
+            reader = csv.DictReader(io.StringIO(text))
+            for r in reader:
+                rows.append({"telefono": r.get("telefono",""), "archivo_norm": r.get("archivo_norm","")})
+            return rows
+
+    # Normalizar columnas
+    col_tel = next((c for c in df.columns if str(c).strip().lower() in ("telefono","teléfono","phone","to")), None)
+    col_arc = next((c for c in df.columns if str(c).strip().lower() in ("archivo","archivo_norm","cuil")), None)
+    if col_tel is None or col_arc is None:
+        return rows
+    for _, rec in df.iterrows():
+        tel = str(rec[col_tel]).strip()
+        arc = str(rec[col_arc]).strip()
+        if tel and arc:
+            rows.append({"telefono": tel, "archivo_norm": arc})
+    return rows
+
+# ==========
+# Buscar PDF por archivo_norm + período
+# ==========
+def find_pdf_for_archivo_and_period(archivo_norm: str, period_label: str) -> Optional[str]:
+    """
+    Busca archivos con nombre EXACTO '<archivo_norm>.pdf' en Drive
+    y matchea el parent que tenga nombre 'mm-aaaa' según period_label.
+    """
+    if not DRIVE_RECIBOS_ROOT_ID:
+        raise RuntimeError("Falta DRIVE_ROOT_FOLDER_ID")
+
+    target_folder = folder_name_from_period(period_label)  # "10-2025"
+    filename = f"{archivo_norm}.pdf"
+
+    # 1) Traemos todos los archivos con ese nombre (en todo el Drive al que ve la SA)
+    files = _drive_list(
+        q=f"name = '{filename}' and mimeType = 'application/pdf' and trashed = false",
+        fields="files(id,name,parents)"
+    )
+
+    if not files:
+        return None
+
+    # 2) Verificamos que alguno esté bajo una carpeta llamada target_folder (y opcionalmente bajo la root)
+    #    Para eso consultamos cada parent y recuperamos su nombre
+    svc = _drive_service()
+    for f in files:
+        parents = f.get("parents", [])
+        for pid in parents:
+            meta = svc.files().get(fileId=pid, fields="id,name,parents").execute()
+            folder_name = meta.get("name", "")
+            if folder_name == target_folder:
+                # (Opcional) validar que esta carpeta cuelga de DRIVE_ROOT_FOLDER_ID
+                # subimos hasta raiz de recibos
+                cur = meta
+                safety = 0
+                is_under_root = False
+                while cur and safety < 10:
+                    pr = cur.get("parents", [])
+                    if not pr: break
+                    parent_meta = svc.files().get(fileId=pr[0], fields="id,name,parents").execute()
+                    if parent_meta.get("id") == DRIVE_RECIBOS_ROOT_ID:
+                        is_under_root = True
+                        break
+                    cur = parent_meta
+                    safety += 1
+
+                if is_under_root:
+                    return f["id"]
+                # si no validás jerarquía, igual podés retornar:
+                # return f["id"]
+
+    return None
+
+def get_drive_download_url(file_id: str) -> Optional[str]:
+    """Devuelve el webContentLink para Twilio (descarga directa)."""
+    links = _drive_web_links(file_id)
+    return links.get("webContentLink")
+
+# ==========
+# Enviar PDF por WhatsApp (Twilio) desde esta app
+# ==========
+def send_pdf_to_whatsapp(to_whatsapp: str, media_url: str, caption: Optional[str] = None) -> bool:
+    """
+    Envía un media message con el PDF.
+    `to_whatsapp` debe ser 'whatsapp:+...'
+    """
+    try:
+        msg = twilio_client.messages.create(
+            from_=TWILIO_WHATSAPP_FROM,
+            to=to_whatsapp,
+            body=caption or "",
+            media_url=[media_url] if media_url else None
+        )
+        print("DEBUG send_pdf_to_whatsapp OK:", msg.sid)
+        return True
+    except Exception as e:
+        print("ERROR send_pdf_to_whatsapp:", e)
+        return False
+
+# ==========
+# ENDPOINTS Camino A
+# ==========
+@app.route("/admin/envios_list", methods=["POST"])
+def admin_envios_list():
+    try:
+        rows = read_envios_rows()
+        return jsonify({"ok": True, "rows": rows}), 200
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+@app.route("/admin/has_pdf", methods=["POST"])
+def admin_has_pdf():
+    archivo_norm = (request.form.get("archivo_norm") or "").strip()
+    period_raw   = (request.form.get("period") or PERIODO_ACTUAL or "").strip()
+    if not archivo_norm or not period_raw:
+        return jsonify({"ok": False, "error": "faltan params"}), 400
+
+    period_lbl = norm_period_label(period_raw)   # "10/2025"
+
+    try:
+        file_id = find_pdf_for_archivo_and_period(archivo_norm, period_lbl)
+        return jsonify({"ok": True, "has_pdf": bool(file_id)}), 200
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+@app.route("/admin/send_pdf", methods=["POST"])
+def admin_send_pdf():
+    to           = (request.form.get("to") or "").strip()
+    archivo_norm = (request.form.get("archivo_norm") or "").strip()
+    period_raw   = (request.form.get("period") or PERIODO_ACTUAL or "").strip()
+
+    if not to or not archivo_norm or not period_raw:
+        return jsonify({"ok": False, "error": "faltan params"}), 400
+
+    period_lbl = norm_period_label(period_raw)   # "10/2025"
+
+    try:
+        file_id = find_pdf_for_archivo_and_period(archivo_norm, period_lbl)
+        if not file_id:
+            return jsonify({"ok": False, "error": "no_file"}), 404
+
+        media_url = get_drive_download_url(file_id)
+        if not media_url:
+            return jsonify({"ok": False, "error": "no_media_link"}), 500
+
+        # IMPORTANTE: acá 'to' debe venir en formato whatsapp:+...
+        ok = send_pdf_to_whatsapp(to, media_url, caption=f"Recibo {period_lbl}")
+        return jsonify({"ok": ok}), 200 if ok else 500
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+# ==== Fin de bloque para app.py ====
+
+# ==================================================================================================================================
 
 @app.route("/media/<file_id>", methods=["GET"])
 def media_proxy(file_id):
