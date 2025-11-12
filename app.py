@@ -5,6 +5,10 @@ import re
 import requests
 from typing import Dict, Tuple, Optional, List
 
+from flask import send_file
+import io
+
+
 import pandas as pd
 from flask import Flask, request, Response
 from twilio.rest import Client
@@ -441,13 +445,14 @@ def handle_view_current(telefono_whatsapp: str) -> Response:
         # No está el archivo en Drive → silencio
         return Response('<?xml version="1.0" encoding="UTF-8"?><Response></Response>',
                         mimetype="text/xml")
+    text = f"✅ Acá tenés tu recibo del período {PERIODO_ACTUAL}."
 
-    link = get_drive_download_url(pdf_id)
+
+    # link = build_drive_public_link(pdf_id)   # o get_drive_download_url(pdf_id)
+    link = build_media_url_for_twilio(pdf_id)
     print("DEBUG final_media_link:", link)
-    print("DEBUG fetchable?:", is_url_fetchable(link))
-
-    text = f"✅ Acá tenés tu recibo de sueldo del período {PERIODO_ACTUAL}."
     return twiml_message_with_link(text, link)
+
 
 
 def handle_period_selection(
@@ -473,13 +478,21 @@ def handle_period_selection(
             "pero el archivo no está disponible en este momento. "
             "Probá más tarde o contactá con RRHH."
         )
+    text = f"✅ Acá tenés tu recibo del período {period_label}."
 
-    link = get_drive_download_url(pdf_id)
+
+    # link = build_drive_public_link(pdf_id)   # o get_drive_download_url(pdf_id)
+    link = build_media_url_for_twilio(pdf_id)
     print("DEBUG final_media_link:", link)
-    print("DEBUG fetchable?:", is_url_fetchable(link))
-
-    text = f"✅ Acá tenés tu recibo de sueldo del período {period_label}."
     return twiml_message_with_link(text, link)
+
+
+PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "").rstrip("/")
+
+def build_media_url_for_twilio(file_id: str) -> str:
+    # Twilio necesita URL absoluta y pública
+    base = PUBLIC_BASE_URL or "https://twilio-webhook-lddc.onrender.com"
+    return f"{base}/media/{file_id}"
 
 
 def handle_show_periods_menu(telefono_whatsapp: str) -> Response:
@@ -556,6 +569,38 @@ def handle_menu_option(telefono_whatsapp: str, body: str) -> Response:
     session["state"] = "IDLE"
     session["options_map"] = {}
     return handle_period_selection(telefono_whatsapp, period_label)
+
+@app.route("/media/<file_id>", methods=["GET"])
+def media_proxy(file_id):
+    """
+    Proxy para servir PDFs de Drive a Twilio/WhatsApp sin requerir login.
+    """
+    service = build_drive_service()
+    # Descargo el binario desde Drive
+    request_drive = service.files().get_media(fileId=file_id)
+    fh = io.BytesIO()
+    downloader = MediaIoBaseDownload(fh, request_drive)
+    done = False
+    while not done:
+        status, done = downloader.next_chunk()
+    fh.seek(0)
+
+    # Intento obtener el nombre real (opcional)
+    try:
+        meta = service.files().get(fileId=file_id, fields="name").execute()
+        filename = meta.get("name", "documento.pdf")
+    except Exception:
+        filename = "documento.pdf"
+
+    # Envío el PDF como respuesta HTTP pública
+    return send_file(
+        fh,
+        mimetype="application/pdf",
+        as_attachment=False,
+        download_name=filename,  # Flask 2.x
+        max_age=300,             # cache 5 min
+        etag=False
+    )
 
 
 # ==========================
