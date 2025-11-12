@@ -662,6 +662,22 @@ def _drive_web_links(file_id: str) -> Dict[str, Optional[str]]:
         "size": meta.get("size"),
     }
 
+from urllib.parse import urlparse
+
+PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "https://twilio-webhook-lddc.onrender.com")
+
+def get_public_media_url(file_id: str) -> str:
+    # 1) probá webContentLink
+    links = _drive_web_links(file_id)
+    wcl = links.get("webContentLink")
+    if wcl:
+        # Twilio sigue redirects. Pero si esto termina en accounts.google.com, no sirve
+        # nos ahorramos HEADs y vamos directo al proxy para ser 100% confiables
+        pass
+    # 2) proxy propio
+    return f"{PUBLIC_BASE_URL.rstrip('/')}/media/{file_id}"
+
+
 # ==========
 # Leer ENVIOS_FILE_ID (Google Sheet o Excel/CSV)
 # ==========
@@ -832,6 +848,27 @@ def admin_has_pdf():
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
 
+@app.route("/admin/diag_pdf", methods=["POST"])
+def admin_diag_pdf():
+    archivo_norm = (request.form.get("archivo_norm") or "").strip()
+    period_raw   = (request.form.get("period") or "").strip()
+    if not archivo_norm or not period_raw:
+        return {"ok": False, "error": "faltan params"}, 400
+    period_lbl = norm_period_label(period_raw)
+    try:
+        file_id = find_pdf_for_archivo_and_period(archivo_norm, period_lbl)
+        if not file_id:
+            return {"ok": True, "found": False}, 200
+        return {
+            "ok": True,
+            "found": True,
+            "file_id": file_id,
+            "proxy_url": f"{PUBLIC_BASE_URL.rstrip('/')}/media/{file_id}"
+        }, 200
+    except Exception as e:
+        return {"ok": False, "error": str(e)}, 500
+
+
 @app.route("/admin/send_pdf", methods=["POST"])
 def admin_send_pdf():
     to           = (request.form.get("to") or "").strip()
@@ -848,7 +885,9 @@ def admin_send_pdf():
         if not file_id:
             return jsonify({"ok": False, "error": "no_file"}), 404
 
-        media_url = get_drive_download_url(file_id)
+        media_url = get_public_media_url(file_id)     # ✅ público via Render
+        ok = send_pdf_to_whatsapp(to, media_url, caption=f"Recibo {period_lbl}")
+
         if not media_url:
             return jsonify({"ok": False, "error": "no_media_link"}), 500
 
@@ -861,37 +900,49 @@ def admin_send_pdf():
 
 # ==================================================================================================================================
 
+@app.route("/admin/env", methods=["GET"])
+def admin_env():
+    def mask(s, keep=6):
+        if not s: return "None"
+        s = str(s)
+        return ("*" * max(0, len(s)-keep)) + s[-keep:]
+    return {
+        "GOOGLE_APPLICATION_CREDENTIALS": os.getenv("GOOGLE_APPLICATION_CREDENTIALS", "None"),
+        "DRIVE_ROOT_FOLDER_ID": os.getenv("DRIVE_ROOT_FOLDER_ID", "None"),
+        "ENVIOS_FILE_ID": os.getenv("ENVIOS_FILE_ID", "None"),
+        "PERIODO_ACTUAL": os.getenv("PERIODO_ACTUAL", "None"),
+        "TWILIO_ACCOUNT_SID": mask(os.getenv("TWILIO_ACCOUNT_SID")),
+        "TWILIO_AUTH_TOKEN": mask(os.getenv("TWILIO_AUTH_TOKEN")),
+        "TWILIO_WHATSAPP_FROM": os.getenv("TWILIO_WHATSAPP_FROM", "None"),
+    }, 200
+
+from flask import send_file
+import io
+
 @app.route("/media/<file_id>", methods=["GET"])
 def media_proxy(file_id):
-    """
-    Proxy para servir PDFs de Drive a Twilio/WhatsApp sin requerir login.
-    """
-    service = build_drive_service()
-    # Descargo el binario desde Drive
-    request_drive = service.files().get_media(fileId=file_id)
-    fh = io.BytesIO()
-    downloader = MediaIoBaseDownload(fh, request_drive)
-    done = False
-    while not done:
-        status, done = downloader.next_chunk()
-    fh.seek(0)
-
-    # Intento obtener el nombre real (opcional)
     try:
-        meta = service.files().get(fileId=file_id, fields="name").execute()
-        filename = meta.get("name", "documento.pdf")
-    except Exception:
-        filename = "documento.pdf"
+        # baja el binario desde Drive con la service account
+        svc = _drive_service()
+        req = svc.files().get_media(fileId=file_id)
+        buf = io.BytesIO()
+        from googleapiclient.http import MediaIoBaseDownload
+        downloader = MediaIoBaseDownload(buf, req)
+        done = False
+        while not done:
+            _, done = downloader.next_chunk()
+        buf.seek(0)
+        # devolver como PDF
+        return send_file(
+            buf,
+            mimetype="application/pdf",
+            as_attachment=False,
+            download_name=f"{file_id}.pdf",
+            max_age=300  # cache 5 min
+        )
+    except Exception as e:
+        return {"ok": False, "error": str(e)}, 500
 
-    # Envío el PDF como respuesta HTTP pública
-    return send_file(
-        fh,
-        mimetype="application/pdf",
-        as_attachment=False,
-        download_name=filename,  # Flask 2.x
-        max_age=300,             # cache 5 min
-        etag=False
-    )
 
 
 # ==========================
