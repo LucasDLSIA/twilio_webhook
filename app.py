@@ -738,6 +738,18 @@ def send_pdf_via_twilio_media(
     text = f"Perfecto, te envío tu recibo de sueldo del período {period_label}."
     return build_twilio_response(text, media_url)
 
+import os
+from datetime import datetime
+
+def get_current_period_label():
+    # Intentamos leer de una variable de entorno en Render
+    label_env = os.getenv("PERIODO_ACTUAL")
+    if label_env:
+        return label_env
+
+    # Fallback: período igual al mes actual, formato mm/aaaa
+    return datetime.now().strftime("%m/%Y")
+
 # ==========================
 #  Lógica de los caminos
 # ==========================
