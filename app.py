@@ -518,13 +518,6 @@ def empty_twiml():
 
 @app.route("/admin/send_template_all", methods=["POST"])
 def admin_send_template_all():
-    """
-    Envia la plantilla a todas las personas que:
-      - Tienen telefono válido
-      - Tienen 'Archivo' asignado en el Excel de envíos
-      - Existe PDF para ese 'Archivo' en el periodo elegido (por defecto PERIODO_ACTUAL)
-    No envía el PDF acá. Ese se envía cuando el usuario toca el botón (VIEW_NOW) en el webhook.
-    """
     try:
         period_raw = request.form.get("period") or PERIODO_ACTUAL or ""
         period_lbl = norm_period_label(period_raw)
@@ -539,8 +532,8 @@ def admin_send_template_all():
         skipped = []
         total = 0
 
+        # 👇 SOLO UN for
         for r in rows:
-           for r in rows:
             # columnas esperadas
             telefono = s(r.get("Telefono") or r.get("Teléfono"))
 
@@ -575,13 +568,12 @@ def admin_send_template_all():
                 skipped.append({"reason": "telefono_invalido", "row": r})
                 continue
 
-            # ✅ acá sí chequeamos si existe PDF para ese período
+            # ✅ chequeamos si existe PDF para ese período
             pdf_id = find_pdf_for_archivo_and_period(archivo_norm, period_lbl)
             if not pdf_id:
                 skipped.append({"reason": "sin_pdf_periodo", "row": r})
                 continue
 
-            # Si es dry_run no enviamos, solo listamos candidatos
             if dry_run:
                 sent.append({
                     "to": to,
@@ -592,7 +584,6 @@ def admin_send_template_all():
                 })
                 total += 1
             else:
-                # Enviar plantilla con {{1}} = nombre
                 sid = send_template_with_name(to, nombre)
                 if sid:
                     sent.append({
@@ -609,14 +600,13 @@ def admin_send_template_all():
             if limit and total >= limit:
                 break
 
-
         return {
             "ok": True,
             "period": period_lbl,
             "dry_run": dry_run,
             "sent_count": len(sent),
             "skipped_count": len(skipped),
-            "sent": sent[:200],        # recorta para no explotar la respuesta
+            "sent": sent[:200],
             "skipped": skipped[:200]
         }, 200
 
