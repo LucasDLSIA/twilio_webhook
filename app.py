@@ -741,47 +741,48 @@ def send_pdf_via_twilio_media(
 # ==========================
 #  Lógica de los caminos
 # ==========================
-def handle_view_current(form):
-    from_number = form.get("From")
+def handle_view_current(from_number: str):
+    """
+    Maneja cuando el usuario toca el botón 'Sí, visualizar':
+    usamos el número de WhatsApp para buscar el archivo en Envios
+    y enviarle el PDF del período actual.
+    """
+    print("DEBUG handle_view_current, from_number:", from_number)
 
-    # 1) Primero intentamos por MensajeSid (botón del template)
-    archivo = get_archivo_from_envios(form)
+    # from_number ya viene como 'whatsapp:+54911...'
+    envios_df = download_envios_excel()
 
-    # 2) Si no se encontró, hacemos fallback por teléfono
-    if not archivo:
-        print("DEBUG handle_view_current: no se encontró archivo por MensajeSid, probando por teléfono")
-        telefono_norm = normalize_phone(from_number)
-        envios_df = download_envios_excel()
-        archivo = get_archivo_for_phone(telefono_norm, envios_df)
+    # normalizamos el número (le sacamos 'whatsapp:' y demás)
+    tel_norm = canonicalize_phone(from_number)
 
-    # 3) Si sigue sin haber archivo, mandamos mensaje de ayuda
-    if not archivo:
+    # buscamos el archivo_norm en el Excel de envíos
+    archivo_norm = get_archivo_for_phone(tel_norm, envios_df)
+
+    if not archivo_norm:
+        print("No se encontró archivo_norm para el teléfono:", tel_norm)
         return build_twilio_response(
-            "No encontramos un recibo asociado a este número de WhatsApp. "
-            "Por favor, escribime *AYUDA* para que podamos revisarlo."
+            "No encontramos un recibo asociado a tu número para este período. "
+            "Por favor contactate con Recursos Humanos."
         )
 
-    # 4) Buscamos el PDF para el período actual
-    pdf_file_id = find_pdf_for_archivo_and_period(archivo, PERIODO_ACTUAL)
+    # acá asumimos que ya tenés period_label actual (por ejemplo, '10/2025')
+    period_label = get_current_period_label()  # o como lo estés resolviendo ahora
+
+    print(f"DEBUG handle_view_current -> archivo_norm: {archivo_norm}, period_label: {period_label}")
+
+    pdf_file_id = find_pdf_for_archivo_and_period(archivo_norm, period_label)
 
     if not pdf_file_id:
+        print("No se encontró PDF para ese archivo_norm + período")
         return build_twilio_response(
-            f"No encontramos tu recibo de *{PERIODO_ACTUAL}* en el sistema. "
-            "Si creés que esto es un error, por favor escribirle a RRHH."
+            f"No encontramos tu recibo del período {period_label}. "
+            "Por favor contactate con Recursos Humanos."
         )
 
-    success = send_pdf_via_twilio_media(from_number, pdf_file_id, archivo, PERIODO_ACTUAL)
-
-    if success:
-        return build_twilio_response(
-            f"🧾 Te enviamos tu recibo de *{PERIODO_ACTUAL}* en un archivo PDF.\n\n"
-            "Si no te llegó nada, por favor escribime *AYUDA*."
-        )
-    else:
-        return build_twilio_response(
-            "Ocurrió un error al enviar tu recibo. "
-            "Por favor, intentá de nuevo en unos minutos o escribí *AYUDA*."
-        )
+    # construimos la URL pública para Twilio y respondemos con el PDF
+    media_url = build_media_url_for_twilio(pdf_file_id)
+    text = f"Perfecto, te envío tu recibo de sueldo del período {period_label}."
+    return build_twilio_response(text, media_url)
 
 
 
