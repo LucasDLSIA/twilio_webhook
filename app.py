@@ -50,23 +50,29 @@ SESSIONS: Dict[str, Dict] = {}
 # ==========================
 #  Helpers generales
 # ==========================
-
 def normalize_phone(whatsapp_from: str) -> str:
     """
-    Normaliza el teléfono que viene de Twilio a la misma forma que usamos en el Excel:
-    últimos 10 dígitos.
+    Normaliza el teléfono que viene de Twilio (ej: 'whatsapp:+54911...')
+    a la misma forma que usamos en el Excel: solo dígitos.
     """
-    return canonicalize_phone(whatsapp_from)
+    val = s(whatsapp_from)
+    if val.startswith("whatsapp:"):
+        val = val[len("whatsapp:"):]
+    return canonicalize_phone(val)
 
+import re
 
 def canonicalize_phone(x) -> str:
-    """Deja solo + y dígitos. Acepta int/float/str."""
+    """Normaliza un teléfono dejando solo dígitos.
+       Sirve para comparar Twilio vs Excel sin lío de 'whatsapp:' ni '+'.
+    """
     raw = s(x)
-    # reemplazar comas/puntos decimales si vinieron por Excel
     raw = raw.replace(",", "").replace(".0", "")
-    # quitar espacios y caracteres no numéricos salvo +
-    keep = ["+", *"0123456789"]
-    return "".join(ch for ch in raw if ch in keep)
+    # dejar solo dígitos
+    digits = re.sub(r"\D", "", raw)
+    # si querés, podés quedarte con los últimos 10 dígitos (opcional):
+    # return digits[-10:] if len(digits) > 10 else digits
+    return digits
 
 
 def ensure_anyone_reader(file_id: str) -> None:
@@ -704,16 +710,23 @@ def send_period_menu_via_text(
 
 def handle_view_current(telefono_whatsapp: str) -> Response:
     period_lbl = norm_period_label(PERIODO_ACTUAL)
-    tel_norm = canonicalize_phone(telefono_whatsapp)
+    tel_norm = normalize_phone(telefono_whatsapp)
+    print("DEBUG handle_view_current:",
+          {"raw": telefono_whatsapp, "tel_norm": tel_norm, "period": period_lbl})
 
     envios_df = download_envios_excel()
-    archivo_norm = get_archivo_for_phone(tel_norm, envios_df)  # tu mapping a "Archivo"/CUIL
+    archivo_norm = get_archivo_for_phone(tel_norm, envios_df)
+    print("DEBUG handle_view_current archivo_norm:", archivo_norm)
+
     if not archivo_norm:
         return empty_twiml()
 
+    # Buscar el PDF correspondiente al período actual
     pdf_id = find_pdf_for_archivo_and_period(archivo_norm, period_lbl)
     if not pdf_id:
-        return empty_twiml()
+        return twiml_message(
+            "⚠️ No encontré tu recibo para el período actual en el sistema."
+        )
 
     link = build_media_url_for_twilio(pdf_id)
     txt  = f"✅ Acá tenés tu recibo del período {period_lbl}."
