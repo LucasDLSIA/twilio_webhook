@@ -886,45 +886,26 @@ def media_proxy(file_id):
 @app.route("/twilio/webhook", methods=["POST"])
 def twilio_webhook():
     from_whatsapp = request.form.get("From", "")
+    btn_payload   = request.form.get("ButtonPayload", "")  # Twilio Content API
+    body_raw      = request.form.get("Body", "") or ""
 
-    # Lo que ya tenías
-    btn_payload = (request.form.get("ButtonPayload", "") or "").strip()
-    btn_text    = (request.form.get("ButtonText", "") or "").strip()
+    # Debug para ver exactamente qué llega desde Twilio
+    print("=== TWILIO WEBHOOK FORM ===")
+    print(dict(request.form))
 
-    # NUEVO: también miro el Body normal del mensaje
-    body        = (request.form.get("Body", "") or "").strip().lower()
+    body = body_raw.strip().lower()
 
-    # 1) Si viene un payload de botón, lo uso
+    # 1) Caso: viene un botón interactivo con payload
     if btn_payload in ("VIEW_NOW", "VIEW_CURRENT"):
         return handle_view_current(from_whatsapp)
 
-    # 2) Si por alguna razón Twilio no manda ButtonPayload,
-    #    pero sí manda el texto del botón en Body o ButtonText
-    if body in {
-        "1",
-        "si", "sí",
-        "visualizar",
-        "sí, visualizar",
-        "si, visualizar",
-        "ver recibo",
-        "sí visualizar",
-        "si visualizar",
-    }:
+    # 2) Caso: el usuario escribe el texto "Sí, visualizar" o similar
+    if "visualizar" in body:
+        # Cualquier mensaje que contenga la palabra "visualizar"
+        # dispara el envío del PDF
         return handle_view_current(from_whatsapp)
 
-    # También podemos cubrir ButtonText por las dudas
-    if btn_text.lower() in {
-        "sí, visualizar",
-        "si, visualizar",
-        "sí visualizar",
-        "si visualizar",
-        "visualizar",
-        "ver recibo",
-    }:
-        return handle_view_current(from_whatsapp)
-    print("WEBHOOK FORM:", dict(request.form))
-
-    # Si no matchea nada de lo anterior, no respondemos nada
+    # 3) Si no coincide nada, devolvés un TwiML vacío o un mensaje guía
     return empty_twiml()
 
 
