@@ -273,7 +273,7 @@ def list_periods_for_archivo(archivo_norm: str) -> List[str]:
 
 def find_pdf_for_archivo_and_period(archivo_norm: str, period_label: str) -> Optional[str]:
     """
-    Dado el CUIL (archivo_norm) y un período 'mm/aaaa',
+    Dado el CUIL (archivo_norm) y un período (puede venir como 'mm/aaaa' o 'mm-aaaa'),
     devuelve el fileId del PDF en Drive para ese período, o None si no existe.
 
     En vez de asumir nombre exacto de carpeta, busca todos los PDFs con ese nombre
@@ -298,10 +298,14 @@ def find_pdf_for_archivo_and_period(archivo_norm: str, period_label: str) -> Opt
     print("  period_label buscado:", period_label)
     print("  cantidad de archivos encontrados:", len(files))
 
+    # Normalizamos el período que nos llega (10/2025 o 10-2025 -> 10-2025)
+    normalized_period = period_label.replace("/", "-") if period_label else ""
+
     for f in files:
         parents = f.get("parents", [])
         if not parents:
             continue
+
         parent_id = parents[0]
         folder = service.files().get(
             fileId=parent_id,
@@ -309,9 +313,18 @@ def find_pdf_for_archivo_and_period(archivo_norm: str, period_label: str) -> Opt
         ).execute()
         folder_name = folder.get("name", "")
         label = period_folder_to_label(folder_name)
+
+        # Normalizamos carpeta y label
+        normalized_folder = folder_name.replace("/", "-") if folder_name else ""
+        normalized_label = label.replace("/", "-") if label else ""
+
         print("   - file:", f.get("id"), f.get("name"),
-              "| carpeta:", folder_name, "| label:", label)
-        if label == period_label:
+              "| carpeta:", folder_name, "| label:", label,
+              "| normalized_folder:", normalized_folder,
+              "| normalized_label:", normalized_label)
+
+        # Matcheamos por carpeta o por label, ya normalizados
+        if normalized_folder == normalized_period or normalized_label == normalized_period:
             print("  -> match encontrado, devolviendo file_id:", f.get("id"))
             return f.get("id")
 
