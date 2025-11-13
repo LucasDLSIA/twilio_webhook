@@ -886,14 +886,44 @@ def media_proxy(file_id):
 @app.route("/twilio/webhook", methods=["POST"])
 def twilio_webhook():
     from_whatsapp = request.form.get("From", "")
-    btn_payload   = request.form.get("ButtonPayload", "")  # Twilio Content API
 
-    # 1) Solo si viene botón "VIEW_NOW", disparamos el PDF del período actual
+    # Lo que ya tenías
+    btn_payload = (request.form.get("ButtonPayload", "") or "").strip()
+    btn_text    = (request.form.get("ButtonText", "") or "").strip()
+
+    # NUEVO: también miro el Body normal del mensaje
+    body        = (request.form.get("Body", "") or "").strip().lower()
+
+    # 1) Si viene un payload de botón, lo uso
     if btn_payload in ("VIEW_NOW", "VIEW_CURRENT"):
-        return handle_view_current(from_whatsapp)  # <- tu función que arma y manda el PDF
+        return handle_view_current(from_whatsapp)
 
-    # 2) Si querés, podés ignorar cualquier otro payload o texto
-    #    o responder con un mensaje guía.
+    # 2) Si por alguna razón Twilio no manda ButtonPayload,
+    #    pero sí manda el texto del botón en Body o ButtonText
+    if body in {
+        "1",
+        "si", "sí",
+        "visualizar",
+        "sí, visualizar",
+        "si, visualizar",
+        "ver recibo",
+        "sí visualizar",
+        "si visualizar",
+    }:
+        return handle_view_current(from_whatsapp)
+
+    # También podemos cubrir ButtonText por las dudas
+    if btn_text.lower() in {
+        "sí, visualizar",
+        "si, visualizar",
+        "sí visualizar",
+        "si visualizar",
+        "visualizar",
+        "ver recibo",
+    }:
+        return handle_view_current(from_whatsapp)
+
+    # Si no matchea nada de lo anterior, no respondemos nada
     return empty_twiml()
 
 
