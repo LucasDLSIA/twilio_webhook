@@ -922,6 +922,7 @@ def twilio_webhook():
         "ver recibo",
     }:
         return handle_view_current(from_whatsapp)
+    print("WEBHOOK FORM:", dict(request.form))
 
     # Si no matchea nada de lo anterior, no respondemos nada
     return empty_twiml()
