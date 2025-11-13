@@ -12,6 +12,8 @@ import io
 import pandas as pd
 from flask import Flask, request, Response
 from twilio.rest import Client
+from twilio.twiml.messaging_response import MessagingResponse
+
 
 from googleapiclient.discovery import build
 from google.oauth2 import service_account
@@ -703,44 +705,83 @@ def send_period_menu_via_text(
     text = "\n".join(lines)
     return twiml_message(text)
 
+def get_archivo_from_envios(telefono_whatsapp: str) -> Optional[str]:
+    """
+    Dado un telefono en formato 'whatsapp:+54911...', busca en el Excel de ENVÍOS
+    y devuelve el 'archivo_norm' más reciente para ese número.
+    """
+    tel_norm = canonicalize_phone(telefono_whatsapp)
+    envios_df = download_envios_excel()
+    archivo_norm = get_archivo_for_phone(tel_norm, envios_df)
+    return archivo_norm
+
+def build_twilio_response(text: str, media_url: Optional[str] = None) -> Response:
+    """
+    Construye una respuesta TwiML para Twilio con un mensaje de texto
+    y opcionalmente un adjunto (media_url).
+    """
+    resp = MessagingResponse()
+    msg = resp.message(body=text)
+    if media_url:
+        msg.media(media_url)
+    return Response(str(resp), mimetype="text/xml")
+
+def send_pdf_via_twilio_media(
+    telefono_whatsapp: str,
+    pdf_file_id: str,
+    period_label: str
+) -> Response:
+    """
+    Devuelve una respuesta TwiML que envía un mensaje + el PDF del recibo.
+    """
+    media_url = build_media_url_for_twilio(pdf_file_id)
+    text = f"Perfecto, te envío tu recibo de sueldo del período {period_label}."
+    return build_twilio_response(text, media_url)
 
 # ==========================
 #  Lógica de los caminos
 # ==========================
+def handle_view_current(form):
+    from_number = form.get("From")
 
-def handle_view_current(telefono_whatsapp: str) -> Response:
-    period_lbl = norm_period_label(PERIODO_ACTUAL)
-    tel_norm = normalize_phone(telefono_whatsapp)
-    print("DEBUG handle_view_current:",
-          {"raw": telefono_whatsapp, "tel_norm": tel_norm, "period": period_lbl})
+    # 1) Primero intentamos por MensajeSid (botón del template)
+    archivo = get_archivo_from_envios(form)
 
-    envios_df = download_envios_excel()
-    archivo_norm = get_archivo_for_phone(tel_norm, envios_df)
-    print("DEBUG handle_view_current archivo_norm:", archivo_norm)
+    # 2) Si no se encontró, hacemos fallback por teléfono
+    if not archivo:
+        print("DEBUG handle_view_current: no se encontró archivo por MensajeSid, probando por teléfono")
+        telefono_norm = normalize_phone(from_number)
+        envios_df = download_envios_excel()
+        archivo = get_archivo_for_phone(telefono_norm, envios_df)
 
-    if not archivo_norm:
-        return empty_twiml()
-
-    # Buscar el PDF correspondiente al período actual
-    pdf_id = find_pdf_for_archivo_and_period(archivo_norm, period_lbl)
-    if not pdf_id:
-        return twiml_message(
-            "⚠️ No encontré tu recibo para el período actual en el sistema."
+    # 3) Si sigue sin haber archivo, mandamos mensaje de ayuda
+    if not archivo:
+        return build_twilio_response(
+            "No encontramos un recibo asociado a este número de WhatsApp. "
+            "Por favor, escribime *AYUDA* para que podamos revisarlo."
         )
 
-    link = build_media_url_for_twilio(pdf_id)
-    txt  = f"✅ Acá tenés tu recibo del período {period_lbl}."
+    # 4) Buscamos el PDF para el período actual
+    pdf_file_id = find_pdf_for_archivo_and_period(archivo, PERIODO_ACTUAL)
 
-    # responder con TwiML que incluye el link
-    twiml = f"""<?xml version="1.0" encoding="UTF-8"?>
-<Response>
-  <Message>
-    <Body>{txt}</Body>
-    <Media>{link}</Media>
-  </Message>
-</Response>"""
-    return Response(twiml, mimetype="text/xml")
+    if not pdf_file_id:
+        return build_twilio_response(
+            f"No encontramos tu recibo de *{PERIODO_ACTUAL}* en el sistema. "
+            "Si creés que esto es un error, por favor escribirle a RRHH."
+        )
 
+    success = send_pdf_via_twilio_media(from_number, pdf_file_id, archivo, PERIODO_ACTUAL)
+
+    if success:
+        return build_twilio_response(
+            f"🧾 Te enviamos tu recibo de *{PERIODO_ACTUAL}* en un archivo PDF.\n\n"
+            "Si no te llegó nada, por favor escribime *AYUDA*."
+        )
+    else:
+        return build_twilio_response(
+            "Ocurrió un error al enviar tu recibo. "
+            "Por favor, intentá de nuevo en unos minutos o escribí *AYUDA*."
+        )
 
 
 
