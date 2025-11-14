@@ -25,7 +25,6 @@ from pathlib import Path
 
 app = Flask(__name__)
 
-init_db()
 
 # ==========================
 #  Configuración / entorno
@@ -86,59 +85,91 @@ def canonicalize_phone(x) -> str:
 # =========================
 # SQLITE: tabla de envíos pendientes
 # =========================
-DB_PATH = Path(__file__).with_name("sia_whatsapp.db")
+# === SQLite: almacenamiento de "pendientes de ver" ===
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+DB_PATH = os.path.join(BASE_DIR, "twilio_state.db")
+
+
+def get_db_connection():
+    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    return conn
+
 
 def init_db():
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS pending_views (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            from_number   TEXT NOT NULL,
-            archivo_norm  TEXT NOT NULL,
-            period_label  TEXT NOT NULL,
-            created_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    """)
-    conn.commit()
-    conn.close()
-
-def save_pending_view(from_number: str, archivo_norm: str, period_label: str) -> None:
-    """
-    Guarda que a este número se le envió el recibo archivo_norm
-    correspondiente al período period_label (ej: '10/2025').
-    """
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_db_connection()
     cur = conn.cursor()
     cur.execute(
-        "INSERT INTO pending_views (from_number, archivo_norm, period_label) VALUES (?, ?, ?)",
-        (from_number, archivo_norm, period_label),
+        """
+        CREATE TABLE IF NOT EXISTS pending_views (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            phone TEXT NOT NULL,
+            archivo_norm TEXT NOT NULL,
+            period_label TEXT NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+        """
+    )
+    cur.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_pending_views_phone_created
+        ON pending_views(phone, created_at);
+        """
     )
     conn.commit()
     conn.close()
 
-def get_last_pending_view(from_number: str):
+
+def save_pending_view(phone: str, archivo_norm: str, period_label: str) -> None:
     """
-    Devuelve (archivo_norm, period_label) del último envío hecho a este número,
-    o None si no hay nada.
+    Guarda que a este número (phone) le mandamos la plantilla
+    para cierto archivo_norm y período.
     """
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_db_connection()
     cur = conn.cursor()
-    cur.execute("""
+    cur.execute(
+        """
+        INSERT INTO pending_views (phone, archivo_norm, period_label)
+        VALUES (?, ?, ?)
+        """,
+        (phone, archivo_norm, period_label),
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_last_pending_view(phone: str):
+    """
+    Devuelve (archivo_norm, period_label) del último envío a ese número,
+    o None si no hay registros.
+    """
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute(
+        """
         SELECT archivo_norm, period_label
         FROM pending_views
-        WHERE from_number = ?
-        ORDER BY created_at DESC
+        WHERE phone = ?
+        ORDER BY created_at DESC, id DESC
         LIMIT 1
-    """, (from_number,))
+        """,
+        (phone,),
+    )
     row = cur.fetchone()
     conn.close()
-    if row:
-        return row[0], row[1]
-    return None
+
+    if not row:
+        return None
+
+    return row["archivo_norm"], row["period_label"]
 
 
 #=============================================================================
+
+# Inicializamos la DB al importar el módulo
+init_db()
+# ==========================
 
 def ensure_anyone_reader(file_id: str) -> None:
     """Se asegura de que el file sea accesible públicamente por link."""
