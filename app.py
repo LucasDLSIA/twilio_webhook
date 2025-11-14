@@ -1291,7 +1291,7 @@ def handle_view_current(from_whatsapp: str):
         f"Acá tenés tu recibo de sueldo de {period_label} 📄\n\n"
         "Cuando lo veas, por favor respondé:\n"
         "*1* si está todo OK ✅\n"
-        "*2* si tuviste algún problema ❗"
+        "*2* si tenes alguna observación ❗"
     )
 
     send_pdf_via_twilio_media(
@@ -1346,17 +1346,22 @@ TWILIO_ADMIN_WHATSAPP = os.getenv("TWILIO_ADMIN_WHATSAPP")  # ej: "whatsapp:+549
 def notify_issue_to_admin(from_whatsapp: str):
     """
     Envía un mensaje a RRHH avisando que esta persona tuvo un problema con el PDF.
-    Usa TWILIO_ADMIN_WHATSAPP como destino.
+    Usa TWILIO_ADMIN_WHATSAPP como destino (WhatsApp).
     """
     if not TWILIO_ADMIN_WHATSAPP:
         print("TWILIO_ADMIN_WHATSAPP no está configurado, no se envía aviso a RRHH.")
         return
 
-    # Intentamos enriquecer el mensaje con nombre / archivo / período
+    # Normalizamos el número del admin al canal WhatsApp
+    admin_to = TWILIO_ADMIN_WHATSAPP.strip()
+    if not admin_to.startswith("whatsapp:"):
+        # si lo pusiste como +54911..., lo convertimos a whatsapp:+54911...
+        admin_to = "whatsapp:" + admin_to.lstrip("+")
+
     try:
         nombre = ""
         try:
-            # si tenés esta función definida
+            # si tenés esta función definida, sino podés comentar este bloque
             nombre = resolve_name_for_phone(from_whatsapp) or ""
         except Exception as e:
             print("WARN resolve_name_for_phone falló:", e)
@@ -1367,7 +1372,7 @@ def notify_issue_to_admin(from_whatsapp: str):
         if pending:
             archivo_norm, period_label = pending
 
-        partes = [f"El número {from_whatsapp} reportó un problema al ver su recibo."]
+        partes = [f"El número {from_whatsapp} reporta observaciones al ver su recibo."]
 
         if nombre:
             partes.append(f"Nombre: {nombre}.")
@@ -1379,8 +1384,8 @@ def notify_issue_to_admin(from_whatsapp: str):
         body = " ".join(partes)
 
         twilio_client.messages.create(
-            from_=TWILIO_WHATSAPP_FROM,
-            to=TWILIO_ADMIN_WHATSAPP,
+            from_=TWILIO_WHATSAPP_FROM,  # sigue siendo tu número de WhatsApp
+            to=admin_to,                 # ahora seguro es whatsapp:+549...
             body=body,
         )
         print("DEBUG notify_issue_to_admin -> enviado a RRHH")
