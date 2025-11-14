@@ -1284,9 +1284,15 @@ def handle_view_current(from_whatsapp: str):
         )
         return build_twilio_response(msg)
 
-    # Usamos el proxy /media/<file_id> para Twilio
+    # Usamos el proxy /media/<file_id>
     media_url = build_media_url_for_twilio(file_id)
-    caption = f"Acá tenés tu recibo de sueldo de {period_label} 📄"
+
+    caption = (
+        f"Acá tenés tu recibo de sueldo de {period_label} 📄\n\n"
+        "Cuando lo veas, por favor respondé:\n"
+        "*1* si está todo OK ✅\n"
+        "*2* si tuviste algún problema ❗"
+    )
 
     send_pdf_via_twilio_media(
         from_whatsapp,
@@ -1296,21 +1302,7 @@ def handle_view_current(from_whatsapp: str):
         period_label=period_label,
     )
 
-    # Mensaje de confirmación (texto)
-    try:
-        confirm_text = (
-            "¿Pudiste ver bien tu recibo de sueldo?\n\n"
-            "Respondé *1* si está todo OK ✅\n"
-            "Respondé *2* si tuviste algún problema ❗"
-        )
-        twilio_client.messages.create(
-            from_=TWILIO_WHATSAPP_FROM,
-            to=from_whatsapp,
-            body=confirm_text,
-        )
-    except Exception as e:
-        print("ERROR enviando mensaje de confirmación:", e)
-
+    # Ya no mandamos un segundo mensaje de texto.
     return ("", 200)
 
 
