@@ -19,7 +19,13 @@ from googleapiclient.discovery import build
 from google.oauth2 import service_account
 from googleapiclient.http import MediaIoBaseDownload
 
+import sqlite3
+from pathlib import Path
+
+
 app = Flask(__name__)
+
+init_db()
 
 # ==========================
 #  Configuración / entorno
@@ -76,6 +82,63 @@ def canonicalize_phone(x) -> str:
     # return digits[-10:] if len(digits) > 10 else digits
     return digits
 
+#=============================================================================
+# =========================
+# SQLITE: tabla de envíos pendientes
+# =========================
+DB_PATH = Path(__file__).with_name("sia_whatsapp.db")
+
+def init_db():
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS pending_views (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            from_number   TEXT NOT NULL,
+            archivo_norm  TEXT NOT NULL,
+            period_label  TEXT NOT NULL,
+            created_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    conn.commit()
+    conn.close()
+
+def save_pending_view(from_number: str, archivo_norm: str, period_label: str) -> None:
+    """
+    Guarda que a este número se le envió el recibo archivo_norm
+    correspondiente al período period_label (ej: '10/2025').
+    """
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute(
+        "INSERT INTO pending_views (from_number, archivo_norm, period_label) VALUES (?, ?, ?)",
+        (from_number, archivo_norm, period_label),
+    )
+    conn.commit()
+    conn.close()
+
+def get_last_pending_view(from_number: str):
+    """
+    Devuelve (archivo_norm, period_label) del último envío hecho a este número,
+    o None si no hay nada.
+    """
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT archivo_norm, period_label
+        FROM pending_views
+        WHERE from_number = ?
+        ORDER BY created_at DESC
+        LIMIT 1
+    """, (from_number,))
+    row = cur.fetchone()
+    conn.close()
+    if row:
+        return row[0], row[1]
+    return None
+
+
+#=============================================================================
 
 def ensure_anyone_reader(file_id: str) -> None:
     """Se asegura de que el file sea accesible públicamente por link."""
@@ -510,39 +573,16 @@ def send_template(to_phone: str, period_label: str, cuil: str | None = None) -> 
         return None
 
 
-#@app.route("/admin/send_template_one", methods=["POST"])
-#def admin_send_template_one():
-    to = normalize_to_whatsapp_e164(request.form.get("to", ""))
-    # period puede seguir viniendo para tu logging o trazabilidad, pero NO lo usamos para la plantilla
-    period_raw = request.form.get("period") or PERIODO_ACTUAL or ""
-
-    if not to:
-        return {"ok": False, "error": "falta 'to'"}, 400
-
-    # buscamos el NOMBRE para la plantilla {{1}}
-    try:
-        name = resolve_name_for_phone(to)  # <- ver helper más abajo
-    except Exception:
-        name = ""  # si no hay nombre, mandamos vacío (mejor que fallar)
-
-    sid = send_template_with_name(to, name)  # <- ver helper más abajo
-    if not sid:
-        return {"ok": False, "error": "no se pudo enviar la plantilla"}, 500
-
-    # IMPORTANTE: NO enviar PDF acá.
-    return {"ok": True, "sid": sid}, 200
-
 def empty_twiml():
     return Response('<?xml version="1.0" encoding="UTF-8"?><Response></Response>',
                     mimetype="text/xml")
-
 
 @app.route("/admin/send_template_all", methods=["POST"])
 def admin_send_template_all():
     try:
         period_raw = request.form.get("period") or PERIODO_ACTUAL or ""
         period_lbl = norm_period_label(period_raw)
-        dry_run    = (request.form.get("dry_run") or "").lower() in ("1","true","yes","y")
+        dry_run    = (request.form.get("dry_run") or "").lower() in ("1", "true", "yes", "y")
         limit      = int(request.form.get("limit") or 0)  # 0 = sin límite
 
         rows = read_envios_rows()
@@ -596,23 +636,28 @@ def admin_send_template_all():
                 continue
 
             if dry_run:
+                # Solo simulamos el envío, no llamamos a Twilio ni guardamos en sqlite
                 sent.append({
                     "to": to,
                     "name": nombre,
                     "archivo_norm": archivo_norm,
                     "period": period_lbl,
-                    "dry_run": True
+                    "dry_run": True,
                 })
                 total += 1
             else:
+                # Enviamos la plantilla con el nombre
                 sid = send_template_with_name(to, nombre)
                 if sid:
+                    # Guardamos en sqlite qué archivo y período le corresponde a este número
+                    save_pending_view(to, archivo_norm, period_lbl)
+
                     sent.append({
-                        "to": to,
-                        "name": nombre,
                         "archivo_norm": archivo_norm,
+                        "to": to,
+                        "nombre": nombre,
+                        "sid": sid,
                         "period": period_lbl,
-                        "sid": sid
                     })
                     total += 1
                 else:
@@ -628,7 +673,7 @@ def admin_send_template_all():
             "sent_count": len(sent),
             "skipped_count": len(skipped),
             "sent": sent[:200],
-            "skipped": skipped[:200]
+            "skipped": skipped[:200],
         }, 200
 
     except Exception as e:
@@ -766,43 +811,36 @@ def get_current_period_label():
 # ==========================
 #  Lógica de los caminos
 # ==========================
-def handle_view_current(from_number: str):
-    """
-    Maneja cuando el usuario toca el botón 'Sí, visualizar':
-    usamos el número de WhatsApp para buscar el archivo en Envios
-    y enviarle el PDF del período actual.
-    """
-    print("DEBUG handle_view_current, from_number:", from_number)
+def handle_view_current(from_whatsapp: str):
+    print(f"DEBUG handle_view_current, from_number: {from_whatsapp}")
 
-    # from_number ya viene como 'whatsapp:+54911...'
-    envios_df = download_envios_excel()
-
-    # normalizamos el número (le sacamos 'whatsapp:' y demás)
-    tel_norm = canonicalize_phone(from_number)
-
-    # buscamos el archivo_norm en el Excel de envíos
-    archivo_norm = get_archivo_for_phone(tel_norm, envios_df)
-
-    if not archivo_norm:
-        print("No se encontró archivo_norm para el teléfono:", tel_norm)
-        return build_twilio_response(
-            "No encontramos un recibo asociado a tu número para este período. "
-            "Por favor contactate con Recursos Humanos."
+    # 1) Buscar en sqlite el último envío que hicimos a este número
+    pending = get_last_pending_view(from_whatsapp)
+    if not pending:
+        msg = (
+            "No encontré ningún recibo pendiente para este número 😕.\n"
+            "Si creés que es un error, avisá a RRHH para que lo revisen 🙏."
         )
+        return build_twilio_response(msg)
 
-    # acá asumimos que ya tenés period_label actual (por ejemplo, '10/2025')
-    period_label = get_current_period_label()  # o como lo estés resolviendo ahora
+    archivo_norm, period_label = pending
 
-    print(f"DEBUG handle_view_current -> archivo_norm: {archivo_norm}, period_label: {period_label}")
+    # Normalizamos el período a formato que usa Drive (mm/aaaa)
+    period_for_drive = norm_period_label(period_label)
 
-    pdf_file_id = find_pdf_for_archivo_and_period(archivo_norm, period_label)
+    print(
+        f"DEBUG handle_view_current -> archivo_norm: {archivo_norm}, "
+        f"period_label_db: {period_label}, period_for_drive: {period_for_drive}"
+    )
 
+    # 2) Buscar el PDF en Drive usando archivo_norm + period_for_drive (ej: '10/2025')
+    pdf_file_id = find_pdf_for_archivo_and_period(archivo_norm, period_for_drive)
     if not pdf_file_id:
-        print("No se encontró PDF para ese archivo_norm + período")
-        return build_twilio_response(
-            f"No encontramos tu recibo del período {period_label}. "
-            "Por favor contactate con Recursos Humanos."
+        msg = (
+            f"No pude encontrar el PDF de tu recibo para el período {period_for_drive} 😕.\n"
+            "Avisá a RRHH para que lo revisen 🙏."
         )
+        return build_twilio_response(msg)
 
     # construimos la URL pública para Twilio y respondemos con el PDF
     media_url = build_media_url_for_twilio(pdf_file_id)
