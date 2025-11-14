@@ -1097,6 +1097,26 @@ def twilio_webhook():
     return build_twilio_response(msg)
 
 
+@app.route("/ping")
+def ping():
+    return "pong", 200
+
+import threading
+import time
+import requests
+
+def keep_alive():
+    url = "https://twilio-webhook-lddc.onrender.com/ping"
+    while True:
+        try:
+            print("KEEP-ALIVE: haciendo ping...")
+            requests.get(url, timeout=10)
+        except Exception as e:
+            print("KEEP-ALIVE error:", e)
+        time.sleep(60)
+
+t = threading.Thread(target=keep_alive, daemon=True)
+t.start()
 
 if __name__ == "__main__":
     # Para pruebas locales
