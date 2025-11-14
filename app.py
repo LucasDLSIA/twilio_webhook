@@ -533,16 +533,23 @@ def find_archivo_by_phone(to_whatsapp: str) -> str | None:
     Compara flexible: ignora espacios/guiones.
     """
     rows = read_envios_rows()
-    # normalizamos: quitamos todo menos dígitos para comparar
-    want = re.sub(r"\D", "", to_whatsapp)
+    want = re.sub(r"\D", "", to_whatsapp or "")
     for r in rows:
-        tel = r.get("telefono", "")
-        arc = r.get("archivo_norm", "") or r.get("archivo", "")
+        # soportar Telefono / teléfono
+        tel = r.get("Telefono") or r.get("Teléfono") or r.get("telefono") or ""
+        # soportar Archivo_norm / archivo_norm / Archivo / archivo
+        arc = (
+            r.get("Archivo_norm")
+            or r.get("archivo_norm")
+            or r.get("Archivo")
+            or r.get("archivo")
+            or ""
+        )
         if not tel or not arc:
             continue
-        tclean = re.sub(r"\D", "", tel)
+        tclean = re.sub(r"\D", "", str(tel))
         if tclean.endswith(want) or want.endswith(tclean):
-            return arc.strip()
+            return str(arc).strip()
     return None
 
 import json
@@ -552,13 +559,28 @@ def resolve_name_for_phone(phone_e164: str) -> str:
     rows = read_envios_rows()
     target = canonicalize_phone(phone_e164)
     for r in rows:
-        tel = canonicalize_phone(r.get("Telefono") or r.get("Teléfono"))
+        tel = canonicalize_phone(
+            r.get("Telefono") or r.get("Teléfono") or r.get("telefono")
+        )
         if tel and tel == target:
-            for k in ("Nombre", "Nombre y apellido", "Apellido y nombre", "Empleado", "Persona"):
+            for k in (
+                "Nombre",
+                "Nombre y apellido",
+                "Apellido y nombre",
+                "Empleado",
+                "Persona",
+                "nombre",
+                "nombre y apellido",
+                "apellido y nombre",
+                "empleado",
+                "persona",
+            ):
                 v = s(r.get(k))
                 if v:
                     return v
     return ""
+
+
 
 def send_template_whatsapp_norm(to_e164: str, name: str) -> str | None:
     """
@@ -617,8 +639,8 @@ def empty_twiml():
 @app.route("/admin/send_template_all", methods=["POST"])
 def admin_send_template_all():
     try:
-        period_raw = request.form.get("period") or PERIODO_ACTUAL or ""
-        period_lbl = norm_period_label(period_raw)  # ej. "10/2025" o "10-2025"
+        period_raw = request.form.get("period") or PERIODO_ACTUAL or get_current_period_label()
+        period_lbl = norm_period_label(period_raw)
         dry_run = (request.form.get("dry_run") or "").lower() in ("1", "true", "yes", "y")
         limit = int(request.form.get("limit") or 0)  # 0 = sin límite
 
@@ -881,9 +903,10 @@ def handle_view_current(from_whatsapp: str):
         )
         return build_twilio_response(msg)
 
-    # 3) Generar el link directo de Drive y mandarlo como media
-    media_url = build_drive_public_link(file_id)
+    # 3) Usar el proxy /media/<file_id>, como en el camino de menú
+    media_url = build_media_url_for_twilio(file_id)
     caption = f"Acá tenés tu recibo de sueldo de {period_label} 📄"
+
     send_pdf_via_twilio_media(from_whatsapp, media_url, caption=caption)
 
     # Twilio no necesita más texto, con status 200 ya está
