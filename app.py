@@ -88,61 +88,67 @@ def canonicalize_phone(x) -> str:
 # === SQLite: almacenamiento de "pendientes de ver" ===
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-DB_PATH = os.path.join(BASE_DIR, "twilio_state.db")
+import os
+import sqlite3
+import time
+
+# Ruta del archivo SQLite
+# En local: usa "pending_views.db"
+# En Render con disk persistente, podés usar /data/pending_views.db
+DB_PATH = os.environ.get("PENDING_DB_PATH", "pending_views.db")
 
 
 def get_db_connection():
+    """
+    Devuelve una conexión a SQLite.
+    """
     conn = sqlite3.connect(DB_PATH, check_same_thread=False)
-    conn.row_factory = sqlite3.Row
     return conn
 
 
 def init_db():
+    """
+    Crea la tabla si no existe.
+    """
     conn = get_db_connection()
     cur = conn.cursor()
     cur.execute(
         """
         CREATE TABLE IF NOT EXISTS pending_views (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            phone TEXT NOT NULL,
+            to_whatsapp TEXT NOT NULL,
             archivo_norm TEXT NOT NULL,
             period_label TEXT NOT NULL,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            created_at INTEGER NOT NULL
         );
-        """
-    )
-    cur.execute(
-        """
-        CREATE INDEX IF NOT EXISTS idx_pending_views_phone_created
-        ON pending_views(phone, created_at);
         """
     )
     conn.commit()
     conn.close()
 
 
-def save_pending_view(phone: str, archivo_norm: str, period_label: str) -> None:
+def save_pending_view(to_whatsapp: str, archivo_norm: str, period_label: str):
     """
-    Guarda que a este número (phone) le mandamos la plantilla
-    para cierto archivo_norm y período.
+    Guarda que a este número le mandamos la plantilla
+    asociada a (archivo_norm, period_label).
     """
     conn = get_db_connection()
     cur = conn.cursor()
     cur.execute(
         """
-        INSERT INTO pending_views (phone, archivo_norm, period_label)
-        VALUES (?, ?, ?)
+        INSERT INTO pending_views (to_whatsapp, archivo_norm, period_label, created_at)
+        VALUES (?, ?, ?, ?);
         """,
-        (phone, archivo_norm, period_label),
+        (to_whatsapp, archivo_norm, period_label, int(time.time())),
     )
     conn.commit()
     conn.close()
 
 
-def get_last_pending_view(phone: str):
+def get_last_pending_view(from_whatsapp: str):
     """
-    Devuelve (archivo_norm, period_label) del último envío a ese número,
-    o None si no hay registros.
+    Devuelve el último (archivo_norm, period_label) pendiente
+    para ese número de WhatsApp, o None si no hay.
     """
     conn = get_db_connection()
     cur = conn.cursor()
@@ -150,25 +156,25 @@ def get_last_pending_view(phone: str):
         """
         SELECT archivo_norm, period_label
         FROM pending_views
-        WHERE phone = ?
-        ORDER BY created_at DESC, id DESC
-        LIMIT 1
+        WHERE to_whatsapp = ?
+        ORDER BY created_at DESC
+        LIMIT 1;
         """,
-        (phone,),
+        (from_whatsapp,),
     )
     row = cur.fetchone()
     conn.close()
 
-    if not row:
-        return None
+    if row:
+        return row[0], row[1]
+    return None
 
-    return row["archivo_norm"], row["period_label"]
 
-
-#=============================================================================
-
-# Inicializamos la DB al importar el módulo
+# ⚠️ MUY IMPORTANTE:
+# Llamamos a init_db() al importar el módulo
+# (para que gunicorn lo ejecute siempre)
 init_db()
+
 # ==========================
 
 def ensure_anyone_reader(file_id: str) -> None:
@@ -554,7 +560,7 @@ def resolve_name_for_phone(phone_e164: str) -> str:
                     return v
     return ""
 
-def send_template_with_name(to_e164: str, name: str) -> str | None:
+def send_template_whatsapp_norm(to_e164: str, name: str) -> str | None:
     """
     Envía la plantilla de WhatsApp usando la variable {{1}} = nombre.
     Devuelve el SID del mensaje o None si falla.
@@ -574,7 +580,7 @@ def send_template_with_name(to_e164: str, name: str) -> str | None:
         )
         return msg.sid
     except Exception as e:
-        print("ERROR send_template_with_name:", e)
+        print("ERROR send_template_whatsapp_norm:", e)
         return None
 
 
@@ -612,9 +618,9 @@ def empty_twiml():
 def admin_send_template_all():
     try:
         period_raw = request.form.get("period") or PERIODO_ACTUAL or ""
-        period_lbl = norm_period_label(period_raw)
-        dry_run    = (request.form.get("dry_run") or "").lower() in ("1", "true", "yes", "y")
-        limit      = int(request.form.get("limit") or 0)  # 0 = sin límite
+        period_lbl = norm_period_label(period_raw)  # ej. "10/2025" o "10-2025"
+        dry_run = (request.form.get("dry_run") or "").lower() in ("1", "true", "yes", "y")
+        limit = int(request.form.get("limit") or 0)  # 0 = sin límite
 
         rows = read_envios_rows()
         if not rows:
@@ -624,25 +630,24 @@ def admin_send_template_all():
         skipped = []
         total = 0
 
-        # 👇 SOLO UN for
         for r in rows:
             # columnas esperadas
             telefono = s(r.get("Telefono") or r.get("Teléfono"))
 
-            # OJO: usamos Archivo_norm si existe, si no, caemos a Archivo/CUIL/Cuil
+            # usamos Archivo_norm si existe, si no, caemos a otras
             archivo_norm = s(
-                r.get("Archivo_norm") or
-                r.get("Archivo") or
-                r.get("CUIL") or
-                r.get("Cuil")
+                r.get("Archivo_norm")
+                or r.get("Archivo")
+                or r.get("CUIL")
+                or r.get("Cuil")
             )
 
             nombre = s(
-                r.get("Nombre") or
-                r.get("Nombre y apellido") or
-                r.get("Apellido y nombre") or
-                r.get("Empleado") or
-                r.get("Persona")
+                r.get("Nombre")
+                or r.get("Nombre y apellido")
+                or r.get("Apellido y nombre")
+                or r.get("Empleado")
+                or r.get("Persona")
             )
 
             # Validaciones mínimas
@@ -653,21 +658,20 @@ def admin_send_template_all():
                 skipped.append({"reason": "sin_archivo_norm", "row": r})
                 continue
 
-            # Canonicalizar y prefijo WhatsApp
+            # Canonicalizamos a formato whatsapp:+54911...
             try:
                 to = normalize_to_whatsapp_e164(telefono)
             except Exception:
                 skipped.append({"reason": "telefono_invalido", "row": r})
                 continue
 
-            # ✅ chequeamos si existe PDF para ese período
+            # Chequeamos si existe PDF para ese período
             pdf_id = find_pdf_for_archivo_and_period(archivo_norm, period_lbl)
             if not pdf_id:
                 skipped.append({"reason": "sin_pdf_periodo", "row": r})
                 continue
 
             if dry_run:
-                # Solo simulamos el envío, no llamamos a Twilio ni guardamos en sqlite
                 sent.append({
                     "to": to,
                     "name": nombre,
@@ -677,19 +681,24 @@ def admin_send_template_all():
                 })
                 total += 1
             else:
-                # Enviamos la plantilla con el nombre
-                sid = send_template_with_name(to, nombre)
+                # Usá la función que ya tengas para mandar la plantilla
+                # (acá supongo que la tuya es send_template_whatsapp_norm)
+                sid = send_template_whatsapp_norm(to, nombre)
+
                 if sid:
+                    sent.append(
+                        {
+                            "archivo_norm": archivo_norm,
+                            "to": to,
+                            "nombre": nombre,
+                            "sid": sid,
+                            "period": period_lbl,
+                        }
+                    )
+
                     # Guardamos en sqlite qué archivo y período le corresponde a este número
                     save_pending_view(to, archivo_norm, period_lbl)
 
-                    sent.append({
-                        "archivo_norm": archivo_norm,
-                        "to": to,
-                        "nombre": nombre,
-                        "sid": sid,
-                        "period": period_lbl,
-                    })
                     total += 1
                 else:
                     skipped.append({"reason": "twilio_error_envio_plantilla", "row": r})
@@ -810,22 +819,28 @@ def build_twilio_response(text: str, media_url: Optional[str] = None) -> Respons
     y opcionalmente un adjunto (media_url).
     """
     resp = MessagingResponse()
-    msg = resp.message(body=text)
+    msg = resp.message(text)
     if media_url:
         msg.media(media_url)
     return Response(str(resp), mimetype="text/xml")
 
-def send_pdf_via_twilio_media(
-    telefono_whatsapp: str,
-    pdf_file_id: str,
-    period_label: str
-) -> Response:
+def send_pdf_via_twilio_media(to_whatsapp: str, media_url: str, caption: str = "") -> str:
     """
-    Devuelve una respuesta TwiML que envía un mensaje + el PDF del recibo.
+    Envía un mensaje de WhatsApp con el PDF adjunto.
+
+    - to_whatsapp: ej. 'whatsapp:+5491136222572'
+    - media_url: URL directa al PDF en Drive
+    - caption: texto que acompaña al PDF
     """
-    media_url = build_media_url_for_twilio(pdf_file_id)
-    text = f"Perfecto, te envío tu recibo de sueldo del período {period_label}."
-    return build_twilio_response(text, media_url)
+    # Usa el mismo cliente y FROM que usás para las plantillas
+    msg = twilio_client.messages.create(
+        from_=TWILIO_WHATSAPP_FROM,   # mismo que en send_template_whatsapp_norm
+        to=to_whatsapp,
+        body=caption or None,
+        media_url=[media_url],
+    )
+    print("DEBUG send_pdf_via_twilio_media SID:", msg.sid)
+    return msg.sid
 
 import os
 from datetime import datetime
@@ -855,28 +870,24 @@ def handle_view_current(from_whatsapp: str):
         return build_twilio_response(msg)
 
     archivo_norm, period_label = pending
+    print(f"DEBUG handle_view_current -> archivo_norm: {archivo_norm}, period_label: {period_label}")
 
-    # Normalizamos el período a formato que usa Drive (mm/aaaa)
-    period_for_drive = norm_period_label(period_label)
-
-    print(
-        f"DEBUG handle_view_current -> archivo_norm: {archivo_norm}, "
-        f"period_label_db: {period_label}, period_for_drive: {period_for_drive}"
-    )
-
-    # 2) Buscar el PDF en Drive usando archivo_norm + period_for_drive (ej: '10/2025')
-    pdf_file_id = find_pdf_for_archivo_and_period(archivo_norm, period_for_drive)
-    if not pdf_file_id:
+    # 2) Buscar el PDF en Drive usando archivo_norm + period_label
+    file_id = find_pdf_for_archivo_and_period(archivo_norm, period_label)
+    if not file_id:
         msg = (
-            f"No pude encontrar el PDF de tu recibo para el período {period_for_drive} 😕.\n"
+            f"No pude encontrar el PDF de tu recibo para el período {period_label} 😕.\n"
             "Avisá a RRHH para que lo revisen 🙏."
         )
         return build_twilio_response(msg)
 
-    # construimos la URL pública para Twilio y respondemos con el PDF
-    media_url = build_media_url_for_twilio(pdf_file_id)
-    text = f"Perfecto, te envío tu recibo de sueldo del período {period_label}."
-    return build_twilio_response(text, media_url)
+    # 3) Generar el link directo de Drive y mandarlo como media
+    media_url = build_drive_public_link(file_id)
+    caption = f"Acá tenés tu recibo de sueldo de {period_label} 📄"
+    send_pdf_via_twilio_media(from_whatsapp, media_url, caption=caption)
+
+    # Twilio no necesita más texto, con status 200 ya está
+    return ("", 200)
 
 
 
@@ -1032,30 +1043,36 @@ def media_proxy(file_id):
 #  Webhook Twilio
 # ==========================
 
+from flask import request
+from twilio.twiml.messaging_response import MessagingResponse
+
 @app.route("/twilio/webhook", methods=["POST"])
 def twilio_webhook():
-    from_whatsapp = request.form.get("From", "")
-    btn_payload   = request.form.get("ButtonPayload", "")  # Twilio Content API
-    body_raw      = request.form.get("Body", "") or ""
-
-    # Debug para ver exactamente qué llega desde Twilio
+    form = request.form.to_dict()
     print("=== TWILIO WEBHOOK FORM ===")
-    print(dict(request.form))
+    print(form)
 
-    body = body_raw.strip().lower()
+    from_whatsapp = form.get("From")  # ej: "whatsapp:+5491136222572"
+    body = (form.get("Body") or "").strip()
+    button_payload = form.get("ButtonPayload") or ""
+    button_text = form.get("ButtonText") or ""
 
-    # 1) Caso: viene un botón interactivo con payload
-    if btn_payload in ("VIEW_NOW", "VIEW_CURRENT"):
+    # Caso: tocaron el botón "Sí, visualizar"
+    if button_payload == "VIEW_NOW" or button_text.lower().startswith("sí, visualizar"):
         return handle_view_current(from_whatsapp)
 
-    # 2) Caso: el usuario escribe el texto "Sí, visualizar" o similar
-    if "visualizar" in body:
-        # Cualquier mensaje que contenga la palabra "visualizar"
-        # dispara el envío del PDF
+    # Si escribe algo tipo "ver", "ver recibo", etc., también podés engancharlo
+    if body.lower() in ("ver", "ver recibo", "ver recibo de sueldo", "si, visualizar", "sí, visualizar"):
         return handle_view_current(from_whatsapp)
 
-    # 3) Si no coincide nada, devolvés un TwiML vacío o un mensaje guía
-    return empty_twiml()
+    # Respuesta por defecto
+    msg = (
+        "Hola 👋\n"
+        "Tu recibo de sueldo está disponible.\n"
+        "Usá el botón *Sí, visualizar* para recibirlo, o escribí *ver*."
+    )
+    return build_twilio_response(msg)
+
 
 
 if __name__ == "__main__":
