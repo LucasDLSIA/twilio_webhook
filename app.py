@@ -22,6 +22,15 @@ from googleapiclient.http import MediaIoBaseDownload
 import sqlite3
 from pathlib import Path
 
+from openpyxl import Workbook
+from openpyxl.utils import get_column_letter
+from flask import send_file
+from collections import defaultdict
+from datetime import datetime
+import os
+import sqlite3
+
+
 
 app = Flask(__name__)
 
@@ -107,11 +116,9 @@ def get_db_connection():
 
 
 def init_db():
-    """
-    Crea la tabla si no existe.
-    """
     conn = get_db_connection()
     cur = conn.cursor()
+
     cur.execute(
         """
         CREATE TABLE IF NOT EXISTS pending_views (
@@ -123,6 +130,42 @@ def init_db():
         );
         """
     )
+
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS message_status (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            message_sid TEXT UNIQUE NOT NULL,
+            to_whatsapp TEXT,
+            archivo_norm TEXT,
+            period_label TEXT,
+            nombre TEXT,             -- ← nombre de la persona
+            kind TEXT,               -- 'template' o 'media'
+            created_at INTEGER,      -- ← CUANDO lo enviamos
+            last_status TEXT,        -- queued/sent/delivered/read/failed/undelivered
+            last_status_at INTEGER,
+            read_at INTEGER,
+            delivered_at INTEGER,
+            failed_at INTEGER,
+            error_code TEXT,
+            error_message TEXT
+        );
+        """
+    )
+
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS view_confirmations (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            from_whatsapp TEXT NOT NULL,
+            archivo_norm TEXT,
+            period_label TEXT,
+            response TEXT,          -- 'ok' o 'problema'
+            created_at INTEGER NOT NULL
+        );
+        """
+    )
+
     conn.commit()
     conn.close()
 
@@ -169,6 +212,144 @@ def get_last_pending_view(from_whatsapp: str):
         return row[0], row[1]
     return None
 
+#============================================
+import time
+from typing import Optional, Tuple
+
+def save_message_sent(
+    message_sid: str,
+    to_whatsapp: str,
+    archivo_norm: Optional[str],
+    period_label: Optional[str],
+    kind: str,
+    nombre: Optional[str] = None,
+):
+    """
+    Registra que enviamos un mensaje (plantilla o media).
+    kind: 'template' o 'media'
+    """
+    conn = get_db_connection()
+    cur = conn.cursor()
+    now_ts = int(time.time())
+    cur.execute(
+        """
+        INSERT OR IGNORE INTO message_status (
+            message_sid, to_whatsapp, archivo_norm, period_label,
+            nombre, kind, created_at, last_status, last_status_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?);
+        """,
+        (
+            message_sid,
+            to_whatsapp,
+            archivo_norm,
+            period_label,
+            nombre,
+            kind,
+            now_ts,      # created_at = momento de envío
+            "sent",      # estado inicial
+            now_ts,
+        ),
+    )
+    conn.commit()
+    conn.close()
+
+
+def update_message_status_and_get(
+    message_sid: str,
+    status: str,
+    error_code: Optional[str] = None,
+    error_message: Optional[str] = None,
+) -> Tuple[Optional[str], Optional[str]]:
+    """
+    Actualiza el estado de un mensaje por SID y devuelve (kind, to_whatsapp).
+    """
+    conn = get_db_connection()
+    conn.row_factory = sqlite3.Row
+    cur = conn.cursor()
+
+    cur.execute(
+        "SELECT kind, to_whatsapp FROM message_status WHERE message_sid = ?;",
+        (message_sid,),
+    )
+    row = cur.fetchone()
+    now_ts = int(time.time())
+
+    if row:
+        kind = row["kind"]
+        to_whatsapp = row["to_whatsapp"]
+        cur.execute(
+            """
+            UPDATE message_status
+            SET last_status = ?, last_status_at = ?,
+                read_at = CASE WHEN ? = 'read' THEN COALESCE(read_at, ?) ELSE read_at END,
+                delivered_at = CASE WHEN ? = 'delivered' THEN COALESCE(delivered_at, ?) ELSE delivered_at END,
+                failed_at = CASE WHEN ? IN ('failed','undelivered') THEN COALESCE(failed_at, ?) ELSE failed_at END,
+                error_code = COALESCE(?, error_code),
+                error_message = COALESCE(?, error_message)
+            WHERE message_sid = ?;
+            """,
+            (
+                status,
+                now_ts,
+                status,
+                now_ts,
+                status,
+                now_ts,
+                status,
+                now_ts,
+                error_code,
+                error_message,
+                message_sid,
+            ),
+        )
+        conn.commit()
+        conn.close()
+        return kind, to_whatsapp
+
+    # Si no existía, lo registramos mínimo
+    cur.execute(
+        """
+        INSERT OR IGNORE INTO message_status (
+            message_sid, last_status, last_status_at, error_code, error_message
+        ) VALUES (?, ?, ?, ?, ?);
+        """,
+        (message_sid, status, now_ts, error_code, error_message),
+    )
+    conn.commit()
+    conn.close()
+    return None, None
+
+
+def save_user_confirmation(from_whatsapp: str, response: str):
+    """
+    Guarda que el usuario respondió 'ok' o 'problema' sobre el último recibo pendiente.
+    """
+    archivo_norm = None
+    period_label = None
+    pending = get_last_pending_view(from_whatsapp)
+    if pending:
+        archivo_norm, period_label = pending
+
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        INSERT INTO view_confirmations (
+            from_whatsapp, archivo_norm, period_label, response, created_at
+        ) VALUES (?, ?, ?, ?, ?);
+        """,
+        (
+            from_whatsapp,
+            archivo_norm,
+            period_label,
+            response,
+            int(time.time()),
+        ),
+    )
+    conn.commit()
+    conn.close()
+#=============================
+
 
 # ⚠️ MUY IMPORTANTE:
 # Llamamos a init_db() al importar el módulo
@@ -177,6 +358,186 @@ init_db()
 
 # ==========================
 
+def ts_to_str(ts: Optional[int]) -> str:
+    if not ts:
+        return ""
+    try:
+        return datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M:%S")
+    except Exception:
+        return ""
+
+
+def generate_excel_report() -> str:
+    """
+    Lee message_status + view_confirmations y genera un Excel en /tmp/reporte_recibos.xlsx
+    con una fila por persona/período.
+    """
+    conn = get_db_connection()
+    conn.row_factory = sqlite3.Row
+    cur = conn.cursor()
+
+    # Traemos TODOS los mensajes registrados
+    cur.execute(
+        """
+        SELECT
+            message_sid, to_whatsapp, archivo_norm, period_label,
+            nombre, kind, created_at, last_status,
+            last_status_at, read_at, delivered_at, failed_at
+        FROM message_status;
+        """
+    )
+    msg_rows = cur.fetchall()
+
+    # Agregamos confirmaciones
+    cur.execute(
+        """
+        SELECT from_whatsapp, archivo_norm, period_label, response, created_at
+        FROM view_confirmations;
+        """
+    )
+    conf_rows = cur.fetchall()
+    conn.close()
+
+    # key = (whatsapp, archivo_norm, period_label)
+    agg = {}
+
+    for row in msg_rows:
+        key = (
+            row["to_whatsapp"],
+            row["archivo_norm"],
+            row["period_label"],
+        )
+        rec = agg.get(key)
+        if not rec:
+            rec = {
+                "nombre": row["nombre"] or "",
+                "whatsapp": row["to_whatsapp"],
+                "plantilla_sent_at": None,
+                "plantilla_delivered_at": None,
+                "plantilla_read_at": None,
+                "plantilla_failed_at": None,
+                "pdf_sent_at": None,
+                "pdf_delivered_at": None,
+                "pdf_read_at": None,
+                "pdf_failed_at": None,
+                "respuesta_usuario": "",
+                "respuesta_timestamp": None,
+            }
+            agg[key] = rec
+
+        if row["nombre"] and not rec["nombre"]:
+            rec["nombre"] = row["nombre"]
+
+        kind = row["kind"]
+        created_at = row["created_at"]
+        delivered_at = row["delivered_at"]
+        read_at = row["read_at"]
+        failed_at = row["failed_at"]
+
+        if kind == "template":
+            if created_at and (not rec["plantilla_sent_at"] or created_at < rec["plantilla_sent_at"]):
+                rec["plantilla_sent_at"] = created_at
+            if delivered_at:
+                rec["plantilla_delivered_at"] = delivered_at
+            if read_at:
+                rec["plantilla_read_at"] = read_at
+            if failed_at:
+                rec["plantilla_failed_at"] = failed_at
+
+        elif kind == "media":
+            if created_at and (not rec["pdf_sent_at"] or created_at < rec["pdf_sent_at"]):
+                rec["pdf_sent_at"] = created_at
+            if delivered_at:
+                rec["pdf_delivered_at"] = delivered_at
+            if read_at:
+                rec["pdf_read_at"] = read_at
+            if failed_at:
+                rec["pdf_failed_at"] = failed_at
+
+    # Mezclamos confirmaciones
+    for row in conf_rows:
+        key = (
+            row["from_whatsapp"],
+            row["archivo_norm"],
+            row["period_label"],
+        )
+        if key not in agg:
+            agg[key] = {
+                "nombre": "",
+                "whatsapp": row["from_whatsapp"],
+                "plantilla_sent_at": None,
+                "plantilla_delivered_at": None,
+                "plantilla_read_at": None,
+                "plantilla_failed_at": None,
+                "pdf_sent_at": None,
+                "pdf_delivered_at": None,
+                "pdf_read_at": None,
+                "pdf_failed_at": None,
+                "respuesta_usuario": "",
+                "respuesta_timestamp": None,
+            }
+        rec = agg[key]
+        ts = row["created_at"]
+        # nos quedamos con la última respuesta
+        if not rec["respuesta_timestamp"] or (ts and ts > rec["respuesta_timestamp"]):
+            rec["respuesta_usuario"] = row["response"]
+            rec["respuesta_timestamp"] = ts
+
+    # Creamos el Excel
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Recibos"
+
+    headers = [
+        "Nombre",
+        "WhatsApp",
+        "Plantilla_enviada",
+        "Plantilla_entregada",
+        "Plantilla_leida",
+        "Plantilla_fallida",
+        "PDF_enviado",
+        "PDF_entregado",
+        "PDF_leido",
+        "PDF_fallido",
+        "Respuesta_usuario",
+        "Respuesta_timestamp",
+    ]
+    ws.append(headers)
+
+    for rec in agg.values():
+        ws.append(
+            [
+                rec["nombre"],
+                rec["whatsapp"],
+                ts_to_str(rec["plantilla_sent_at"]),
+                ts_to_str(rec["plantilla_delivered_at"]),
+                ts_to_str(rec["plantilla_read_at"]),
+                ts_to_str(rec["plantilla_failed_at"]),
+                ts_to_str(rec["pdf_sent_at"]),
+                ts_to_str(rec["pdf_delivered_at"]),
+                ts_to_str(rec["pdf_read_at"]),
+                ts_to_str(rec["pdf_failed_at"]),
+                rec["respuesta_usuario"],
+                ts_to_str(rec["respuesta_timestamp"]),
+            ]
+        )
+
+    # auto ancho de columnas
+    for col in ws.columns:
+        max_len = 0
+        col_letter = get_column_letter(col[0].column)
+        for cell in col:
+            try:
+                max_len = max(max_len, len(str(cell.value or "")))
+            except Exception:
+                pass
+        ws.column_dimensions[col_letter].width = max(10, max_len + 2)
+
+    path = "/tmp/reporte_recibos.xlsx"
+    wb.save(path)
+    return path
+
+# =======================
 def ensure_anyone_reader(file_id: str) -> None:
     """Se asegura de que el file sea accesible públicamente por link."""
     service = build_drive_service()
@@ -708,19 +1069,28 @@ def admin_send_template_all():
                 sid = send_template_whatsapp_norm(to, nombre)
 
                 if sid:
+                    # Registrar mensaje en SQLite
+                    try:
+                        save_message_sent(
+                            message_sid=sid,
+                            to_whatsapp=to,
+                            archivo_norm=archivo_norm,
+                            period_label=period_lbl,
+                            kind="template",
+                            nombre=nombre,
+                        )
+                    except Exception as e:
+                        print("ERROR guardando message_status template:", e)
+
                     sent.append(
                         {
                             "archivo_norm": archivo_norm,
                             "to": to,
                             "nombre": nombre,
                             "sid": sid,
-                            "period": period_lbl,
                         }
                     )
-
-                    # Guardamos en sqlite qué archivo y período le corresponde a este número
                     save_pending_view(to, archivo_norm, period_lbl)
-
                     total += 1
                 else:
                     skipped.append({"reason": "twilio_error_envio_plantilla", "row": r})
@@ -846,23 +1216,36 @@ def build_twilio_response(text: str, media_url: Optional[str] = None) -> Respons
         msg.media(media_url)
     return Response(str(resp), mimetype="text/xml")
 
-def send_pdf_via_twilio_media(to_whatsapp: str, media_url: str, caption: str = "") -> str:
-    """
-    Envía un mensaje de WhatsApp con el PDF adjunto.
-
-    - to_whatsapp: ej. 'whatsapp:+5491136222572'
-    - media_url: URL directa al PDF en Drive
-    - caption: texto que acompaña al PDF
-    """
-    # Usa el mismo cliente y FROM que usás para las plantillas
+def send_pdf_via_twilio_media(
+    to_whatsapp: str,
+    media_url: str,
+    caption: str = "",
+    archivo_norm: Optional[str] = None,
+    period_label: Optional[str] = None,
+):
     msg = twilio_client.messages.create(
-        from_=TWILIO_WHATSAPP_FROM,   # mismo que en send_template_whatsapp_norm
+        from_=TWILIO_WHATSAPP_FROM,
         to=to_whatsapp,
         body=caption or None,
         media_url=[media_url],
+        status_callback=STATUS_CALLBACK_URL,
     )
     print("DEBUG send_pdf_via_twilio_media SID:", msg.sid)
+
+    try:
+        save_message_sent(
+            message_sid=msg.sid,
+            to_whatsapp=to_whatsapp,
+            archivo_norm=archivo_norm,
+            period_label=period_label,
+            kind="media",
+            nombre=None,  # ya lo tenemos en la plantilla
+        )
+    except Exception as e:
+        print("ERROR guardando message_status media:", e)
+
     return msg.sid
+
 
 import os
 from datetime import datetime
@@ -882,7 +1265,6 @@ def get_current_period_label():
 def handle_view_current(from_whatsapp: str):
     print(f"DEBUG handle_view_current, from_number: {from_whatsapp}")
 
-    # 1) Buscar en sqlite el último envío que hicimos a este número
     pending = get_last_pending_view(from_whatsapp)
     if not pending:
         msg = (
@@ -894,7 +1276,6 @@ def handle_view_current(from_whatsapp: str):
     archivo_norm, period_label = pending
     print(f"DEBUG handle_view_current -> archivo_norm: {archivo_norm}, period_label: {period_label}")
 
-    # 2) Buscar el PDF en Drive usando archivo_norm + period_label
     file_id = find_pdf_for_archivo_and_period(archivo_norm, period_label)
     if not file_id:
         msg = (
@@ -903,13 +1284,33 @@ def handle_view_current(from_whatsapp: str):
         )
         return build_twilio_response(msg)
 
-    # 3) Usar el proxy /media/<file_id>, como en el camino de menú
+    # Usamos el proxy /media/<file_id> para Twilio
     media_url = build_media_url_for_twilio(file_id)
     caption = f"Acá tenés tu recibo de sueldo de {period_label} 📄"
 
-    send_pdf_via_twilio_media(from_whatsapp, media_url, caption=caption)
+    send_pdf_via_twilio_media(
+        from_whatsapp,
+        media_url,
+        caption=caption,
+        archivo_norm=archivo_norm,
+        period_label=period_label,
+    )
 
-    # Twilio no necesita más texto, con status 200 ya está
+    # Mensaje de confirmación (texto)
+    try:
+        confirm_text = (
+            "¿Pudiste ver bien tu recibo de sueldo?\n\n"
+            "Respondé *1* si está todo OK ✅\n"
+            "Respondé *2* si tuviste algún problema ❗"
+        )
+        twilio_client.messages.create(
+            from_=TWILIO_WHATSAPP_FROM,
+            to=from_whatsapp,
+            body=confirm_text,
+        )
+    except Exception as e:
+        print("ERROR enviando mensaje de confirmación:", e)
+
     return ("", 200)
 
 
@@ -1061,6 +1462,15 @@ def media_proxy(file_id):
         etag=False
     )
 
+@app.route("/admin/report_excel", methods=["GET"])
+def admin_report_excel():
+    path = generate_excel_report()
+    return send_file(
+        path,
+        as_attachment=True,
+        download_name="reporte_recibos.xlsx",
+        mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    )
 
 # ==========================
 #  Webhook Twilio
@@ -1077,18 +1487,47 @@ def twilio_webhook():
 
     from_whatsapp = form.get("From")  # ej: "whatsapp:+5491136222572"
     body = (form.get("Body") or "").strip()
-    button_payload = form.get("ButtonPayload") or ""
-    button_text = form.get("ButtonText") or ""
+    button_payload = (form.get("ButtonPayload") or "").strip()
+    button_text = (form.get("ButtonText") or "").strip()
 
-    # Caso: tocaron el botón "Sí, visualizar"
-    if button_payload == "VIEW_NOW" or button_text.lower().startswith("sí, visualizar"):
+    body_lower = body.lower()
+    button_text_lower = button_text.lower()
+
+    # ✅ Confirmación positiva
+    if body_lower in ("1", "ok", "listo", "si", "sí", "si, todo bien", "sí, todo bien"):
+        save_user_confirmation(from_whatsapp, "ok")
+        msg = "¡Perfecto! Registramos que pudiste ver tu recibo correctamente ✅"
+        return build_twilio_response(msg)
+
+    # ✅ Confirmación de problema -> registramos y reenviamos
+    if body_lower in ("2", "no", "no pude", "problema", "no se ve", "no funciona"):
+        save_user_confirmation(from_whatsapp, "problema")
+        try:
+            handle_view_current(from_whatsapp)
+        except Exception as e:
+            print("ERROR handle_view_current desde confirmación problema:", e)
+
+        msg = (
+            "Listo, te volvimos a enviar tu recibo 📄.\n"
+            "Si el problema continúa, por favor contactá a RRHH."
+        )
+        return build_twilio_response(msg)
+
+    # ✅ Caso: tocaron el botón "Sí, visualizar"
+    if button_payload == "VIEW_NOW" or button_text_lower.startswith("sí, visualizar"):
         return handle_view_current(from_whatsapp)
 
-    # Si escribe algo tipo "ver", "ver recibo", etc., también podés engancharlo
-    if body.lower() in ("ver", "ver recibo", "ver recibo de sueldo", "si, visualizar", "sí, visualizar"):
+    # ✅ Si escribe algo tipo "ver", "ver recibo", etc.
+    if body_lower in (
+        "ver",
+        "ver recibo",
+        "ver recibo de sueldo",
+        "si, visualizar",
+        "sí, visualizar",
+    ):
         return handle_view_current(from_whatsapp)
 
-    # Respuesta por defecto
+    # ✅ Respuesta por defecto
     msg = (
         "Hola 👋\n"
         "Tu recibo de sueldo está disponible.\n"
