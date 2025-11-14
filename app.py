@@ -1338,6 +1338,57 @@ def handle_period_selection(
     print("DEBUG final_media_link:", link)
     return twiml_message_with_link(text, link)
 
+#======================================
+#notificacion rrhh
+TWILIO_ADMIN_WHATSAPP = os.getenv("TWILIO_ADMIN_WHATSAPP")  # ej: "whatsapp:+54911XXXXXXXX"
+
+
+def notify_issue_to_admin(from_whatsapp: str):
+    """
+    Envía un mensaje a RRHH avisando que esta persona tuvo un problema con el PDF.
+    Usa TWILIO_ADMIN_WHATSAPP como destino.
+    """
+    if not TWILIO_ADMIN_WHATSAPP:
+        print("TWILIO_ADMIN_WHATSAPP no está configurado, no se envía aviso a RRHH.")
+        return
+
+    # Intentamos enriquecer el mensaje con nombre / archivo / período
+    try:
+        nombre = ""
+        try:
+            # si tenés esta función definida
+            nombre = resolve_name_for_phone(from_whatsapp) or ""
+        except Exception as e:
+            print("WARN resolve_name_for_phone falló:", e)
+
+        archivo_norm = None
+        period_label = None
+        pending = get_last_pending_view(from_whatsapp)
+        if pending:
+            archivo_norm, period_label = pending
+
+        partes = [f"El número {from_whatsapp} reportó un problema al ver su recibo."]
+
+        if nombre:
+            partes.append(f"Nombre: {nombre}.")
+        if archivo_norm:
+            partes.append(f"CUIL/archivo: {archivo_norm}.")
+        if period_label:
+            partes.append(f"Período: {period_label}.")
+
+        body = " ".join(partes)
+
+        twilio_client.messages.create(
+            from_=TWILIO_WHATSAPP_FROM,
+            to=TWILIO_ADMIN_WHATSAPP,
+            body=body,
+        )
+        print("DEBUG notify_issue_to_admin -> enviado a RRHH")
+
+    except Exception as e:
+        print("ERROR notify_issue_to_admin:", e)
+
+#======================================
 
 PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "").rstrip("/")
 
@@ -1479,51 +1530,50 @@ def twilio_webhook():
 
     from_whatsapp = form.get("From")  # ej: "whatsapp:+5491136222572"
     body = (form.get("Body") or "").strip()
-    button_payload = (form.get("ButtonPayload") or "").strip()
-    button_text = (form.get("ButtonText") or "").strip()
+    button_payload = form.get("ButtonPayload") or ""
+    button_text = form.get("ButtonText") or ""
 
     body_lower = body.lower()
-    button_text_lower = button_text.lower()
 
-    # ✅ Confirmación positiva
+    # Confirmación positiva
     if body_lower in ("1", "ok", "listo", "si", "sí", "si, todo bien", "sí, todo bien"):
         save_user_confirmation(from_whatsapp, "ok")
         msg = "¡Perfecto! Registramos que pudiste ver tu recibo correctamente ✅"
         return build_twilio_response(msg)
 
-    # ✅ Confirmación de problema -> registramos y reenviamos
+    # Confirmación de problema -> registramos y avisamos a RRHH
     if body_lower in ("2", "no", "no pude", "problema", "no se ve", "no funciona"):
         save_user_confirmation(from_whatsapp, "problema")
-        try:
-            handle_view_current(from_whatsapp)
-        except Exception as e:
-            print("ERROR handle_view_current desde confirmación problema:", e)
 
+        # Avisamos a RRHH / administrador
+        notify_issue_to_admin(from_whatsapp)
+
+        # NO reenviamos automáticamente, le explicamos qué hacer
         msg = (
-            "Listo, te volvimos a enviar tu recibo 📄.\n"
-            "Si el problema continúa, por favor contactá a RRHH."
+            "Registramos que tuviste un problema con tu recibo y avisamos a RRHH ⚠️.\n\n"
+            "Si querés que te volvamos a enviar el PDF, respondé *Reenviar*."
         )
         return build_twilio_response(msg)
 
-    # ✅ Caso: tocaron el botón "Sí, visualizar"
-    if button_payload == "VIEW_NOW" or button_text_lower.startswith("sí, visualizar"):
+    # Reenvío manual del PDF
+    if body_lower == "reenviar":
+        # Volvemos a usar el mismo circuito que con el botón 'Sí, visualizar'
         return handle_view_current(from_whatsapp)
 
-    # ✅ Si escribe algo tipo "ver", "ver recibo", etc.
-    if body_lower in (
-        "ver",
-        "ver recibo",
-        "ver recibo de sueldo",
-        "si, visualizar",
-        "sí, visualizar",
-    ):
+    # Caso: tocaron el botón "Sí, visualizar"
+    if button_payload == "VIEW_NOW" or button_text.lower().startswith("sí, visualizar"):
         return handle_view_current(from_whatsapp)
 
-    # ✅ Respuesta por defecto
+    # Si escribe algo tipo "ver", "ver recibo", etc., también lo enganchamos
+    if body_lower in ("ver", "ver recibo", "ver recibo de sueldo", "si, visualizar", "sí, visualizar"):
+        return handle_view_current(from_whatsapp)
+
+    # Respuesta por defecto
     msg = (
         "Hola 👋\n"
         "Tu recibo de sueldo está disponible.\n"
-        "Usá el botón *Sí, visualizar* para recibirlo, o escribí *ver*."
+        "Usá el botón *Sí, visualizar* para recibirlo, o escribí *ver*.\n"
+        "Si ya lo viste, podés responder *1* (OK) o *2* (problema)."
     )
     return build_twilio_response(msg)
 
@@ -1544,7 +1594,7 @@ def keep_alive():
             requests.get(url, timeout=10)
         except Exception as e:
             print("KEEP-ALIVE error:", e)
-        time.sleep(60)
+        time.sleep(600)
 
 t = threading.Thread(target=keep_alive, daemon=True)
 t.start()
