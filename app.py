@@ -1638,7 +1638,9 @@ def twilio_webhook():
     if flow_state == "ASK_DESHACER_OBS":
         if not ensure_context():
             session["flow_state"] = "IDLE"
-            return build_twilio_response("Ocurrió un problema con el contexto. Escribí de nuevo *ver recibo*.")
+            return build_twilio_response(
+                "Ocurrió un problema con el contexto. Escribí de nuevo *ver recibo*."
+            )
 
         if body_lower in ("1", "si", "sí", "si,", "sí,", "deshacer", "deshacer y firmar"):
             # Deshacer observación y firmar
@@ -1661,7 +1663,9 @@ def twilio_webhook():
     if flow_state == "ASK_FIRMAR_OBS":
         if not ensure_context():
             session["flow_state"] = "IDLE"
-            return build_twilio_response("Ocurrió un problema con el contexto. Escribí de nuevo *ver recibo*.")
+            return build_twilio_response(
+                "Ocurrió un problema con el contexto. Escribí de nuevo *ver recibo*."
+            )
 
         if body_lower in ("1", "firmar", "confirmar", "confirmar/firmar"):
             set_recibo_estado(archivo_norm, period_label, "FIRMADO")
@@ -1672,8 +1676,8 @@ def twilio_webhook():
             set_recibo_estado(archivo_norm, period_label, "OBSERVADO")
             save_user_confirmation(from_whatsapp, "observado")
             # Avisamos a RRHH para que sepan que el recibo quedó observado
-            #notify_issue_to_admin(from_whatsapp)
-            #session["flow_state"] = "IDLE"
+            notify_issue_to_admin(from_whatsapp)
+            session["flow_state"] = "IDLE"
             return build_twilio_response("🤖 Por favor acérquese a RRHH.")
         else:
             return build_twilio_response("🤖 Por favor responda *1* o *2*.")
@@ -1683,13 +1687,17 @@ def twilio_webhook():
     if flow_state == "ASK_VISUALIZAR":
         if not ensure_context():
             session["flow_state"] = "IDLE"
-            return build_twilio_response("Ocurrió un problema con el contexto. Escribí de nuevo *ver recibo*.")
+            return build_twilio_response(
+                "Ocurrió un problema con el contexto. Escribí de nuevo *ver recibo*."
+            )
 
         if body_lower in ("si", "sí", "s", "ver", "ver recibo", "ok"):
             pdf_id = session.get("pdf_id")
             if not pdf_id:
                 session["flow_state"] = "IDLE"
-                return build_twilio_response("No pude encontrar el PDF en este momento. Por favor intentá más tarde o contactá a RRHH.")
+                return build_twilio_response(
+                    "No pude encontrar el PDF en este momento. Por favor intentá más tarde o contactá a RRHH."
+                )
 
             media_url = build_media_url_for_twilio(pdf_id)
 
@@ -1714,21 +1722,90 @@ def twilio_webhook():
             return ("", 200)
         elif body_lower in ("no", "despues", "más tarde", "después"):
             session["flow_state"] = "IDLE"
-            return build_twilio_response("Perfecto. Cuando quieras verlo, escribí *ver recibo*.")
+            return build_twilio_response(
+                "Perfecto. Cuando quieras verlo, escribí *ver recibo*."
+            )
         else:
-            return build_twilio_response("🤖 Por favor respondé *sí* si querés visualizar tu recibo.")
+            return build_twilio_response(
+                "🤖 Por favor respondé *sí* si querés visualizar tu recibo."
+            )
+
+    # CASE FIRMADO: ya está firmado y le preguntamos si quiere verlo de nuevo
+    if flow_state == "ASK_FIRMADO_VISTA":
+        if not ensure_context():
+            session["flow_state"] = "IDLE"
+            return build_twilio_response(
+                "Ocurrió un problema con el contexto. Escribí de nuevo *ver recibo*."
+            )
+
+        vistas_actuales = get_recibo_vistas(archivo_norm, period_label)
+        restantes = max(0, 3 - vistas_actuales)
+
+        if restantes <= 0:
+            session["flow_state"] = "IDLE"
+            return build_twilio_response(
+                f"🤖 Tu recibo del período {period_label} ya alcanzó el máximo de 3 visualizaciones adicionales."
+            )
+
+        if body_lower in ("1", "si", "sí", "ver", "ver recibo", "enviar", "si,", "sí,"):
+            # Incrementamos contador y enviamos copia
+            nuevas_vistas = inc_recibo_vistas(archivo_norm, period_label)
+            restantes_luego = max(0, 3 - nuevas_vistas)
+
+            pdf_id = session.get("pdf_id")
+            if not pdf_id:
+                # por las dudas, volvemos a buscarlo
+                pdf_id = find_pdf_for_archivo_and_period(archivo_norm, period_label)
+                session["pdf_id"] = pdf_id
+
+            if not pdf_id:
+                session["flow_state"] = "IDLE"
+                return build_twilio_response(
+                    "No pude encontrar el PDF en este momento. Por favor intentá más tarde o contactá a RRHH."
+                )
+
+            media_url = build_media_url_for_twilio(pdf_id)
+            caption = (
+                f"🤖 Aquí tiene la copia de su recibo firmado del período {period_label}.\n"
+                f"🤖 Visualizaciones restantes: {restantes_luego} de 3."
+            )
+            send_pdf_via_twilio_media(
+                from_whatsapp,
+                media_url,
+                caption=caption,
+                archivo_norm=archivo_norm,
+                period_label=period_label,
+            )
+
+            session["flow_state"] = "IDLE"
+            return ("", 200)
+
+        elif body_lower in ("2", "no", "gracias"):
+            session["flow_state"] = "IDLE"
+            return build_twilio_response(
+                "🤖 Perfecto, tu recibo ya figura como firmado. Cuando quieras, podés volver a escribir."
+            )
+        else:
+            msg = (
+                f"🤖 Tu recibo del período {period_label} ya está firmado.\n"
+                f"🤖 ¿Querés verlo nuevamente? Te quedan {restantes} de 3 visualizaciones.\n"
+                "    1) Sí, enviar copia\n"
+                "    2) No"
+            )
+            return build_twilio_response(msg)
 
     # ------------------------------------------------------------------
     # 2) ENTRADA NUEVA AL FLUJO (MENSAJE RECIBIDO EN WHATS)
     # ------------------------------------------------------------------
 
-    # === CAMBIO IMPORTANTE ===
-    # Botón “Sí, visualizar” de la plantilla → manda el PDF DIRECTO
+    # Botón “Sí, visualizar” de la plantilla → manda el PDF DIRECTO (según estado)
     if button_payload == "VIEW_NOW" or button_text.lower().startswith("sí, visualizar"):
         # 2.1) ¿NÚMERO AUTORIZADO?
         archivo_norm = get_archivo_from_incoming(from_whatsapp)
         if not archivo_norm:
-            return build_twilio_response("🤖 Ud. no está registrado/autorizado para utilizar este servicio.")
+            return build_twilio_response(
+                "🤖 Ud. no está registrado/autorizado para utilizar este servicio."
+            )
 
         # 2.2) PERÍODO ACTUAL
         period_label = norm_period_label(get_current_period_label())
@@ -1752,20 +1829,17 @@ def twilio_webhook():
 
         # ---------------- CASE 1: RECIBO FIRMADO ----------------
         if estado == "FIRMADO":
-            media_url = build_media_url_for_twilio(pdf_id)
-            caption = (
-                "🤖 Ud. ya firmó su recibo. Le envío una copia.\n"
-                "🤖 Solo puede visualizarlo una vez más."
+            vistas_actuales = get_recibo_vistas(archivo_norm, period_label)
+            restantes = max(0, 3 - vistas_actuales)
+
+            msg = (
+                f"🤖 Tu recibo de sueldo del período {period_label} ya está firmado.\n"
+                f"🤖 ¿Querés verlo nuevamente? Te quedan {restantes} de 3 visualizaciones.\n"
+                "    1) Sí, enviar copia\n"
+                "    2) No"
             )
-            send_pdf_via_twilio_media(
-                from_whatsapp,
-                media_url,
-                caption=caption,
-                archivo_norm=archivo_norm,
-                period_label=period_label,
-            )
-            session["flow_state"] = "IDLE"
-            return ("", 200)
+            session["flow_state"] = "ASK_FIRMADO_VISTA"
+            return build_twilio_response(msg)
 
         # ---------------- CASE 2: RECIBO OBSERVADO ----------------
         if estado == "OBSERVADO":
@@ -1807,11 +1881,13 @@ def twilio_webhook():
         return ("", 200)
 
     # Palabras que disparan el flujo principal cuando ESCRIBE (no botón)
-    if body_lower in ("ver", "ver recibo", "ver recibo de sueldo", "hola", "buenas"):
+    if body_lower in ("ver", "ver recibo", "ver recibo de sueldo"):
         # 2.1) ¿NÚMERO AUTORIZADO?
         archivo_norm = get_archivo_from_incoming(from_whatsapp)
         if not archivo_norm:
-            return build_twilio_response("🤖 Ud. no está registrado/autorizado para utilizar este servicio.")
+            return build_twilio_response(
+                "🤖 Ud. no está registrado/autorizado para utilizar este servicio."
+            )
 
         # 2.2) PERÍODO ACTUAL
         period_label = norm_period_label(get_current_period_label())
@@ -1835,20 +1911,17 @@ def twilio_webhook():
 
         # ---------------- CASE 1: RECIBO FIRMADO ----------------
         if estado == "FIRMADO":
-            media_url = build_media_url_for_twilio(pdf_id)
-            caption = (
-                "🤖 Ud. ya firmó su recibo. Le envío una copia.\n"
-                "🤖 Solo puede visualizarlo una vez más."
+            vistas_actuales = get_recibo_vistas(archivo_norm, period_label)
+            restantes = max(0, 3 - vistas_actuales)
+
+            msg = (
+                f"🤖 Tu recibo de sueldo del período {period_label} ya está firmado.\n"
+                f"🤖 ¿Querés verlo nuevamente? Te quedan {restantes} de 3 visualizaciones.\n"
+                "    1) Sí, enviar copia\n"
+                "    2) No"
             )
-            send_pdf_via_twilio_media(
-                from_whatsapp,
-                media_url,
-                caption=caption,
-                archivo_norm=archivo_norm,
-                period_label=period_label,
-            )
-            session["flow_state"] = "IDLE"
-            return ("", 200)
+            session["flow_state"] = "ASK_FIRMADO_VISTA"
+            return build_twilio_response(msg)
 
         # ---------------- CASE 2: RECIBO OBSERVADO ----------------
         if estado == "OBSERVADO":
@@ -1870,11 +1943,13 @@ def twilio_webhook():
             session["flow_state"] = "ASK_DESHACER_OBS"
             return ("", 200)
 
+        # ---------------- CASE 3: RECIBO DISPONIBLE ----------------
+        # Cuando ESCRIBE "ver recibo", sí preguntamos primero
+        session["flow_state"] = "ASK_VISUALIZAR"
+        return build_twilio_response("🤖 ¿Desea visualizar su recibo?")
+
     # ------------------------------------------------------------------
-    # 3) MENSAJE QUE NO ENTRA EN NINGÚN FLUJO → TEXTO GENÉRICO
-    # ------------------------------------------------------------------
-    # ------------------------------------------------------------------
-    # 3) MENSAJE QUE NO ENTRA EN NINGÚN FLUJO → RESPUESTA SEGÚN ESTADO
+    # 3) MENSAJE QUE NO ENTRA EN NINGÚN FLUJO → TEXTO SEGÚN ESTADO
     # ------------------------------------------------------------------
     archivo_norm_fallback = get_archivo_from_incoming(from_whatsapp)
     if archivo_norm_fallback:
@@ -1882,15 +1957,27 @@ def twilio_webhook():
         estado_fallback = get_recibo_estado(archivo_norm_fallback, period_label_fallback)
 
         if estado_fallback == "FIRMADO":
-            # Ya firmó el recibo actual
+            vistas_actuales = get_recibo_vistas(archivo_norm_fallback, period_label_fallback)
+            restantes = max(0, 3 - vistas_actuales)
+
+            # Guardamos contexto por si responde 1 / 2
+            session["archivo_norm"] = archivo_norm_fallback
+            session["period_label"] = period_label_fallback
+            pdf_id_fb = find_pdf_for_archivo_and_period(
+                archivo_norm_fallback, period_label_fallback
+            )
+            session["pdf_id"] = pdf_id_fb
+            session["flow_state"] = "ASK_FIRMADO_VISTA"
+
             msg = (
-                f"🤖 Tu recibo de sueldo del período {period_label_fallback} ya fue firmado.\n"
-                "Si querés verlo nuevamente, escribí *ver recibo*."
+                f"🤖 Tu recibo de sueldo del período {period_label_fallback} ya está firmado.\n"
+                f"🤖 ¿Querés verlo nuevamente? Te quedan {restantes} de 3 visualizaciones.\n"
+                "    1) Sí, enviar copia\n"
+                "    2) No"
             )
             return build_twilio_response(msg)
 
         if estado_fallback == "OBSERVADO":
-            # Recibo observado
             msg = (
                 f"🤖 Tu recibo de sueldo del período {period_label_fallback} está observado.\n"
                 "Por favor acercate a RRHH para que lo revisen.\n"
@@ -1898,7 +1985,7 @@ def twilio_webhook():
             )
             return build_twilio_response(msg)
 
-    # Si no hay recibo / no está autorizado / sigue disponible sin interacción → mensaje genérico
+    # Si no hay nada especial, mensaje genérico
     msg = (
         "Hola 👋\n"
         "Si querés consultar tu recibo de sueldo del último período, escribí *ver recibo* "
