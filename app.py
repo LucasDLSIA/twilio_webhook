@@ -1870,14 +1870,35 @@ def twilio_webhook():
             session["flow_state"] = "ASK_DESHACER_OBS"
             return ("", 200)
 
-        # ---------------- CASE 3: RECIBO DISPONIBLE ----------------
-        # Cuando ESCRIBE "ver recibo", sí preguntamos primero
-        session["flow_state"] = "ASK_VISUALIZAR"
-        return build_twilio_response("🤖 ¿Desea visualizar su recibo?")
-
     # ------------------------------------------------------------------
     # 3) MENSAJE QUE NO ENTRA EN NINGÚN FLUJO → TEXTO GENÉRICO
     # ------------------------------------------------------------------
+    # ------------------------------------------------------------------
+    # 3) MENSAJE QUE NO ENTRA EN NINGÚN FLUJO → RESPUESTA SEGÚN ESTADO
+    # ------------------------------------------------------------------
+    archivo_norm_fallback = get_archivo_from_incoming(from_whatsapp)
+    if archivo_norm_fallback:
+        period_label_fallback = norm_period_label(get_current_period_label())
+        estado_fallback = get_recibo_estado(archivo_norm_fallback, period_label_fallback)
+
+        if estado_fallback == "FIRMADO":
+            # Ya firmó el recibo actual
+            msg = (
+                f"🤖 Tu recibo de sueldo del período {period_label_fallback} ya fue firmado.\n"
+                "Si querés verlo nuevamente, escribí *ver recibo*."
+            )
+            return build_twilio_response(msg)
+
+        if estado_fallback == "OBSERVADO":
+            # Recibo observado
+            msg = (
+                f"🤖 Tu recibo de sueldo del período {period_label_fallback} está observado.\n"
+                "Por favor acercate a RRHH para que lo revisen.\n"
+                "Si querés volver a verlo, escribí *ver recibo*."
+            )
+            return build_twilio_response(msg)
+
+    # Si no hay recibo / no está autorizado / sigue disponible sin interacción → mensaje genérico
     msg = (
         "Hola 👋\n"
         "Si querés consultar tu recibo de sueldo del último período, escribí *ver recibo* "
