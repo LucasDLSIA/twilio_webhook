@@ -1763,10 +1763,13 @@ def twilio_webhook():
         elif body_lower in ("2", "observar"):
             set_recibo_estado(archivo_norm, period_label, "OBSERVADO")
             save_user_confirmation(from_whatsapp, "observado")
-            # Avisamos a RRHH para que sepan que el recibo quedó observado
             notify_issue_to_admin(from_whatsapp)
             session["flow_state"] = "IDLE"
-            return build_twilio_response("🤖 Por favor acérquese a RRHH.")
+            return build_twilio_response(
+                f"🤖 Su recibo del período {period_label} quedó registrado como *observado*.\n"
+                "🤖 Para resolverlo, por favor comuníquese con RRHH.\n\n"
+                "Si desea visualizarlo nuevamente más tarde, escriba *ver recibo*."
+            )
         else:
             return build_twilio_response("🤖 Por favor responda *1* o *2*.")
 
