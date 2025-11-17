@@ -1499,55 +1499,57 @@ def handle_period_selection(
 #TWILIO_ADMIN_WHATSAPP = os.getenv("TWILIO_ADMIN_WHATSAPP")  # ej: "whatsapp:+54911XXXXXXXX"
 
 
-#def notify_issue_to_admin(from_whatsapp: str):
+# === DESACTIVADO TEMPORALMENTE: notificación a RRHH ===
+def notify_issue_to_admin(from_whatsapp: str):
+    # Por ahora no hacemos nada para evitar notificaciones durante pruebas
+    print(f"[DEBUG] notify_issue_to_admin() desactivado. Número: {from_whatsapp}")
     """
     Envía un mensaje a RRHH avisando que esta persona tuvo un problema con el PDF.
     Usa TWILIO_ADMIN_WHATSAPP como destino (WhatsApp).
     """
-    if not TWILIO_ADMIN_WHATSAPP:
-        print("TWILIO_ADMIN_WHATSAPP no está configurado, no se envía aviso a RRHH.")
-        return
-
+#    if not TWILIO_ADMIN_WHATSAPP:
+#        print("TWILIO_ADMIN_WHATSAPP no está configurado, no se envía aviso a RRHH.")
+ #       return
     # Normalizamos el número del admin al canal WhatsApp
-    admin_to = TWILIO_ADMIN_WHATSAPP.strip()
-    if not admin_to.startswith("whatsapp:"):
+ #   admin_to = TWILIO_ADMIN_WHATSAPP.strip()
+  #  if not admin_to.startswith("whatsapp:"):
         # si lo pusiste como +54911..., lo convertimos a whatsapp:+54911...
-        admin_to = "whatsapp:" + admin_to.lstrip("+")
+   #     admin_to = "whatsapp:" + admin_to.lstrip("+")
 
-    try:
-        nombre = ""
-        try:
+    #try:
+     #   nombre = ""
+      #  try:
             # si tenés esta función definida, sino podés comentar este bloque
-            nombre = resolve_name_for_phone(from_whatsapp) or ""
-        except Exception as e:
-            print("WARN resolve_name_for_phone falló:", e)
+       #     nombre = resolve_name_for_phone(from_whatsapp) or ""
+        #except Exception as e:
+         #   print("WARN resolve_name_for_phone falló:", e)
 
-        archivo_norm = None
-        period_label = None
-        pending = get_last_pending_view(from_whatsapp)
-        if pending:
-            archivo_norm, period_label = pending
+        #archivo_norm = None
+        #period_label = None
+        #pending = get_last_pending_view(from_whatsapp)
+        #if pending:
+         #   archivo_norm, period_label = pending
 
-        partes = [f"El número {from_whatsapp} reporta observaciones al ver su recibo."]
+#        partes = [f"El número {from_whatsapp} reporta observaciones al ver su recibo."]
 
-        if nombre:
-            partes.append(f"Nombre: {nombre}.")
-        if archivo_norm:
-            partes.append(f"CUIL/archivo: {archivo_norm}.")
-        if period_label:
-            partes.append(f"Período: {period_label}.")
-
-        body = " ".join(partes)
-
-        twilio_client.messages.create(
-            from_=TWILIO_WHATSAPP_FROM,  # sigue siendo tu número de WhatsApp
-            to=admin_to,                 # ahora seguro es whatsapp:+549...
-            body=body,
-        )
-        print("DEBUG notify_issue_to_admin -> enviado a RRHH")
-
-    except Exception as e:
-        print("ERROR notify_issue_to_admin:", e)
+ #       if nombre:
+  #          partes.append(f"Nombre: {nombre}.")
+   #     if archivo_norm:
+    #        partes.append(f"CUIL/archivo: {archivo_norm}.")
+     #   if period_label:
+      #      partes.append(f"Período: {period_label}.")
+#
+ #       body = " ".join(partes)
+#
+ #       twilio_client.messages.create(
+  ##          from_=TWILIO_WHATSAPP_FROM,  # sigue siendo tu número de WhatsApp
+    #        to=admin_to,                 # ahora seguro es whatsapp:+549...
+     #       body=body,
+      #  )
+       # print("DEBUG notify_issue_to_admin -> enviado a RRHH")
+#
+ #   except Exception as e:
+  #      print("ERROR notify_issue_to_admin:", e)
 
 #======================================
 
