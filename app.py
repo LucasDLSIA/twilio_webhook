@@ -1331,34 +1331,48 @@ def get_current_period_label():
 def handle_view_current(from_whatsapp: str):
     print(f"DEBUG handle_view_current, from_number: {from_whatsapp}")
 
-    pending = get_last_pending_view(from_whatsapp)
-    if not pending:
+    archivo_norm, period_label, estado = get_recibo_estado(from_whatsapp)
+    if not archivo_norm:
         msg = (
             "No encontré ningún recibo pendiente para este número 😕.\n"
             "Si creés que es un error, avisá a RRHH para que lo revisen 🙏."
         )
         return build_twilio_response(msg)
 
-    archivo_norm, period_label = pending
-    print(f"DEBUG handle_view_current -> archivo_norm: {archivo_norm}, period_label: {period_label}")
-
-    file_id = find_pdf_for_archivo_and_period(archivo_norm, period_label)
-    if not file_id:
+    pdf_id = find_pdf_for_archivo_and_period(archivo_norm, period_label)
+    if not pdf_id:
         msg = (
             f"No pude encontrar el PDF de tu recibo para el período {period_label} 😕.\n"
             "Avisá a RRHH para que lo revisen 🙏."
         )
         return build_twilio_response(msg)
 
-    # Usamos el proxy /media/<file_id>
-    media_url = build_media_url_for_twilio(file_id)
+    media_url = build_media_url_for_twilio(pdf_id)
 
-    caption = (
-        f"Acá tenés tu recibo de sueldo de {period_label} 📄\n\n"
-        "Cuando lo veas, por favor respondé:\n"
-        "*1* si está todo OK ✅\n"
-        "*2* si tenes alguna observación ❗"
-    )
+    if estado == "FIRMADO":
+        # CASO 1
+        caption = (
+            "🤖 Ud. ya firmó su recibo.\n"
+            "🤖 Le envío una copia.\n"
+            "🤖 Solo puede visualizarlo una vez más."
+        )
+    elif estado == "OBSERVADO":
+        # CASO 2
+        caption = (
+            "🤖 Ud. tiene el recibo observado.\n"
+            "🤖 Le envío nuevamente el recibo.\n\n"
+            "🤖 ¿Desea deshacer la observación y firmar?\n"
+            "    1) Sí, deshacer y firmar\n"
+            "    2) No, mantener observado"
+        )
+    else:
+        # CASO 3 – DISPONIBLE (flujo normal)
+        caption = (
+            f"Acá tenés tu recibo de sueldo de {period_label} 📄\n\n"
+            "🤖 ¿Confirma/firma su recibo?\n"
+            "    1) Confirmar/Firmar\n"
+            "    2) Observar"
+        )
 
     send_pdf_via_twilio_media(
         from_whatsapp,
@@ -1368,7 +1382,7 @@ def handle_view_current(from_whatsapp: str):
         period_label=period_label,
     )
 
-    # Ya no mandamos un segundo mensaje de texto.
+    # No mandamos mensaje extra, ya quedó todo en el caption
     return ("", 200)
 
 
