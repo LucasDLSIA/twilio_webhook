@@ -166,7 +166,7 @@ def init_db():
         """
     )
 
-    # NUEVA TABLA: estado del recibo (flujo del Word)
+    # 👇👈 AÑADIR ESTO
     cur.execute(
         """
         CREATE TABLE IF NOT EXISTS recibo_estado (
@@ -179,8 +179,84 @@ def init_db():
         """
     )
 
+    # 👇👈 AÑADIR ESTO (contador de vistas extra)
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS recibo_vistas (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            archivo_norm TEXT NOT NULL,
+            period_label TEXT NOT NULL,
+            vistas INTEGER NOT NULL DEFAULT 0,
+            UNIQUE(archivo_norm, period_label)
+        );
+        """
+    )
+
     conn.commit()
     conn.close()
+
+def get_recibo_vistas(archivo_norm: str, period_label: str) -> int:
+    """
+    Devuelve cuántas visualizaciones adicionales (post-firma) tiene registradas
+    ese recibo. Si no existe registro, devuelve 0.
+    """
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT vistas
+        FROM recibo_vistas
+        WHERE archivo_norm = ? AND period_label = ?;
+        """,
+        (archivo_norm, period_label),
+    )
+    row = cur.fetchone()
+    conn.close()
+    return int(row[0]) if row else 0
+
+
+def inc_recibo_vistas(archivo_norm: str, period_label: str) -> int:
+    """
+    Incrementa en 1 el contador de visualizaciones para ese recibo y
+    devuelve el valor nuevo.
+    """
+    conn = get_db_connection()
+    cur = conn.cursor()
+
+    # Si no existe, lo creamos con 0
+    cur.execute(
+        """
+        INSERT OR IGNORE INTO recibo_vistas (archivo_norm, period_label, vistas)
+        VALUES (?, ?, 0);
+        """,
+        (archivo_norm, period_label),
+    )
+
+    # Sumamos 1
+    cur.execute(
+        """
+        UPDATE recibo_vistas
+        SET vistas = vistas + 1
+        WHERE archivo_norm = ? AND period_label = ?;
+        """,
+        (archivo_norm, period_label),
+    )
+
+    # Leemos el valor nuevo
+    cur.execute(
+        """
+        SELECT vistas
+        FROM recibo_vistas
+        WHERE archivo_norm = ? AND period_label = ?;
+        """,
+        (archivo_norm, period_label),
+    )
+    row = cur.fetchone()
+    conn.commit()
+    conn.close()
+
+    return int(row[0]) if row else 0
+
 
 def get_recibo_estado(archivo_norm: str, period_label: str) -> str:
     """
