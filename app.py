@@ -725,6 +725,15 @@ def is_url_fetchable(url: str) -> bool:
         print("DEBUG is_url_fetchable EXC:", e)
         return False
 
+# Cache global para el cliente de Drive
+_DRIVE_SERVICE = None
+
+def get_drive_service():
+    global _DRIVE_SERVICE
+    if _DRIVE_SERVICE is None:
+        _DRIVE_SERVICE = build_drive_service()
+    return _DRIVE_SERVICE
+
 
 def build_drive_service():
     creds = service_account.Credentials.from_service_account_file(
@@ -872,17 +881,23 @@ def find_pdf_for_archivo_and_period(archivo_norm: str, period_label: str) -> Opt
     y se queda con el que esté en una carpeta cuyo nombre mapee a ese período
     vía period_folder_to_label.
     """
-    service = build_drive_service()
+    try:
+        service = get_drive_service()
+    except Exception as e:
+        print("ERROR build/get_drive_service:", e)
+        return None
 
     filename = f"{archivo_norm}.pdf"
 
-    # Buscamos todos los archivos con ese nombre en todo el Drive
-    results = service.files().list(
-        q=f"name = '{filename}' and mimeType = 'application/pdf' and trashed = false",
-        fields="files(id, name, parents)",
-        pageSize=1000,
-    ).execute()
-
+    try:
+        results = service.files().list(
+            q=f"name = '{filename}' and mimeType = 'application/pdf' and trashed = false",
+            fields="files(id, name, parents)",
+            pageSize=1000,
+        ).execute()
+    except Exception as e:
+        print("ERROR list files in find_pdf_for_archivo_and_period:", e)
+        return None
     files = results.get("files", [])
 
     print("DEBUG find_pdf_for_archivo_and_period")
@@ -899,11 +914,15 @@ def find_pdf_for_archivo_and_period(archivo_norm: str, period_label: str) -> Opt
             continue
 
         parent_id = parents[0]
-        folder = service.files().get(
-            fileId=parent_id,
-            fields="id, name, parents",
-        ).execute()
-        folder_name = folder.get("name", "")
+        try:
+            folder = service.files().get(
+                fileId=parent_id,
+                fields="id, name, parents",
+            ).execute()
+            folder_name = folder.get("name", "")
+        except Exception as e:
+            print("ERROR get parent folder:", e)
+            folder_name = ""
         label = period_folder_to_label(folder_name)
 
         # Normalizamos carpeta y label
