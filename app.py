@@ -29,6 +29,7 @@ from collections import defaultdict
 from datetime import datetime
 import os
 import sqlite3
+import time
 
 
 
@@ -1208,6 +1209,7 @@ def admin_send_template_all():
             else:
                 # Usá la función que ya tengas para mandar la plantilla
                 # (acá supongo que la tuya es send_template_whatsapp_norm)
+                time.sleep(0.7)   # 700 ms entre mensajes
                 sid = send_template_whatsapp_norm(to, nombre)
 
                 if sid:
