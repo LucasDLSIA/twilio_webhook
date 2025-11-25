@@ -19,7 +19,9 @@ from googleapiclient.discovery import build
 from google.oauth2 import service_account
 from googleapiclient.http import MediaIoBaseDownload
 
-import sqlite3
+
+import psycopg2
+import psycopg2.extras
 from pathlib import Path
 
 from openpyxl import Workbook
@@ -28,7 +30,7 @@ from flask import send_file
 from collections import defaultdict
 from datetime import datetime
 import os
-import sqlite3
+
 import time
 
 
@@ -99,20 +101,22 @@ def canonicalize_phone(x) -> str:
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 import os
-import sqlite3
+
 import time
 
 # Ruta del archivo SQLite
 # En local: usa "pending_views.db"
 # En Render con disk persistente, podés usar /data/pending_views.db
-DB_PATH = os.environ.get("PENDING_DB_PATH", "pending_views.db")
-
+DATABASE_URL = os.environ.get("DATABASE_URL")
 
 def get_db_connection():
-    """
-    Devuelve una conexión a SQLite.
-    """
-    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+    if not DATABASE_URL:
+        raise RuntimeError("DATABASE_URL no está configurado")
+
+    conn = psycopg2.connect(
+        DATABASE_URL,
+        cursor_factory=psycopg2.extras.DictCursor
+    )
     return conn
 
 
@@ -123,7 +127,7 @@ def init_db():
     cur.execute(
         """
         CREATE TABLE IF NOT EXISTS pending_views (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id SERIAL PRIMARY KEY,
             to_whatsapp TEXT NOT NULL,
             archivo_norm TEXT NOT NULL,
             period_label TEXT NOT NULL,
@@ -135,7 +139,7 @@ def init_db():
     cur.execute(
         """
         CREATE TABLE IF NOT EXISTS message_status (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id SERIAL PRIMARY KEY,
             message_sid TEXT UNIQUE NOT NULL,
             to_whatsapp TEXT,
             archivo_norm TEXT,
@@ -157,7 +161,7 @@ def init_db():
     cur.execute(
         """
         CREATE TABLE IF NOT EXISTS view_confirmations (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id SERIAL PRIMARY KEY,
             from_whatsapp TEXT NOT NULL,
             archivo_norm TEXT,
             period_label TEXT,
@@ -171,7 +175,7 @@ def init_db():
     cur.execute(
         """
         CREATE TABLE IF NOT EXISTS recibo_estado (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id SERIAL PRIMARY KEY,
             archivo_norm TEXT NOT NULL,
             period_label TEXT NOT NULL,
             estado TEXT NOT NULL,         -- 'DISPONIBLE', 'FIRMADO', 'OBSERVADO'
@@ -184,7 +188,7 @@ def init_db():
     cur.execute(
         """
         CREATE TABLE IF NOT EXISTS recibo_vistas (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id SERIAL PRIMARY KEY,
             archivo_norm TEXT NOT NULL,
             period_label TEXT NOT NULL,
             vistas INTEGER NOT NULL DEFAULT 0,
@@ -207,7 +211,7 @@ def get_recibo_vistas(archivo_norm: str, period_label: str) -> int:
         """
         SELECT vistas
         FROM recibo_vistas
-        WHERE archivo_norm = ? AND period_label = ?;
+        WHERE archivo_norm = %s AND period_label = %s;
         """,
         (archivo_norm, period_label),
     )
@@ -227,8 +231,9 @@ def inc_recibo_vistas(archivo_norm: str, period_label: str) -> int:
     # Si no existe, lo creamos con 0
     cur.execute(
         """
-        INSERT OR IGNORE INTO recibo_vistas (archivo_norm, period_label, vistas)
-        VALUES (?, ?, 0);
+        INSERT INTO recibo_vistas (archivo_norm, period_label, vistas)
+        VALUES (%s, %s, 0)
+        ON CONFLICT (archivo_norm, period_label) DO NOTHING;
         """,
         (archivo_norm, period_label),
     )
@@ -238,7 +243,7 @@ def inc_recibo_vistas(archivo_norm: str, period_label: str) -> int:
         """
         UPDATE recibo_vistas
         SET vistas = vistas + 1
-        WHERE archivo_norm = ? AND period_label = ?;
+        WHERE archivo_norm = %s AND period_label = %s;
         """,
         (archivo_norm, period_label),
     )
@@ -248,7 +253,7 @@ def inc_recibo_vistas(archivo_norm: str, period_label: str) -> int:
         """
         SELECT vistas
         FROM recibo_vistas
-        WHERE archivo_norm = ? AND period_label = ?;
+        WHERE archivo_norm = %s AND period_label = %s;
         """,
         (archivo_norm, period_label),
     )
@@ -267,7 +272,11 @@ def get_recibo_estado(archivo_norm: str, period_label: str) -> str:
     conn = get_db_connection()
     cur = conn.cursor()
     cur.execute(
-        "SELECT estado FROM recibo_estado WHERE archivo_norm = ? AND period_label = ?;",
+        """
+        SELECT estado
+        FROM recibo_estado
+        WHERE archivo_norm = %s AND period_label = %s;
+        """,
         (archivo_norm, period_label),
     )
     row = cur.fetchone()
@@ -291,9 +300,9 @@ def set_recibo_estado(archivo_norm: str, period_label: str, estado: str) -> None
     cur.execute(
         """
         INSERT INTO recibo_estado (archivo_norm, period_label, estado)
-        VALUES (?, ?, ?)
-        ON CONFLICT(archivo_norm, period_label)
-        DO UPDATE SET estado = excluded.estado;
+        VALUES (%s, %s, %s)
+        ON CONFLICT (archivo_norm, period_label)
+        DO UPDATE SET estado = EXCLUDED.estado;
         """,
         (archivo_norm, period_label, estado),
     )
@@ -311,7 +320,7 @@ def save_pending_view(to_whatsapp: str, archivo_norm: str, period_label: str):
     cur.execute(
         """
         INSERT INTO pending_views (to_whatsapp, archivo_norm, period_label, created_at)
-        VALUES (?, ?, ?, ?);
+        VALUES (%s, %s, %s, %s);
         """,
         (to_whatsapp, archivo_norm, period_label, int(time.time())),
     )
@@ -330,7 +339,7 @@ def get_last_pending_view(from_whatsapp: str):
         """
         SELECT archivo_norm, period_label
         FROM pending_views
-        WHERE to_whatsapp = ?
+        WHERE to_whatsapp = %s
         ORDER BY created_at DESC
         LIMIT 1;
         """,
@@ -343,9 +352,6 @@ def get_last_pending_view(from_whatsapp: str):
         return row[0], row[1]
     return None
 
-#============================================
-import time
-from typing import Optional, Tuple
 
 def save_message_sent(
     message_sid: str,
@@ -364,10 +370,11 @@ def save_message_sent(
     now_ts = int(time.time())
     cur.execute(
         """
-        INSERT OR IGNORE INTO message_status (
+        INSERT INTO message_status (
             message_sid, to_whatsapp, archivo_norm, period_label,
             nombre, kind, created_at, last_status, last_status_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?);
+        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+        ON CONFLICT (message_sid) DO NOTHING;
         """,
         (
             message_sid,
@@ -395,11 +402,10 @@ def update_message_status_and_get(
     Actualiza el estado de un mensaje por SID y devuelve (kind, to_whatsapp).
     """
     conn = get_db_connection()
-    conn.row_factory = sqlite3.Row
     cur = conn.cursor()
 
     cur.execute(
-        "SELECT kind, to_whatsapp FROM message_status WHERE message_sid = ?;",
+        "SELECT kind, to_whatsapp FROM message_status WHERE message_sid = %s;",
         (message_sid,),
     )
     row = cur.fetchone()
@@ -411,13 +417,13 @@ def update_message_status_and_get(
         cur.execute(
             """
             UPDATE message_status
-            SET last_status = ?, last_status_at = ?,
-                read_at = CASE WHEN ? = 'read' THEN COALESCE(read_at, ?) ELSE read_at END,
-                delivered_at = CASE WHEN ? = 'delivered' THEN COALESCE(delivered_at, ?) ELSE delivered_at END,
-                failed_at = CASE WHEN ? IN ('failed','undelivered') THEN COALESCE(failed_at, ?) ELSE failed_at END,
-                error_code = COALESCE(?, error_code),
-                error_message = COALESCE(?, error_message)
-            WHERE message_sid = ?;
+            SET last_status = %s, last_status_at = %s,
+                read_at = CASE WHEN %s = 'read' THEN COALESCE(read_at, %s) ELSE read_at END,
+                delivered_at = CASE WHEN %s = 'delivered' THEN COALESCE(delivered_at, %s) ELSE delivered_at END,
+                failed_at = CASE WHEN %s IN ('failed','undelivered') THEN COALESCE(failed_at, %s) ELSE failed_at END,
+                error_code = COALESCE(%s, error_code),
+                error_message = COALESCE(%s, error_message)
+            WHERE message_sid = %s;
             """,
             (
                 status,
@@ -440,9 +446,10 @@ def update_message_status_and_get(
     # Si no existía, lo registramos mínimo
     cur.execute(
         """
-        INSERT OR IGNORE INTO message_status (
+        INSERT INTO message_status (
             message_sid, last_status, last_status_at, error_code, error_message
-        ) VALUES (?, ?, ?, ?, ?);
+        ) VALUES (%s, %s, %s, %s, %s)
+        ON CONFLICT (message_sid) DO NOTHING;
         """,
         (message_sid, status, now_ts, error_code, error_message),
     )
@@ -467,7 +474,7 @@ def save_user_confirmation(from_whatsapp: str, response: str):
         """
         INSERT INTO view_confirmations (
             from_whatsapp, archivo_norm, period_label, response, created_at
-        ) VALUES (?, ?, ?, ?, ?);
+        ) VALUES (%s, %s, %s, %s, %s);
         """,
         (
             from_whatsapp,
@@ -504,7 +511,6 @@ def generate_excel_report() -> str:
     con una fila por persona/período.
     """
     conn = get_db_connection()
-    conn.row_factory = sqlite3.Row
     cur = conn.cursor()
 
     # Traemos TODOS los mensajes registrados
