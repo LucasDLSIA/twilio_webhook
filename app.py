@@ -160,16 +160,17 @@ def init_db():
 
     cur.execute(
         """
-        CREATE TABLE IF NOT EXISTS view_confirmations (
+        CREATE TABLE IF NOT EXISTS dni_verification (
             id SERIAL PRIMARY KEY,
-            from_whatsapp TEXT NOT NULL,
-            archivo_norm TEXT,
-            period_label TEXT,
-            response TEXT,
-            created_at INTEGER NOT NULL
+            archivo_norm TEXT NOT NULL,
+            telefono_norm TEXT NOT NULL,
+            dni TEXT NOT NULL,
+            verified_at INTEGER NOT NULL,
+            UNIQUE(archivo_norm, telefono_norm)
         );
         """
     )
+
 
     # 👇👈 AÑADIR ESTO
     cur.execute(
@@ -308,6 +309,51 @@ def set_recibo_estado(archivo_norm: str, period_label: str, estado: str) -> None
     )
     conn.commit()
     conn.close()
+
+def is_dni_verified(archivo_norm: str, telefono_norm: str) -> bool:
+    """
+    Devuelve True si este archivo_norm + teléfono ya pasó la verificación de DNI.
+    telefono_norm debe venir solo con dígitos (canonicalize_phone).
+    """
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT 1
+        FROM dni_verification
+        WHERE archivo_norm = %s AND telefono_norm = %s
+        LIMIT 1;
+        """,
+        (archivo_norm, telefono_norm),
+    )
+    row = cur.fetchone()
+    conn.close()
+    return bool(row)
+
+
+def mark_dni_verified(archivo_norm: str, telefono_norm: str, dni: str) -> None:
+    """
+    Marca como verificado el DNI para este archivo_norm + teléfono.
+    Guarda el DNI tal cual (solo dígitos) y la fecha/hora actual.
+    """
+    dni_digits = re.sub(r"\D", "", dni or "")
+    if not dni_digits:
+        return
+
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        INSERT INTO dni_verification (archivo_norm, telefono_norm, dni, verified_at)
+        VALUES (%s, %s, %s, %s)
+        ON CONFLICT (archivo_norm, telefono_norm)
+        DO UPDATE SET dni = EXCLUDED.dni, verified_at = EXCLUDED.verified_at;
+        """,
+        (archivo_norm, telefono_norm, dni_digits, int(time.time())),
+    )
+    conn.commit()
+    conn.close()
+
 
 
 def save_pending_view(to_whatsapp: str, archivo_norm: str, period_label: str):
@@ -549,6 +595,7 @@ def generate_excel_report() -> str:
             rec = {
                 "nombre": row["nombre"] or "",
                 "whatsapp": row["to_whatsapp"],
+                "period_label": row["period_label"] or "",
                 "plantilla_sent_at": None,
                 "plantilla_delivered_at": None,
                 "plantilla_read_at": None,
@@ -561,6 +608,7 @@ def generate_excel_report() -> str:
                 "respuesta_timestamp": None,
             }
             agg[key] = rec
+
 
         if row["nombre"] and not rec["nombre"]:
             rec["nombre"] = row["nombre"]
@@ -628,6 +676,7 @@ def generate_excel_report() -> str:
     headers = [
         "Nombre",
         "WhatsApp",
+        "Periodo",
         "Plantilla_enviada",
         "Plantilla_entregada",
         "Plantilla_leida",
@@ -639,6 +688,7 @@ def generate_excel_report() -> str:
         "Respuesta_usuario",
         "Respuesta_timestamp",
     ]
+
     ws.append(headers)
 
     for rec in agg.values():
@@ -646,6 +696,7 @@ def generate_excel_report() -> str:
             [
                 rec["nombre"],
                 rec["whatsapp"],
+                rec["period_label"],
                 ts_to_str(rec["plantilla_sent_at"]),
                 ts_to_str(rec["plantilla_delivered_at"]),
                 ts_to_str(rec["plantilla_read_at"]),
@@ -658,6 +709,7 @@ def generate_excel_report() -> str:
                 ts_to_str(rec["respuesta_timestamp"]),
             ]
         )
+
 
     # auto ancho de columnas
     for col in ws.columns:
@@ -993,16 +1045,17 @@ def get_session(telefono_norm: str) -> Dict:
     """
     if telefono_norm not in SESSIONS:
         SESSIONS[telefono_norm] = {
-            "state": "IDLE",          # para menú de períodos (ya lo tenías)
+            "state": "IDLE",          # menú de períodos
             "offset": 0,
             "periods": [],
             "options_map": {},
-            # NUEVO: flujo del Word
-            "flow_state": "IDLE",     # 'IDLE', 'ASK_VISUALIZAR', 'ASK_FIRMAR_OBS', 'ASK_DESHACER_OBS'
+            # Flujo principal de recibo
+            "flow_state": "IDLE",     # 'IDLE', 'ASK_DNI', 'ASK_VISUALIZAR', 'ASK_FIRMAR_OBS', 'ASK_DESHACER_OBS', 'ASK_FIRMADO_VISTA'
             "archivo_norm": None,
             "period_label": None,
             "pdf_id": None,
         }
+
     return SESSIONS[telefono_norm]
 
 
@@ -1046,6 +1099,47 @@ def read_envios_rows() -> list[dict]:
     except Exception as e:
         print(f"ERROR en read_envios_rows(): {e}")
         return []
+
+def get_dni_for_archivo_and_phone(archivo_norm: str, telefono_norm: str) -> Optional[str]:
+    """
+    Busca en el Excel de envíos el DNI para un determinado archivo_norm + teléfono.
+    Espera que exista una columna 'DNI' (o variantes) en el archivo de envíos.
+    Devuelve solo dígitos (sin puntos).
+    """
+    rows = read_envios_rows()
+    want_tel = re.sub(r"\D", "", telefono_norm or "")
+    want_arc = s(archivo_norm)
+
+    for r in rows:
+        tel = r.get("Telefono") or r.get("Teléfono") or r.get("telefono") or ""
+        arc = (
+            r.get("Archivo_norm")
+            or r.get("archivo_norm")
+            or r.get("Archivo")
+            or r.get("archivo")
+            or ""
+        )
+        if not tel or not arc:
+            continue
+
+        tclean = re.sub(r"\D", "", str(tel))
+        if tclean != want_tel:
+            continue
+
+        if s(arc) != want_arc:
+            continue
+
+        dni_raw = (
+            r.get("DNI")
+            or r.get("Dni")
+            or r.get("dni")
+            or ""
+        )
+        dni_digits = re.sub(r"\D", "", str(dni_raw))
+        if dni_digits:
+            return dni_digits
+
+    return None
 
 
 
@@ -1705,6 +1799,89 @@ def admin_report_excel():
         mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     )
 
+def handle_after_identity_verified(from_whatsapp: str,
+                                   archivo_norm: str,
+                                   period_label: str,
+                                   session: Dict) -> Response | tuple:
+    """
+    Ejecuta el flujo normal de envío de PDF + opciones,
+    asumiendo que la identidad (DNI) ya fue verificada.
+    """
+    # Aseguramos que haya pdf_id en sesión o lo buscamos
+    pdf_id = session.get("pdf_id")
+    if not pdf_id:
+        pdf_id = find_pdf_for_archivo_and_period(archivo_norm, period_label)
+        session["pdf_id"] = pdf_id
+
+    if not pdf_id:
+        msg = (
+            "🤖 No pude encontrar el PDF de tu recibo en este momento.\n"
+            "🤖 Por favor intentá más tarde o contactá a RRHH."
+        )
+        session["flow_state"] = "IDLE"
+        return build_twilio_response(msg)
+
+    estado = get_recibo_estado(archivo_norm, period_label)
+
+    # CASE 1: FIRMADO → hasta 3 visualizaciones
+    if estado == "FIRMADO":
+        vistas_actuales = get_recibo_vistas(archivo_norm, period_label)
+        restantes = max(0, 3 - vistas_actuales)
+
+        if restantes <= 0:
+            session["flow_state"] = "IDLE"
+            return build_twilio_response(
+                f"🤖 Tu recibo del período {period_label} ya alcanzó el máximo de 3 visualizaciones adicionales."
+            )
+
+        msg = (
+            f"🤖 Tu recibo de sueldo del período {period_label} ya está firmado.\n"
+            f"🤖 ¿Querés verlo nuevamente? Te quedan {restantes} de 3 visualizaciones.\n"
+            "    1) Sí, enviar copia\n"
+            "    2) No"
+        )
+        session["flow_state"] = "ASK_FIRMADO_VISTA"
+        return build_twilio_response(msg)
+
+    # CASE 2: OBSERVADO → reenvío + pregunta deshacer
+    if estado == "OBSERVADO":
+        media_url = build_media_url_for_twilio(pdf_id)
+        caption = (
+            "🤖 Ud. tiene el recibo observado.\n"
+            "🤖 Le envío nuevamente el recibo.\n\n"
+            "🤖 ¿Desea deshacer la observación y firmar?\n"
+            "    1) Sí, deshacer y firmar\n"
+            "    2) No, mantener observado"
+        )
+        send_pdf_via_twilio_media(
+            from_whatsapp,
+            media_url,
+            caption=caption,
+            archivo_norm=archivo_norm,
+            period_label=period_label,
+        )
+        session["flow_state"] = "ASK_DESHACER_OBS"
+        return ("", 200)
+
+    # CASE 3: DISPONIBLE → envío directo + firmar/observar
+    media_url = build_media_url_for_twilio(pdf_id)
+    caption = (
+        "🤖 Aquí tiene su recibo.\n\n"
+        "🤖 ¿Confirma/firma su recibo?\n"
+        "    1) Confirmar/Firmar\n"
+        "    2) Observar"
+    )
+    send_pdf_via_twilio_media(
+        from_whatsapp,
+        media_url,
+        caption=caption,
+        archivo_norm=archivo_norm,
+        period_label=period_label,
+    )
+    session["flow_state"] = "ASK_FIRMAR_OBS"
+    return ("", 200)
+
+
 # ==========================
 #  Webhook Twilio
 # ==========================
@@ -1730,7 +1907,6 @@ def twilio_webhook():
     # ------------------------------------------------------------------
     # 0) CHEQUEO GLOBAL DE NÚMERO AUTORIZADO
     # ------------------------------------------------------------------
-    # Si el número no está en la base (Excel / mapping), rechazamos de una.
     archivo_norm_incoming = get_archivo_from_incoming(from_whatsapp)
     if not archivo_norm_incoming:
         return build_twilio_response(
@@ -1749,6 +1925,48 @@ def twilio_webhook():
     def ensure_context():
         return bool(archivo_norm and period_label)
 
+    # CASE DNI: estamos esperando que la persona escriba su DNI completo
+    if flow_state == "ASK_DNI":
+        # Usamos archivo_norm y período actual de la sesión; si falta, usamos el incoming + período actual
+        if not archivo_norm:
+            archivo_norm = archivo_norm_incoming
+            session["archivo_norm"] = archivo_norm
+        if not period_label:
+            period_label = norm_period_label(get_current_period_label())
+            session["period_label"] = period_label
+
+        # DNI esperado desde el Excel de envíos
+        expected_dni = get_dni_for_archivo_and_phone(archivo_norm, telefono_norm)
+        if not expected_dni:
+            session["flow_state"] = "IDLE"
+            return build_twilio_response(
+                "🤖 No pude validar tu DNI en el sistema. Por favor contactá a RRHH."
+            )
+
+        user_dni = re.sub(r"\D", "", body or "")
+        if not user_dni:
+            return build_twilio_response(
+                "🤖 Por favor ingresá tu DNI completo, solo números, sin puntos."
+            )
+
+        if user_dni != expected_dni:
+            return build_twilio_response(
+                "🤖 El DNI ingresado no coincide con nuestros registros. Revisá e intentá de nuevo."
+            )
+
+        # DNI OK → marcamos verificación y seguimos flujo normal
+        mark_dni_verified(archivo_norm, telefono_norm, user_dni)
+        session["flow_state"] = "IDLE"
+
+        # Aseguramos pdf_id en sesión (por si no estaba)
+        if not session.get("pdf_id"):
+            pdf_id = find_pdf_for_archivo_and_period(archivo_norm, period_label)
+            session["pdf_id"] = pdf_id
+
+        return handle_after_identity_verified(
+            from_whatsapp, archivo_norm, period_label, session
+        )
+
     # CASE 2: recibo OBSERVADO -> "¿Desea deshacer la observación y firmar?"
     if flow_state == "ASK_DESHACER_OBS":
         if not ensure_context():
@@ -1758,19 +1976,16 @@ def twilio_webhook():
             )
 
         if body_lower in ("1", "si", "sí", "si,", "sí,", "deshacer", "deshacer y firmar"):
-            # Deshacer observación y firmar
             set_recibo_estado(archivo_norm, period_label, "FIRMADO")
-            save_user_confirmation(from_whatsapp, "firmado")  # opcional, para tus reportes
+            save_user_confirmation(from_whatsapp, "firmado")
             session["flow_state"] = "IDLE"
             return build_twilio_response("🤖 Firmado exitosamente.")
         elif body_lower in ("2", "no", "mantener", "mantener observado"):
-            # Mantener observado
             set_recibo_estado(archivo_norm, period_label, "OBSERVADO")
             save_user_confirmation(from_whatsapp, "observado")
             session["flow_state"] = "IDLE"
             return build_twilio_response("🤖 Se mantiene la observación.")
         else:
-            # Respuesta inválida → repetir pregunta
             return build_twilio_response("🤖 Por favor responda *1* o *2*.")
 
     # CASE 3: recibo DISPONIBLE -> después de enviar PDF preguntamos:
@@ -1801,7 +2016,6 @@ def twilio_webhook():
             return build_twilio_response("🤖 Por favor responda *1* o *2*.")
 
     # Paso intermedio de CASE 3:
-    # "¿Desea visualizar su recibo?" → acá esperamos 'sí' para mandar el PDF.
     if flow_state == "ASK_VISUALIZAR":
         if not ensure_context():
             session["flow_state"] = "IDLE"
@@ -1818,7 +2032,6 @@ def twilio_webhook():
                 )
 
             media_url = build_media_url_for_twilio(pdf_id)
-
             caption = (
                 "🤖 Aquí tiene su recibo.\n\n"
                 "🤖 ¿Confirma/firma su recibo?\n"
@@ -1826,7 +2039,6 @@ def twilio_webhook():
                 "    2) Observar"
             )
 
-            # Enviamos el PDF por API (no como respuesta TwiML)
             send_pdf_via_twilio_media(
                 from_whatsapp,
                 media_url,
@@ -1835,7 +2047,6 @@ def twilio_webhook():
                 period_label=period_label,
             )
 
-            # Ahora esperamos la respuesta 1/2
             session["flow_state"] = "ASK_FIRMAR_OBS"
             return ("", 200)
         elif body_lower in ("no", "despues", "más tarde", "después"):
@@ -1866,13 +2077,11 @@ def twilio_webhook():
             )
 
         if body_lower in ("1", "si", "sí", "ver", "ver recibo", "enviar", "si,", "sí,"):
-            # Incrementamos contador y enviamos copia
             nuevas_vistas = inc_recibo_vistas(archivo_norm, period_label)
             restantes_luego = max(0, 3 - nuevas_vistas)
 
             pdf_id = session.get("pdf_id")
             if not pdf_id:
-                # por las dudas, volvemos a buscarlo
                 pdf_id = find_pdf_for_archivo_and_period(archivo_norm, period_label)
                 session["pdf_id"] = pdf_id
 
@@ -1916,15 +2125,11 @@ def twilio_webhook():
     # 2) ENTRADA NUEVA AL FLUJO (MENSAJE RECIBIDO EN WHATS)
     # ------------------------------------------------------------------
 
-    # Botón “Sí, visualizar” de la plantilla → maneja según estado
+    # Botón “Sí, visualizar” de la plantilla
     if button_payload == "VIEW_NOW" or button_text.lower().startswith("sí, visualizar"):
-        # 2.1) NÚMERO AUTORIZADO YA VALIDADO ARRIBA
         archivo_norm = archivo_norm_incoming
-
-        # 2.2) PERÍODO ACTUAL
         period_label = norm_period_label(get_current_period_label())
 
-        # 2.3) ¿TIENE RECIBO DEL ÚLTIMO PERÍODO?
         pdf_id = find_pdf_for_archivo_and_period(archivo_norm, period_label)
         if not pdf_id:
             msg = (
@@ -1938,77 +2143,24 @@ def twilio_webhook():
         session["period_label"] = period_label
         session["pdf_id"] = pdf_id
 
-        # 2.4) ¿ESTADO DEL RECIBO?  (FIRMADO / OBSERVADO / DISPONIBLE)
-        estado = get_recibo_estado(archivo_norm, period_label)
-
-        # ---------------- CASE 1: RECIBO FIRMADO ----------------
-        if estado == "FIRMADO":
-            vistas_actuales = get_recibo_vistas(archivo_norm, period_label)
-            restantes = max(0, 3 - vistas_actuales)
-
-            if restantes <= 0:
-                session["flow_state"] = "IDLE"
-                return build_twilio_response(
-                    f"🤖 Tu recibo del período {period_label} ya alcanzó el máximo de 3 visualizaciones adicionales."
-                )
-
-            msg = (
-                f"🤖 Tu recibo de sueldo del período {period_label} ya está firmado.\n"
-                f"🤖 ¿Querés verlo nuevamente? Te quedan {restantes} de 3 visualizaciones.\n"
-                "    1) Sí, enviar copia\n"
-                "    2) No"
+        # 🔐 Gating de DNI: si no está verificado, pedimos DNI completo
+        if not is_dni_verified(archivo_norm, telefono_norm):
+            session["flow_state"] = "ASK_DNI"
+            return build_twilio_response(
+                "🤖 Antes de mostrar tu recibo, necesito verificar tu identidad.\n"
+                "Por favor escribí tu *DNI completo*, solo números y sin puntos."
             )
-            session["flow_state"] = "ASK_FIRMADO_VISTA"
-            return build_twilio_response(msg)
 
-        # ---------------- CASE 2: RECIBO OBSERVADO ----------------
-        if estado == "OBSERVADO":
-            media_url = build_media_url_for_twilio(pdf_id)
-            caption = (
-                "🤖 Ud. tiene el recibo observado.\n"
-                "🤖 Le envío nuevamente el recibo.\n\n"
-                "🤖 ¿Desea deshacer la observación y firmar?\n"
-                "    1) Sí, deshacer y firmar\n"
-                "    2) No, mantener observado"
-            )
-            send_pdf_via_twilio_media(
-                from_whatsapp,
-                media_url,
-                caption=caption,
-                archivo_norm=archivo_norm,
-                period_label=period_label,
-            )
-            session["flow_state"] = "ASK_DESHACER_OBS"
-            return ("", 200)
-
-        # ---------------- CASE 3: RECIBO DISPONIBLE ----------------
-        # Botón = YA dijo que quiere visualizar → mandamos directo el PDF
-        media_url = build_media_url_for_twilio(pdf_id)
-        caption = (
-            "🤖 Aquí tiene su recibo.\n\n"
-            "🤖 ¿Confirma/firma su recibo?\n"
-            "    1) Confirmar/Firmar\n"
-            "    2) Observar"
+        # Si ya estaba verificado → seguimos con el flujo normal
+        return handle_after_identity_verified(
+            from_whatsapp, archivo_norm, period_label, session
         )
-        send_pdf_via_twilio_media(
-            from_whatsapp,
-            media_url,
-            caption=caption,
-            archivo_norm=archivo_norm,
-            period_label=period_label,
-        )
-        session["flow_state"] = "ASK_FIRMAR_OBS"
-        return ("", 200)
 
-    # Palabras que disparan el flujo principal cuando ESCRIBE (no botón)
+    # Palabras que disparan el flujo cuando ESCRIBE (no botón)
     if body_lower in ("ver", "ver recibo", "ver recibo de sueldo"):
-        # 2.1) NÚMERO AUTORIZADO YA VALIDADO ARRIBA
         archivo_norm = archivo_norm_incoming
-
-        # 2.2) PERÍODO ACTUAL
         period_label = norm_period_label(get_current_period_label())
 
-        # 2.3) ¿TIENE RECIBO DEL ÚLTIMO PERÍODO?
         pdf_id = find_pdf_for_archivo_and_period(archivo_norm, period_label)
         if not pdf_id:
             msg = (
@@ -2017,58 +2169,22 @@ def twilio_webhook():
             )
             return build_twilio_response(msg)
 
-        # Guardamos contexto en la sesión
         session["archivo_norm"] = archivo_norm
         session["period_label"] = period_label
         session["pdf_id"] = pdf_id
 
-        # 2.4) ¿ESTADO DEL RECIBO?  (FIRMADO / OBSERVADO / DISPONIBLE)
-        estado = get_recibo_estado(archivo_norm, period_label)
-
-        # ---------------- CASE 1: RECIBO FIRMADO ----------------
-        if estado == "FIRMADO":
-            vistas_actuales = get_recibo_vistas(archivo_norm, period_label)
-            restantes = max(0, 3 - vistas_actuales)
-
-            if restantes <= 0:
-                session["flow_state"] = "IDLE"
-                return build_twilio_response(
-                    f"🤖 Tu recibo del período {period_label} ya alcanzó el máximo de 3 visualizaciones adicionales."
-                )
-
-            msg = (
-                f"🤖 Tu recibo de sueldo del período {period_label} ya está firmado.\n"
-                f"🤖 ¿Querés verlo nuevamente? Te quedan {restantes} de 3 visualizaciones.\n"
-                "    1) Sí, enviar copia\n"
-                "    2) No"
+        # 🔐 Gating de DNI: si no está verificado, pedimos DNI completo
+        if not is_dni_verified(archivo_norm, telefono_norm):
+            session["flow_state"] = "ASK_DNI"
+            return build_twilio_response(
+                "🤖 Antes de mostrar tu recibo, necesito verificar tu identidad.\n"
+                "Por favor escribí tu *DNI completo*, solo números y sin puntos."
             )
-            session["flow_state"] = "ASK_FIRMADO_VISTA"
-            return build_twilio_response(msg)
 
-        # ---------------- CASE 2: RECIBO OBSERVADO ----------------
-        if estado == "OBSERVADO":
-            media_url = build_media_url_for_twilio(pdf_id)
-            caption = (
-                "🤖 Ud. tiene el recibo observado.\n"
-                "🤖 Le envío nuevamente el recibo.\n\n"
-                "🤖 ¿Desea deshacer la observación y firmar?\n"
-                "    1) Sí, deshacer y firmar\n"
-                "    2) No, mantener observado"
-            )
-            send_pdf_via_twilio_media(
-                from_whatsapp,
-                media_url,
-                caption=caption,
-                archivo_norm=archivo_norm,
-                period_label=period_label,
-            )
-            session["flow_state"] = "ASK_DESHACER_OBS"
-            return ("", 200)
-
-        # ---------------- CASE 3: RECIBO DISPONIBLE ----------------
-        # Cuando ESCRIBE "ver recibo", sí preguntamos primero
-        session["flow_state"] = "ASK_VISUALIZAR"
-        return build_twilio_response("🤖 ¿Desea visualizar su recibo?")
+        # Si ya estaba verificado → flujo normal
+        return handle_after_identity_verified(
+            from_whatsapp, archivo_norm, period_label, session
+        )
 
     # ------------------------------------------------------------------
     # 3) MENSAJE QUE NO ENTRA EN NINGÚN FLUJO → TEXTO SEGÚN ESTADO
@@ -2090,7 +2206,6 @@ def twilio_webhook():
                     f"🤖 Tu recibo del período {period_label_fallback} ya alcanzó el máximo de 3 visualizaciones adicionales."
                 )
 
-            # Guardamos contexto por si responde 1 / 2
             session["archivo_norm"] = archivo_norm_fallback
             session["period_label"] = period_label_fallback
             pdf_id_fb = find_pdf_for_archivo_and_period(
@@ -2119,7 +2234,7 @@ def twilio_webhook():
     msg = (
         "Hola 👋\n"
         "Si querés consultar tu recibo de sueldo del último período, escribí *ver recibo* "
-        "o usá el botón *Sí, visualizar* cuando te llegue la notificació"
+        "o usá el botón *Sí, visualizar* cuando te llegue la notificación."
     )
     return build_twilio_response(msg)
 
