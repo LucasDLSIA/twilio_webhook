@@ -2129,26 +2129,33 @@ import requests
 @app.route("/admin/clean_db", methods=["POST"])
 def clean_db():
     token = request.args.get("token")
-    if token != "Legui3009":  # 👉 ESTE LO ELEGÍS VOS
+    # ⚠️ el token tiene que ser exactamente el mismo que usás en el curl
+    if token != "Legui3009":
         return "NO AUTORIZADO", 403
 
-    conn = get_db_connection()
-    cur = conn.cursor()
-    cur.execute("""
-        TRUNCATE TABLE 
-            pending_views,
-            message_status,
-            view_confirmations,
-            dni_verification,
-            recibo_estado,
-            recibo_vistas
-        RESTART IDENTITY CASCADE;
-    """)
-    conn.commit()
-    cur.close()
-    conn.close()
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        # Usamos IF EXISTS para que no falle si alguna tabla todavía no existe
+        cur.execute("""
+            TRUNCATE TABLE IF EXISTS
+                pending_views,
+                message_status,
+                view_confirmations,
+                dni_verification,
+                recibo_estado,
+                recibo_vistas
+            RESTART IDENTITY CASCADE;
+        """)
+        conn.commit()
+        cur.close()
+        conn.close()
+        return "Base limpiada correctamente", 200
 
-    return "Base limpiada correctamente"
+    except Exception as e:
+        # Log en consola y devolvemos el mensaje para ver qué pasó
+        print("ERROR clean_db:", e)
+        return f"Error al limpiar la base: {e}", 500
 
 
 def keep_alive():
