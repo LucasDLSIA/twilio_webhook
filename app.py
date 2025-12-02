@@ -2129,31 +2129,28 @@ import requests
 @app.route("/admin/clean_db", methods=["POST"])
 def clean_db():
     token = request.args.get("token")
-    # ⚠️ el token tiene que ser exactamente el mismo que usás en el curl
-    if token != "Legui3009":
+    if token != "Legui3009":  # tu token
         return "NO AUTORIZADO", 403
 
     try:
         conn = get_db_connection()
         cur = conn.cursor()
-        # Usamos IF EXISTS para que no falle si alguna tabla todavía no existe
-        cur.execute("""
-            TRUNCATE TABLE IF EXISTS
-                pending_views,
-                message_status,
-                view_confirmations,
-                dni_verification,
-                recibo_estado,
-                recibo_vistas
-            RESTART IDENTITY CASCADE;
-        """)
+
+        # Para SQLite: usamos DELETE FROM en lugar de TRUNCATE
+        cur.execute("DELETE FROM pending_views;")
+        cur.execute("DELETE FROM message_status;")
+        cur.execute("DELETE FROM view_confirmations;")
+        cur.execute("DELETE FROM dni_verification;")
+        cur.execute("DELETE FROM recibo_estado;")
+        cur.execute("DELETE FROM recibo_vistas;")
+
         conn.commit()
         cur.close()
         conn.close()
+
         return "Base limpiada correctamente", 200
 
     except Exception as e:
-        # Log en consola y devolvemos el mensaje para ver qué pasó
         print("ERROR clean_db:", e)
         return f"Error al limpiar la base: {e}", 500
 
