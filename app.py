@@ -2136,13 +2136,34 @@ def clean_db():
         conn = get_db_connection()
         cur = conn.cursor()
 
-        # Para SQLite: usamos DELETE FROM en lugar de TRUNCATE
-        cur.execute("DELETE FROM pending_views;")
-        cur.execute("DELETE FROM message_status;")
-        cur.execute("DELETE FROM view_confirmations;")
-        cur.execute("DELETE FROM dni_verification;")
-        cur.execute("DELETE FROM recibo_estado;")
-        cur.execute("DELETE FROM recibo_vistas;")
+        # Aseguramos que exista la tabla dni_verification (por si es un SQLite viejo)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS dni_verification (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                archivo_norm TEXT NOT NULL,
+                telefono_norm TEXT NOT NULL,
+                dni TEXT NOT NULL,
+                verified_at INTEGER NOT NULL,
+                UNIQUE(archivo_norm, telefono_norm)
+            );
+        """)
+
+        # Intentamos borrar datos tabla por tabla; si alguna no existe, la ignoramos
+        tablas = [
+            "pending_views",
+            "message_status",
+            "view_confirmations",
+            "dni_verification",
+            "recibo_estado",
+            "recibo_vistas",
+        ]
+
+        for tabla in tablas:
+            try:
+                cur.execute(f"DELETE FROM {tabla};")
+            except Exception as e:
+                # La tabla no existe: la ignoramos
+                print(f"[clean_db] aviso: no se pudo borrar {tabla}: {e}")
 
         conn.commit()
         cur.close()
