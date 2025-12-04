@@ -1880,11 +1880,12 @@ def get_envios_dni_for(archivo_norm: str, telefono_norm: str) -> Optional[str]:
     """
     rows = read_envios_rows()
 
-    # Normalizamos archivo_norm igual que lo que viene del Excel (.pdf fuera)
+    # Normalizamos archivo_norm igual que la columna del Excel: sin ".pdf"
     archivo_norm_norm = str(archivo_norm or "").strip().replace(".pdf", "")
     telefono_norm = canonicalize_phone(telefono_norm)
 
     for r in rows:
+        # Teléfono en la fila
         tel_raw = (
             r.get("Telefono")
             or r.get("Teléfono")
@@ -1895,10 +1896,11 @@ def get_envios_dni_for(archivo_norm: str, telefono_norm: str) -> Optional[str]:
         if not tel_norm_row:
             continue
 
-        # Teléfonos deben matchear exactamente (ya están normalizados a dígitos)
+        # Teléfonos deben matchear exactamente
         if tel_norm_row != telefono_norm:
             continue
 
+        # Archivo / CUIL en la fila
         arc_val = (
             r.get("Archivo_norm")
             or r.get("archivo_norm")
@@ -1910,10 +1912,11 @@ def get_envios_dni_for(archivo_norm: str, telefono_norm: str) -> Optional[str]:
         )
         arc_norm_row = str(arc_val or "").strip().replace(".pdf", "")
 
-        # Chequeamos que sea el mismo archivo_norm (CUIL) ya normalizado
+        # Chequeamos que sea el mismo archivo_norm ya normalizado
         if archivo_norm_norm and arc_norm_row and archivo_norm_norm != arc_norm_row:
             continue
 
+        # Si llegamos acá, teléfono y archivo hacen match → leemos DNI
         dni_val = r.get("DNI") or r.get("Dni") or r.get("dni") or ""
         dni_digits = normalize_dni_digits(dni_val)
         if dni_digits:
