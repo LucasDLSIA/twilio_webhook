@@ -1995,13 +1995,17 @@ def twilio_webhook():
         return build_twilio_response(
             "🤖 Ud. no está registrado/autorizado para utilizar este servicio."
         )
-    
+    flow_state = session.get("flow_state", "IDLE")
+
         # ------------------------------------------------------------------
     # 0.b) VERIFICACIÓN DE DNI (la primera vez)
     # ------------------------------------------------------------------
+        # ------------------------------------------------------------------
+    # 0.b) VERIFICACIÓN DE DNI (primera vez o reintentos)
+    # ------------------------------------------------------------------
     if not is_dni_verified(archivo_norm_incoming, telefono_norm):
-        # Si ya estamos en el flujo de pedir DNI, interpretamos el body como DNI
-        if session.get("flow_state") == "ASK_DNI":
+        # Si ya estamos esperando el DNI, este mensaje se interpreta como el DNI
+        if flow_state == "ASK_DNI":
             dni_digits = normalize_dni_digits(body)
 
             if not dni_digits:
@@ -2009,13 +2013,16 @@ def twilio_webhook():
                     "🤖 Para continuar, por favor escribí tu *DNI* (solo números, sin puntos ni espacios)."
                 )
 
-            if len(dni_digits) != 8:
+            # Aceptamos 7 u 8 dígitos (y normalize_dni_digits ya los corrige)
+            if len(dni_digits) not in (7, 8):
                 return build_twilio_response(
                     "🤖 El DNI parece inválido. Volvé a ingresarlo con 7 u 8 dígitos (solo números)."
                 )
 
             # Buscamos el DNI esperado en el Excel de envíos
             expected_dni = get_envios_dni_for(archivo_norm_incoming, telefono_norm)
+            print("DEBUG DNI expected:", expected_dni, "input:", dni_digits)
+
             if not expected_dni:
                 return build_twilio_response(
                     "🤖 No tengo un DNI registrado para tu usuario en el Excel de envíos.\n"
@@ -2023,13 +2030,14 @@ def twilio_webhook():
                 )
 
             if dni_digits != expected_dni:
+                # ❌ NO COINCIDE → se queda en ASK_DNI, puede reintentar
                 return build_twilio_response(
                     "🤖 El DNI que ingresaste no coincide con el que está registrado.\n"
                     "Verificá que lo escribiste bien y volvé a ingresarlo.\n"
                     "Si el problema continúa, por favor contactá a RRHH."
                 )
 
-            # Si llegamos acá, el DNI es correcto: lo guardamos como verificado
+            # ✅ Coincide → guardamos verificación y salimos del flujo de DNI
             save_dni_verification(archivo_norm_incoming, telefono_norm, dni_digits)
             session["flow_state"] = "IDLE"
 
@@ -2040,7 +2048,7 @@ def twilio_webhook():
             )
 
         else:
-            # Primera vez: todavía no pidió DNI, lo arrancamos ahora
+            # Primera vez: arrancamos el flujo de DNI
             session["flow_state"] = "ASK_DNI"
             return build_twilio_response(
                 "🤖 Antes de continuar necesito confirmar tu identidad.\n"
@@ -2052,7 +2060,6 @@ def twilio_webhook():
     # 1) RESPUESTAS A PREGUNTAS ABIERTAS DEL FLUJO (ya hay contexto)
     # ------------------------------------------------------------------
 
-    flow_state = session.get("flow_state", "IDLE")
     archivo_norm = session.get("archivo_norm")
     period_label = session.get("period_label")
 
