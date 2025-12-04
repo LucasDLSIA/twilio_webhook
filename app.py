@@ -169,7 +169,6 @@ def init_db():
         """
     )
 
-    # 👇👈 AÑADIR ESTO
     cur.execute(
         """
         CREATE TABLE IF NOT EXISTS recibo_estado (
@@ -182,7 +181,6 @@ def init_db():
         """
     )
 
-    # 👇👈 AÑADIR ESTO (contador de vistas extra)
     cur.execute(
         """
         CREATE TABLE IF NOT EXISTS recibo_vistas (
@@ -195,8 +193,24 @@ def init_db():
         """
     )
 
+    # 👇👇 AÑADIR ESTO – dni_verification
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS dni_verification (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            archivo_norm TEXT NOT NULL,
+            telefono_norm TEXT NOT NULL,
+            dni TEXT NOT NULL,
+            verified_at INTEGER NOT NULL,
+            UNIQUE(archivo_norm, telefono_norm)
+        );
+        """
+    )
+
     conn.commit()
     conn.close()
+
+
 
 def get_recibo_vistas(archivo_norm: str, period_label: str) -> int:
     """
