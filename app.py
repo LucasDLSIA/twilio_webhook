@@ -502,6 +502,9 @@ def generate_excel_report() -> str:
     """
     Lee message_status + view_confirmations y genera un Excel en /tmp/reporte_recibos.xlsx
     con una fila por persona/período.
+
+    Además agrega una segunda hoja "DNI" con el estado de verificación
+    por persona según el Excel de envíos y la tabla dni_verification.
     """
     conn = get_db_connection()
     conn.row_factory = sqlite3.Row
@@ -653,7 +656,7 @@ def generate_excel_report() -> str:
             ]
         )
 
-    # auto ancho de columnas
+    # auto ancho de columnas hoja Recibos
     for col in ws.columns:
         max_len = 0
         col_letter = get_column_letter(col[0].column)
@@ -663,6 +666,119 @@ def generate_excel_report() -> str:
             except Exception:
                 pass
         ws.column_dimensions[col_letter].width = max(10, max_len + 2)
+
+    # ============================
+    # Hoja 2: DNI verificados
+    # ============================
+    try:
+        env_rows = read_envios_rows()
+    except Exception as e:
+        print(f"WARN generate_excel_report DNI sheet: {e}")
+        env_rows = []
+
+    # Cargamos verificaciones de SQLite
+    conn = get_db_connection()
+    conn.row_factory = sqlite3.Row
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT archivo_norm, telefono_norm, dni, verified_at
+        FROM dni_verification;
+        """
+    )
+    dni_rows = cur.fetchall()
+    conn.close()
+
+    # índice por (archivo_norm, telefono_norm_normalizado)
+    dni_index: dict[tuple[str, str], dict] = {}
+    for row in dni_rows:
+        key = (
+            (row["archivo_norm"] or "").strip(),
+            canonicalize_phone(row["telefono_norm"]),
+        )
+        dni_index[key] = {
+            "dni": normalize_dni_digits(row["dni"]),
+            "verified_at": row["verified_at"],
+        }
+
+    ws_dni = wb.create_sheet(title="DNI")
+    headers_dni = [
+        "Nombre",
+        "CUIL/Archivo",
+        "Telefono",
+        "Telefono_norm",
+        "DNI_envios",
+        "DNI_guardado",
+        "Verificado",
+        "Fecha_verificacion",
+    ]
+    ws_dni.append(headers_dni)
+
+    for r in env_rows:
+        nombre = (
+            s(r.get("Nombre"))
+            or s(r.get("Nombre y apellido"))
+            or s(r.get("Apellido y nombre"))
+            or s(r.get("Empleado"))
+            or s(r.get("Persona"))
+        )
+
+        archivo_val = (
+            r.get("Archivo_norm")
+            or r.get("archivo_norm")
+            or r.get("Archivo")
+            or r.get("archivo")
+            or r.get("Cuil")
+            or r.get("CUIL")
+            or ""
+        )
+        archivo_norm_row = str(archivo_val).strip().replace(".pdf", "")
+
+        tel_raw = (
+            r.get("Telefono")
+            or r.get("Teléfono")
+            or r.get("telefono")
+            or ""
+        )
+        tel_norm = canonicalize_phone(tel_raw)
+
+        dni_envios_val = r.get("DNI") or r.get("Dni") or r.get("dni") or ""
+        dni_envios_digits = normalize_dni_digits(dni_envios_val)
+
+        key = (archivo_norm_row, tel_norm)
+        info = dni_index.get(key)
+        if info:
+            verified = "SI"
+            dni_guardado = info["dni"]
+            fecha_ver = ts_to_str(info["verified_at"])
+        else:
+            verified = "NO"
+            dni_guardado = ""
+            fecha_ver = ""
+
+        ws_dni.append(
+            [
+                nombre,
+                archivo_norm_row,
+                tel_raw,
+                tel_norm,
+                dni_envios_digits,
+                dni_guardado,
+                verified,
+                fecha_ver,
+            ]
+        )
+
+    # auto ancho de columnas hoja DNI
+    for col in ws_dni.columns:
+        max_len = 0
+        col_letter = get_column_letter(col[0].column)
+        for cell in col:
+            try:
+                max_len = max(max_len, len(str(cell.value or "")))
+            except Exception:
+                pass
+        ws_dni.column_dimensions[col_letter].width = max(10, max_len + 2)
 
     path = "/tmp/reporte_recibos.xlsx"
     wb.save(path)
@@ -1699,6 +1815,109 @@ def admin_report_excel():
         mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     )
 
+def normalize_dni_digits(val: str) -> str:
+    """
+    Deja solo dígitos en el DNI y lo normaliza a 8 dígitos (rellena con 0 a la izquierda si son 7).
+    """
+    digits = re.sub(r"\D", "", str(val or ""))
+    if not digits:
+        return ""
+    if len(digits) == 7:
+        digits = digits.zfill(8)
+    return digits
+
+
+def get_envios_dni_for(archivo_norm: str, telefono_norm: str) -> Optional[str]:
+    """
+    Busca en el Excel de envíos el DNI correspondiente a (archivo_norm, telefono_norm).
+    Devuelve el DNI normalizado (solo dígitos, 8 chars) o None si no lo encuentra.
+    """
+    rows = read_envios_rows()
+    archivo_norm = (archivo_norm or "").strip()
+    telefono_norm = canonicalize_phone(telefono_norm)
+
+    for r in rows:
+        tel_raw = (
+            r.get("Telefono")
+            or r.get("Teléfono")
+            or r.get("telefono")
+            or ""
+        )
+        tel_norm_row = canonicalize_phone(tel_raw)
+        if not tel_norm_row:
+            continue
+
+        # teléfonos deben matchear exactamente (ya están normalizados a dígitos)
+        if tel_norm_row != telefono_norm:
+            continue
+
+        arc_val = (
+            r.get("Archivo_norm")
+            or r.get("archivo_norm")
+            or r.get("Archivo")
+            or r.get("archivo")
+            or r.get("Cuil")
+            or r.get("CUIL")
+            or ""
+        )
+        arc_norm_row = str(arc_val).strip().replace(".pdf", "")
+
+        # chequeamos que sea el mismo archivo_norm (CUIL)
+        if archivo_norm and arc_norm_row and str(archivo_norm) != str(arc_norm_row):
+            continue
+
+        dni_val = r.get("DNI") or r.get("Dni") or r.get("dni") or ""
+        dni_digits = normalize_dni_digits(dni_val)
+        if dni_digits:
+            return dni_digits
+
+    return None
+
+
+def is_dni_verified(archivo_norm: str, telefono_norm: str) -> bool:
+    """
+    Devuelve True si ya tenemos un DNI verificado para ese archivo_norm + teléfono.
+    """
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT 1
+        FROM dni_verification
+        WHERE archivo_norm = ? AND telefono_norm = ?
+        LIMIT 1;
+        """,
+        (archivo_norm, canonicalize_phone(telefono_norm)),
+    )
+    row = cur.fetchone()
+    conn.close()
+    return row is not None
+
+
+def save_dni_verification(archivo_norm: str, telefono_norm: str, dni: str) -> None:
+    """
+    Guarda (o actualiza) el DNI verificado para ese archivo_norm + teléfono.
+    """
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        INSERT INTO dni_verification (archivo_norm, telefono_norm, dni, verified_at)
+        VALUES (?, ?, ?, ?)
+        ON CONFLICT(archivo_norm, telefono_norm)
+        DO UPDATE SET dni = excluded.dni, verified_at = excluded.verified_at;
+        """,
+        (
+            (archivo_norm or "").strip(),
+            canonicalize_phone(telefono_norm),
+            normalize_dni_digits(dni),
+            int(time.time()),
+        ),
+    )
+    conn.commit()
+    conn.close()
+
+
 # ==========================
 #  Webhook Twilio
 # ==========================
@@ -1730,6 +1949,58 @@ def twilio_webhook():
         return build_twilio_response(
             "🤖 Ud. no está registrado/autorizado para utilizar este servicio."
         )
+    
+        # ------------------------------------------------------------------
+    # 0.b) VERIFICACIÓN DE DNI (la primera vez)
+    # ------------------------------------------------------------------
+    if not is_dni_verified(archivo_norm_incoming, telefono_norm):
+        # Si ya estamos en el flujo de pedir DNI, interpretamos el body como DNI
+        if session.get("flow_state") == "ASK_DNI":
+            dni_digits = normalize_dni_digits(body)
+
+            if not dni_digits:
+                return build_twilio_response(
+                    "🤖 Para continuar, por favor escribí tu *DNI* (solo números, sin puntos ni espacios)."
+                )
+
+            if len(dni_digits) != 8:
+                return build_twilio_response(
+                    "🤖 El DNI parece inválido. Volvé a ingresarlo con 7 u 8 dígitos (solo números)."
+                )
+
+            # Buscamos el DNI esperado en el Excel de envíos
+            expected_dni = get_envios_dni_for(archivo_norm_incoming, telefono_norm)
+            if not expected_dni:
+                return build_twilio_response(
+                    "🤖 No tengo un DNI registrado para tu usuario en el Excel de envíos.\n"
+                    "Por favor comunicate con RRHH para que actualicen tus datos."
+                )
+
+            if dni_digits != expected_dni:
+                return build_twilio_response(
+                    "🤖 El DNI que ingresaste no coincide con el que está registrado.\n"
+                    "Verificá que lo escribiste bien y volvé a ingresarlo.\n"
+                    "Si el problema continúa, por favor contactá a RRHH."
+                )
+
+            # Si llegamos acá, el DNI es correcto: lo guardamos como verificado
+            save_dni_verification(archivo_norm_incoming, telefono_norm, dni_digits)
+            session["flow_state"] = "IDLE"
+
+            return build_twilio_response(
+                "✅ DNI verificado correctamente.\n"
+                "A partir de ahora ya no será necesario que lo ingreses de nuevo.\n"
+                "Si querés consultar tu recibo, escribí *ver recibo*."
+            )
+
+        else:
+            # Primera vez: todavía no pidió DNI, lo arrancamos ahora
+            session["flow_state"] = "ASK_DNI"
+            return build_twilio_response(
+                "🤖 Antes de continuar necesito confirmar tu identidad.\n"
+                "Por favor escribí tu *DNI* (solo números, sin puntos ni espacios)."
+            )
+
 
     # ------------------------------------------------------------------
     # 1) RESPUESTAS A PREGUNTAS ABIERTAS DEL FLUJO (ya hay contexto)
@@ -2137,16 +2408,19 @@ def clean_db():
         cur = conn.cursor()
 
         # Aseguramos que exista la tabla dni_verification (por si es un SQLite viejo)
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS dni_verification (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                archivo_norm TEXT NOT NULL,
-                telefono_norm TEXT NOT NULL,
-                dni TEXT NOT NULL,
-                verified_at INTEGER NOT NULL,
-                UNIQUE(archivo_norm, telefono_norm)
-            );
-        """)
+        cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS dni_verification (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            archivo_norm TEXT NOT NULL,
+            telefono_norm TEXT NOT NULL,
+            dni TEXT NOT NULL,
+            verified_at INTEGER NOT NULL,
+            UNIQUE(archivo_norm, telefono_norm)
+        );
+        """
+    )
+
 
         # Intentamos borrar datos tabla por tabla; si alguna no existe, la ignoramos
         tablas = [
