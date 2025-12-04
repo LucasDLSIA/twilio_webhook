@@ -1882,7 +1882,7 @@ def get_envios_dni_for(archivo_norm: str, telefono_norm: str) -> Optional[str]:
 
     # Normalizamos archivo_norm igual que la columna del Excel: sin ".pdf"
     archivo_norm_norm = str(archivo_norm or "").strip().replace(".pdf", "")
-    telefono_norm = canonicalize_phone(telefono_norm)
+    want_phone = canonicalize_phone(telefono_norm)
 
     for r in rows:
         # Teléfono en la fila
@@ -1896,8 +1896,8 @@ def get_envios_dni_for(archivo_norm: str, telefono_norm: str) -> Optional[str]:
         if not tel_norm_row:
             continue
 
-        # Teléfonos deben matchear exactamente
-        if tel_norm_row != telefono_norm:
+        # ⚠️ Comparación flexible, como en find_archivo_by_phone
+        if not (tel_norm_row.endswith(want_phone) or want_phone.endswith(tel_norm_row)):
             continue
 
         # Archivo / CUIL en la fila
@@ -1912,7 +1912,7 @@ def get_envios_dni_for(archivo_norm: str, telefono_norm: str) -> Optional[str]:
         )
         arc_norm_row = str(arc_val or "").strip().replace(".pdf", "")
 
-        # Chequeamos que sea el mismo archivo_norm ya normalizado
+        # Chequeamos que sea el mismo archivo_norm ya normalizado (si viene)
         if archivo_norm_norm and arc_norm_row and archivo_norm_norm != arc_norm_row:
             continue
 
