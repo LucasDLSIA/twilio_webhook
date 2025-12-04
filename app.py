@@ -80,15 +80,17 @@ def normalize_phone(whatsapp_from: str) -> str:
 import re
 
 def canonicalize_phone(x) -> str:
-    """Normaliza un teléfono dejando solo dígitos.
-       Sirve para comparar Twilio vs Excel sin lío de 'whatsapp:' ni '+'.
-    """
     raw = s(x)
     raw = raw.replace(",", "").replace(".0", "")
-    # dejar solo dígitos
     digits = re.sub(r"\D", "", raw)
-    # si querés, podés quedarte con los últimos 10 dígitos (opcional):
-    # return digits[-10:] if len(digits) > 10 else digits
+
+    # Si tiene 11 dígitos pero empieza con 11, probablemente es un celular sin +549
+    # Esto no afecta a nada de Twilio, solo normaliza.
+    
+    # ⚠️ CONTROL EXTRA: si termina en 0 y debería ser de 10 dígitos → quitarlo
+    if len(digits) == 11 and digits.endswith("0"):
+        digits = digits[:-1]
+
     return digits
 
 #=============================================================================
@@ -1118,16 +1120,19 @@ def get_session(telefono_norm: str) -> Dict:
 
 def normalize_to_whatsapp_e164(s: str) -> str:
     s = (s or "").strip()
-    # si ya viene con prefijo 'whatsapp:' lo dejamos
-    if s.startswith("whatsapp:"):
-        return s
-    # si viene sólo +54911... le agregamos el prefijo
-    if s.startswith("+"):
-        return "whatsapp:" + s
-    # último recurso: quitar espacios/guiones y asumir +
-    digits = re.sub(r"[^\d+]", "", s)
-    if digits.startswith("+"):
-        return "whatsapp:" + digits
+    digits = canonicalize_phone(s)
+
+    # Control: celulares argentinos deben tener 12 dígitos cuando armamos el +549...
+    # Esto corrige errores típicos.
+    if len(digits) == 11 and digits.startswith("11"):
+        digits = "549" + digits
+    elif len(digits) == 10:
+        digits = "549" + digits
+    elif len(digits) == 12 and digits.startswith("549"):
+        pass
+    else:
+        print("WARN: teléfono con formato inesperado:", digits)
+
     return "whatsapp:+" + digits
 
 
