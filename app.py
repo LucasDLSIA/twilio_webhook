@@ -1836,13 +1836,40 @@ def admin_report_excel():
 
 def normalize_dni_digits(val: str) -> str:
     """
-    Deja solo dígitos en el DNI y lo normaliza a 8 dígitos (rellena con 0 a la izquierda si son 7).
+    Normaliza el DNI:
+    - Acepta números, strings, floats de Excel.
+    - Saca sufijos tipo .0
+    - Devuelve siempre solo dígitos.
+    - Si tiene 7 dígitos, lo rellena a 8 con un 0 a la izquierda.
     """
-    digits = re.sub(r"\D", "", str(val or ""))
+    if val is None:
+        return ""
+
+    # Si viene como float (típico de pandas con Excel), lo pasamos a int
+    # 44143190.0 -> 44143190
+    if isinstance(val, float):
+        try:
+            val = int(val)
+        except Exception:
+            pass
+
+    s_val = str(val).strip()
+
+    # Caso clásico: "44143190.0" -> "44143190"
+    if s_val.endswith(".0"):
+        s_val = s_val[:-2]
+
+    # Ahora sí, dejamos solo dígitos
+    digits = re.sub(r"\D", "", s_val)
+
     if not digits:
         return ""
+
+    # Si son 7 dígitos, lo rellenamos a 8 (DNI viejo)
     if len(digits) == 7:
         digits = digits.zfill(8)
+
+    # En cualquier otro caso lo dejamos como está
     return digits
 
 
