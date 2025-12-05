@@ -1896,7 +1896,8 @@ def get_envios_dni_for(archivo_norm: str, telefono_norm: str | None = None) -> O
     base_raw, base_digits = norm_arch(archivo_norm)
     want_phone = canonicalize_phone(telefono_norm) if telefono_norm else ""
 
-    candidatos: list[dict] = []
+    best_row = None
+    best_score = -1
 
     for r in rows:
         # Archivo / CUIL en la fila
@@ -1924,7 +1925,7 @@ def get_envios_dni_for(archivo_norm: str, telefono_norm: str | None = None) -> O
         if not same_arch:
             continue
 
-        # Calculamos score: 2 si además matchea teléfono, 1 si solo archivo
+        # Score 1 = solo archivo, 2 = archivo + teléfono
         score = 1
         if want_phone:
             tel_raw = (
@@ -1937,17 +1938,14 @@ def get_envios_dni_for(archivo_norm: str, telefono_norm: str | None = None) -> O
             if tel_norm_row and (tel_norm_row.endswith(want_phone) or want_phone.endswith(tel_norm_row)):
                 score = 2
 
-        candidatos.append({"row": r, "score": score})
+        if score > best_score:
+            best_score = score
+            best_row = r
 
-    if not candidatos:
+    if not best_row:
         print("DEBUG get_envios_dni_for: sin candidatos para archivo_norm:", archivo_norm)
         return None
 
-    # Elegimos el mejor candidato (archivo + teléfono > solo archivo)
-    candidatos.sort(key=lambda c: c["score"], reverse=True)
-    best_row = candidatos[0]["row"]
-
-    # --- DEBUG opcional: ver claves de la fila elegida ---
     print("DEBUG get_envios_dni_for best_row keys:", list(best_row.keys()))
 
     # Intentamos leer DNI de varias formas
@@ -1966,20 +1964,24 @@ def get_envios_dni_for(archivo_norm: str, telefono_norm: str | None = None) -> O
 
     dni_val = None
     for k in posibles_keys:
-        if k in best_row and best_row.get(k):
-            dni_val = best_row.get(k)
-            break
+        if k in best_row:
+            v = best_row.get(k)
+            # ignorar NaN y vacíos
+            if v is not None and str(v).strip() != "" and not (isinstance(v, float) and math.isnan(v)):
+                dni_val = v
+                break
 
     if dni_val is None:
         # Búsqueda laxa por nombre de columna
         for k, v in best_row.items():
             kl = str(k).lower()
-            if ("dni" in kl or "doc" in kl or "document" in kl) and v:
-                dni_val = v
-                break
+            if ("dni" in kl or "doc" in kl or "document" in kl):
+                if v is not None and str(v).strip() != "" and not (isinstance(v, float) and math.isnan(v)):
+                    dni_val = v
+                    break
 
     if dni_val is None:
-        print("DEBUG get_envios_dni_for: fila sin columna DNI/documento para archivo:", archivo_norm)
+        print("DEBUG get_envios_dni_for: fila sin DNI/documento para archivo:", archivo_norm)
         return None
 
     dni_digits = normalize_dni_digits(dni_val)
