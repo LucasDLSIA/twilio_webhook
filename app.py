@@ -1044,16 +1044,19 @@ def read_envios_rows() -> list[dict]:
 
 
 def find_archivo_by_phone(to_whatsapp: str) -> str | None:
-    """
-    Buscar en ENVIOS_FILE_ID el archivo_norm (CUIL) por teléfono.
-    Compara flexible: ignora espacios/guiones.
-    """
     rows = read_envios_rows()
+    # número que viene de Twilio -> solo dígitos
     want = re.sub(r"\D", "", to_whatsapp or "")
     for r in rows:
-        # soportar Telefono / teléfono
-        tel = r.get("Telefono") or r.get("Teléfono") or r.get("telefono") or ""
-        # soportar Archivo_norm / archivo_norm / Archivo / archivo
+        # usar Telefono_norm si existe
+        tel = (
+            r.get("Telefono_norm")
+            or r.get("Telefono")
+            or r.get("Teléfono")
+            or r.get("telefono")
+            or ""
+        )
+
         arc = (
             r.get("Archivo_norm")
             or r.get("archivo_norm")
@@ -1063,10 +1066,15 @@ def find_archivo_by_phone(to_whatsapp: str) -> str | None:
         )
         if not tel or not arc:
             continue
+
+        # normalizar también el tel de la fila
         tclean = re.sub(r"\D", "", str(tel))
+
         if tclean.endswith(want) or want.endswith(tclean):
             return str(arc).strip()
+
     return None
+
 
 def get_archivo_from_incoming(from_whatsapp: str) -> Optional[str]:
     """
@@ -1239,8 +1247,6 @@ def admin_send_template_all():
                 })
                 total += 1
             else:
-                # Usá la función que ya tengas para mandar la plantilla
-                # (acá supongo que la tuya es send_template_whatsapp_norm)
                 time.sleep(0.7)   # 700 ms entre mensajes
                 sid = send_template_whatsapp_norm(to, nombre)
 
@@ -1266,6 +1272,8 @@ def admin_send_template_all():
                             "sid": sid,
                         }
                     )
+
+                    # 👉 esto es lo correcto acá:
                     save_pending_view(to, archivo_norm, period_lbl)
                     total += 1
                 else:
