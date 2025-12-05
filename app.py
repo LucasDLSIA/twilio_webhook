@@ -1991,6 +1991,9 @@ def get_envios_dni_for(archivo_norm: str, telefono_norm: str | None = None) -> O
         if score > best_score:
             best_score = score
             best_row = r
+        print("DEBUG get_envios_dni_for BEST_ROW COMPLETO:")
+        for k, v in best_row.items():
+            print(f"   {k}: {repr(v)}")
 
     if not best_row:
         print("DEBUG get_envios_dni_for: sin candidatos para archivo_norm:", archivo_norm)
