@@ -1876,13 +1876,17 @@ def normalize_dni_digits(val: str) -> str:
 def get_envios_dni_for(archivo_norm: str, telefono_norm: str | None = None) -> Optional[str]:
     """
     Busca en el Excel de envíos el DNI correspondiente a `archivo_norm`.
-    Opcionalmente intenta matchear también por teléfono, pero el identificador
-    principal es el archivo_norm (CUIL), porque ya usamos el teléfono para
-    encontrar ese archivo en `get_archivo_from_incoming`.
+    Opcionalmente usa el teléfono para priorizar filas, pero el identificador
+    principal es el archivo_norm (CUIL/Archivo), porque el teléfono ya se usó
+    para encontrar ese archivo en get_archivo_from_incoming.
 
-    Devuelve el DNI normalizado (solo dígitos, 7/8 chars) o None si no lo encuentra.
+    Devuelve el DNI normalizado (solo dígitos) o None si no lo encuentra.
     """
     rows = read_envios_rows()
+
+    if not rows:
+        print("DEBUG get_envios_dni_for: no hay filas en envíos")
+        return None
 
     def norm_arch(x: str) -> tuple[str, str]:
         raw = str(x or "").strip().replace(".pdf", "")
@@ -1890,12 +1894,12 @@ def get_envios_dni_for(archivo_norm: str, telefono_norm: str | None = None) -> O
         return raw, digits
 
     base_raw, base_digits = norm_arch(archivo_norm)
+    want_phone = canonicalize_phone(telefono_norm) if telefono_norm else ""
 
-    # Vamos a juntar candidatos (filas) que matcheen el archivo.
-    # score=2 → match por archivo + teléfono
-    # score=1 → match solo por archivo
     candidatos: list[dict] = []
+
     for r in rows:
+        # Archivo / CUIL en la fila
         arc_val = (
             r.get("Archivo_norm")
             or r.get("archivo_norm")
@@ -1907,11 +1911,10 @@ def get_envios_dni_for(archivo_norm: str, telefono_norm: str | None = None) -> O
         )
         row_raw, row_digits = norm_arch(arc_val)
 
-        # No hay archivo en la fila → salteamos
         if not row_raw and not row_digits:
             continue
 
-        # ¿Coinciden por string "crudo" o por solo dígitos?
+        # Coincidencia de archivo por string o por dígitos
         same_arch = False
         if base_raw and row_raw and base_raw == row_raw:
             same_arch = True
@@ -1921,9 +1924,9 @@ def get_envios_dni_for(archivo_norm: str, telefono_norm: str | None = None) -> O
         if not same_arch:
             continue
 
-        # Si tenemos teléfono, priorizamos filas cuyo teléfono también matchee
-        if telefono_norm:
-            want_phone = canonicalize_phone(telefono_norm)
+        # Calculamos score: 2 si además matchea teléfono, 1 si solo archivo
+        score = 1
+        if want_phone:
             tel_raw = (
                 r.get("Telefono")
                 or r.get("Teléfono")
@@ -1931,29 +1934,23 @@ def get_envios_dni_for(archivo_norm: str, telefono_norm: str | None = None) -> O
                 or ""
             )
             tel_norm_row = canonicalize_phone(tel_raw)
-            if tel_norm_row and want_phone:
-                # match flexible tipo endswith (como find_archivo_by_phone)
-                if tel_norm_row.endswith(want_phone) or want_phone.endswith(tel_norm_row):
-                    candidatos.append({"row": r, "score": 2})
-                    continue
-                else:
-                    # no matchea el teléfono, pero el archivo sí → candidato de menor prioridad
-                    candidatos.append({"row": r, "score": 1})
-                    continue
+            if tel_norm_row and (tel_norm_row.endswith(want_phone) or want_phone.endswith(tel_norm_row)):
+                score = 2
 
-        # Si no tenemos teléfono o está vacío, igual es un buen candidato
-        candidatos.append({"row": r, "score": 1})
+        candidatos.append({"row": r, "score": score})
 
     if not candidatos:
+        print("DEBUG get_envios_dni_for: sin candidatos para archivo_norm:", archivo_norm)
         return None
 
-    # Nos quedamos con el candidato de mejor score (match por archivo + teléfono > solo archivo)
+    # Elegimos el mejor candidato (archivo + teléfono > solo archivo)
     candidatos.sort(key=lambda c: c["score"], reverse=True)
     best_row = candidatos[0]["row"]
 
-    # Buscamos la columna de DNI de manera robusta:
-    #  - primero intentamos claves típicas
-    #  - después cualquier columna que contenga 'dni' o 'documento' en el nombre
+    # --- DEBUG opcional: ver claves de la fila elegida ---
+    print("DEBUG get_envios_dni_for best_row keys:", list(best_row.keys()))
+
+    # Intentamos leer DNI de varias formas
     posibles_keys = [
         "DNI",
         "Dni",
@@ -1974,7 +1971,7 @@ def get_envios_dni_for(archivo_norm: str, telefono_norm: str | None = None) -> O
             break
 
     if dni_val is None:
-        # búsqueda más laxa por nombre de columna
+        # Búsqueda laxa por nombre de columna
         for k, v in best_row.items():
             kl = str(k).lower()
             if ("dni" in kl or "doc" in kl or "document" in kl) and v:
@@ -1982,10 +1979,12 @@ def get_envios_dni_for(archivo_norm: str, telefono_norm: str | None = None) -> O
                 break
 
     if dni_val is None:
+        print("DEBUG get_envios_dni_for: fila sin columna DNI/documento para archivo:", archivo_norm)
         return None
 
     dni_digits = normalize_dni_digits(dni_val)
-    return dni_digits
+    print("DEBUG get_envios_dni_for: dni_val crudo =", dni_val, "→ dni_digits =", dni_digits)
+    return dni_digits or None
 
 
 def is_dni_verified(archivo_norm: str, telefono_norm: str) -> bool:
