@@ -19,9 +19,7 @@ from googleapiclient.discovery import build
 from google.oauth2 import service_account
 from googleapiclient.http import MediaIoBaseDownload
 
-
-import psycopg2
-import psycopg2.extras
+import sqlite3
 from pathlib import Path
 
 from openpyxl import Workbook
@@ -30,7 +28,7 @@ from flask import send_file
 from collections import defaultdict
 from datetime import datetime
 import os
-
+import sqlite3
 import time
 
 
@@ -93,28 +91,7 @@ def canonicalize_phone(x) -> str:
     # return digits[-10:] if len(digits) > 10 else digits
     return digits
 
-
-#==============================================
-def extract_dni_from_archivo_norm(archivo_norm: str) -> str | None:
-    """
-    Dado un CUIL/CUIT tipo '20-44143190-3' o '20441431903',
-    devuelve el DNI (8 dígitos) si se puede.
-    """
-    if not archivo_norm:
-        return None
-    digits = re.sub(r"\D", "", str(archivo_norm))
-
-    # CUIL típico: 11 dígitos -> XX + DNI(8) + X
-    if len(digits) == 11:
-        return digits[2:10]
-
-    # Si vino raro pero tiene al menos 8 dígitos, tomamos los últimos 8
-    if len(digits) >= 8:
-        return digits[-8:]
-
-    return None
-
-# ===============================
+#=============================================================================
 # =========================
 # SQLITE: tabla de envíos pendientes
 # =========================
@@ -122,22 +99,20 @@ def extract_dni_from_archivo_norm(archivo_norm: str) -> str | None:
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 import os
-
+import sqlite3
 import time
 
 # Ruta del archivo SQLite
 # En local: usa "pending_views.db"
 # En Render con disk persistente, podés usar /data/pending_views.db
-DATABASE_URL = os.environ.get("DATABASE_URL")
+DB_PATH = os.environ.get("PENDING_DB_PATH", "pending_views.db")
+
 
 def get_db_connection():
-    if not DATABASE_URL:
-        raise RuntimeError("DATABASE_URL no está configurado")
-
-    conn = psycopg2.connect(
-        DATABASE_URL,
-        cursor_factory=psycopg2.extras.DictCursor
-    )
+    """
+    Devuelve una conexión a SQLite.
+    """
+    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
     return conn
 
 
@@ -148,7 +123,7 @@ def init_db():
     cur.execute(
         """
         CREATE TABLE IF NOT EXISTS pending_views (
-            id SERIAL PRIMARY KEY,
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
             to_whatsapp TEXT NOT NULL,
             archivo_norm TEXT NOT NULL,
             period_label TEXT NOT NULL,
@@ -160,7 +135,7 @@ def init_db():
     cur.execute(
         """
         CREATE TABLE IF NOT EXISTS message_status (
-            id SERIAL PRIMARY KEY,
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
             message_sid TEXT UNIQUE NOT NULL,
             to_whatsapp TEXT,
             archivo_norm TEXT,
@@ -182,7 +157,7 @@ def init_db():
     cur.execute(
         """
         CREATE TABLE IF NOT EXISTS view_confirmations (
-            id SERIAL PRIMARY KEY,
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
             from_whatsapp TEXT NOT NULL,
             archivo_norm TEXT,
             period_label TEXT,
@@ -196,7 +171,7 @@ def init_db():
     cur.execute(
         """
         CREATE TABLE IF NOT EXISTS recibo_estado (
-            id SERIAL PRIMARY KEY,
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
             archivo_norm TEXT NOT NULL,
             period_label TEXT NOT NULL,
             estado TEXT NOT NULL,         -- 'DISPONIBLE', 'FIRMADO', 'OBSERVADO'
@@ -209,7 +184,7 @@ def init_db():
     cur.execute(
         """
         CREATE TABLE IF NOT EXISTS recibo_vistas (
-            id SERIAL PRIMARY KEY,
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
             archivo_norm TEXT NOT NULL,
             period_label TEXT NOT NULL,
             vistas INTEGER NOT NULL DEFAULT 0,
@@ -232,7 +207,7 @@ def get_recibo_vistas(archivo_norm: str, period_label: str) -> int:
         """
         SELECT vistas
         FROM recibo_vistas
-        WHERE archivo_norm = %s AND period_label = %s;
+        WHERE archivo_norm = ? AND period_label = ?;
         """,
         (archivo_norm, period_label),
     )
@@ -252,9 +227,8 @@ def inc_recibo_vistas(archivo_norm: str, period_label: str) -> int:
     # Si no existe, lo creamos con 0
     cur.execute(
         """
-        INSERT INTO recibo_vistas (archivo_norm, period_label, vistas)
-        VALUES (%s, %s, 0)
-        ON CONFLICT (archivo_norm, period_label) DO NOTHING;
+        INSERT OR IGNORE INTO recibo_vistas (archivo_norm, period_label, vistas)
+        VALUES (?, ?, 0);
         """,
         (archivo_norm, period_label),
     )
@@ -264,7 +238,7 @@ def inc_recibo_vistas(archivo_norm: str, period_label: str) -> int:
         """
         UPDATE recibo_vistas
         SET vistas = vistas + 1
-        WHERE archivo_norm = %s AND period_label = %s;
+        WHERE archivo_norm = ? AND period_label = ?;
         """,
         (archivo_norm, period_label),
     )
@@ -274,7 +248,7 @@ def inc_recibo_vistas(archivo_norm: str, period_label: str) -> int:
         """
         SELECT vistas
         FROM recibo_vistas
-        WHERE archivo_norm = %s AND period_label = %s;
+        WHERE archivo_norm = ? AND period_label = ?;
         """,
         (archivo_norm, period_label),
     )
@@ -293,11 +267,7 @@ def get_recibo_estado(archivo_norm: str, period_label: str) -> str:
     conn = get_db_connection()
     cur = conn.cursor()
     cur.execute(
-        """
-        SELECT estado
-        FROM recibo_estado
-        WHERE archivo_norm = %s AND period_label = %s;
-        """,
+        "SELECT estado FROM recibo_estado WHERE archivo_norm = ? AND period_label = ?;",
         (archivo_norm, period_label),
     )
     row = cur.fetchone()
@@ -321,9 +291,9 @@ def set_recibo_estado(archivo_norm: str, period_label: str, estado: str) -> None
     cur.execute(
         """
         INSERT INTO recibo_estado (archivo_norm, period_label, estado)
-        VALUES (%s, %s, %s)
-        ON CONFLICT (archivo_norm, period_label)
-        DO UPDATE SET estado = EXCLUDED.estado;
+        VALUES (?, ?, ?)
+        ON CONFLICT(archivo_norm, period_label)
+        DO UPDATE SET estado = excluded.estado;
         """,
         (archivo_norm, period_label, estado),
     )
@@ -341,7 +311,7 @@ def save_pending_view(to_whatsapp: str, archivo_norm: str, period_label: str):
     cur.execute(
         """
         INSERT INTO pending_views (to_whatsapp, archivo_norm, period_label, created_at)
-        VALUES (%s, %s, %s, %s);
+        VALUES (?, ?, ?, ?);
         """,
         (to_whatsapp, archivo_norm, period_label, int(time.time())),
     )
@@ -360,7 +330,7 @@ def get_last_pending_view(from_whatsapp: str):
         """
         SELECT archivo_norm, period_label
         FROM pending_views
-        WHERE to_whatsapp = %s
+        WHERE to_whatsapp = ?
         ORDER BY created_at DESC
         LIMIT 1;
         """,
@@ -373,6 +343,9 @@ def get_last_pending_view(from_whatsapp: str):
         return row[0], row[1]
     return None
 
+#============================================
+import time
+from typing import Optional, Tuple
 
 def save_message_sent(
     message_sid: str,
@@ -391,11 +364,10 @@ def save_message_sent(
     now_ts = int(time.time())
     cur.execute(
         """
-        INSERT INTO message_status (
+        INSERT OR IGNORE INTO message_status (
             message_sid, to_whatsapp, archivo_norm, period_label,
             nombre, kind, created_at, last_status, last_status_at
-        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
-        ON CONFLICT (message_sid) DO NOTHING;
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?);
         """,
         (
             message_sid,
@@ -423,10 +395,11 @@ def update_message_status_and_get(
     Actualiza el estado de un mensaje por SID y devuelve (kind, to_whatsapp).
     """
     conn = get_db_connection()
+    conn.row_factory = sqlite3.Row
     cur = conn.cursor()
 
     cur.execute(
-        "SELECT kind, to_whatsapp FROM message_status WHERE message_sid = %s;",
+        "SELECT kind, to_whatsapp FROM message_status WHERE message_sid = ?;",
         (message_sid,),
     )
     row = cur.fetchone()
@@ -438,13 +411,13 @@ def update_message_status_and_get(
         cur.execute(
             """
             UPDATE message_status
-            SET last_status = %s, last_status_at = %s,
-                read_at = CASE WHEN %s = 'read' THEN COALESCE(read_at, %s) ELSE read_at END,
-                delivered_at = CASE WHEN %s = 'delivered' THEN COALESCE(delivered_at, %s) ELSE delivered_at END,
-                failed_at = CASE WHEN %s IN ('failed','undelivered') THEN COALESCE(failed_at, %s) ELSE failed_at END,
-                error_code = COALESCE(%s, error_code),
-                error_message = COALESCE(%s, error_message)
-            WHERE message_sid = %s;
+            SET last_status = ?, last_status_at = ?,
+                read_at = CASE WHEN ? = 'read' THEN COALESCE(read_at, ?) ELSE read_at END,
+                delivered_at = CASE WHEN ? = 'delivered' THEN COALESCE(delivered_at, ?) ELSE delivered_at END,
+                failed_at = CASE WHEN ? IN ('failed','undelivered') THEN COALESCE(failed_at, ?) ELSE failed_at END,
+                error_code = COALESCE(?, error_code),
+                error_message = COALESCE(?, error_message)
+            WHERE message_sid = ?;
             """,
             (
                 status,
@@ -467,10 +440,9 @@ def update_message_status_and_get(
     # Si no existía, lo registramos mínimo
     cur.execute(
         """
-        INSERT INTO message_status (
+        INSERT OR IGNORE INTO message_status (
             message_sid, last_status, last_status_at, error_code, error_message
-        ) VALUES (%s, %s, %s, %s, %s)
-        ON CONFLICT (message_sid) DO NOTHING;
+        ) VALUES (?, ?, ?, ?, ?);
         """,
         (message_sid, status, now_ts, error_code, error_message),
     )
@@ -495,7 +467,7 @@ def save_user_confirmation(from_whatsapp: str, response: str):
         """
         INSERT INTO view_confirmations (
             from_whatsapp, archivo_norm, period_label, response, created_at
-        ) VALUES (%s, %s, %s, %s, %s);
+        ) VALUES (?, ?, ?, ?, ?);
         """,
         (
             from_whatsapp,
@@ -532,6 +504,7 @@ def generate_excel_report() -> str:
     con una fila por persona/período.
     """
     conn = get_db_connection()
+    conn.row_factory = sqlite3.Row
     cur = conn.cursor()
 
     # Traemos TODOS los mensajes registrados
@@ -1009,41 +982,37 @@ def build_drive_public_link(file_id: str) -> str:
 
 
 def get_session(telefono_norm: str) -> Dict:
+    """
+    Devuelve (y crea si no existe) la sesión para ese teléfono.
+    """
     if telefono_norm not in SESSIONS:
         SESSIONS[telefono_norm] = {
-            "state": "IDLE",
+            "state": "IDLE",          # para menú de períodos (ya lo tenías)
             "offset": 0,
             "periods": [],
             "options_map": {},
-            "flow_state": "IDLE",
+            # NUEVO: flujo del Word
+            "flow_state": "IDLE",     # 'IDLE', 'ASK_VISUALIZAR', 'ASK_FIRMAR_OBS', 'ASK_DESHACER_OBS'
             "archivo_norm": None,
             "period_label": None,
             "pdf_id": None,
-            # NUEVO: validación de identidad
-            "dni_verified": False,
-            "awaiting_dni": False,
         }
     return SESSIONS[telefono_norm]
 
 
-
-def normalize_to_whatsapp_e164(raw: str) -> str:
-    """
-    Recibe cualquier cosa (float como 5491136222572.0, string con guiones, etc.)
-    y devuelve siempre algo tipo 'whatsapp:+5491136222572'.
-    """
-    # ya tenés canonicalize_phone que limpia .0, comas, etc.
-    digits = canonicalize_phone(raw)  # deja sólo dígitos y saca '.0'
-
-    if not digits:
-        raise ValueError("teléfono vacío o inválido")
-
-    # Si ya empieza con 54 (código país AR) lo usamos así
-    if digits.startswith("54"):
-        return "whatsapp:+" + digits
-
-    # Si no, le agregamos 54 adelante
-    return "whatsapp:+54" + digits
+def normalize_to_whatsapp_e164(s: str) -> str:
+    s = (s or "").strip()
+    # si ya viene con prefijo 'whatsapp:' lo dejamos
+    if s.startswith("whatsapp:"):
+        return s
+    # si viene sólo +54911... le agregamos el prefijo
+    if s.startswith("+"):
+        return "whatsapp:" + s
+    # último recurso: quitar espacios/guiones y asumir +
+    digits = re.sub(r"[^\d+]", "", s)
+    if digits.startswith("+"):
+        return "whatsapp:" + digits
+    return "whatsapp:+" + digits
 
 
 import pandas as pd
@@ -1072,28 +1041,18 @@ def read_envios_rows() -> list[dict]:
         print(f"ERROR en read_envios_rows(): {e}")
         return []
 
-import math
-
-def is_nan_value(v) -> bool:
-    try:
-        return isinstance(v, float) and math.isnan(v)
-    except Exception:
-        return False
 
 
 def find_archivo_by_phone(to_whatsapp: str) -> str | None:
     """
     Buscar en ENVIOS_FILE_ID el archivo_norm (CUIL) por teléfono.
     Compara flexible: ignora espacios/guiones.
-    Ignora filas donde Archivo esté vacío o NaN.
     """
     rows = read_envios_rows()
-    want = re.sub(r"\D", "", to_whatsapp or "")  # solo dígitos del número que viene de Twilio
-
+    want = re.sub(r"\D", "", to_whatsapp or "")
     for r in rows:
         # soportar Telefono / teléfono
         tel = r.get("Telefono") or r.get("Teléfono") or r.get("telefono") or ""
-
         # soportar Archivo_norm / archivo_norm / Archivo / archivo
         arc = (
             r.get("Archivo_norm")
@@ -1102,26 +1061,12 @@ def find_archivo_by_phone(to_whatsapp: str) -> str | None:
             or r.get("archivo")
             or ""
         )
-
-        # ignorar filas sin teléfono o sin archivo
-        if not tel or is_nan_value(tel):
+        if not tel or not arc:
             continue
-        if not arc or is_nan_value(arc):
-            continue
-
         tclean = re.sub(r"\D", "", str(tel))
-        if not tclean:
-            continue
-
         if tclean.endswith(want) or want.endswith(tclean):
-            arc_str = str(arc).strip()
-            if not arc_str or arc_str.lower() == "nan":
-                # si por alguna razón sigue estando en 'nan', lo descartamos
-                return None
-            return arc_str
-
+            return str(arc).strip()
     return None
-
 
 def get_archivo_from_incoming(from_whatsapp: str) -> Optional[str]:
     """
@@ -1234,11 +1179,6 @@ def admin_send_template_all():
             # columnas esperadas
             telefono = s(r.get("Telefono") or r.get("Teléfono"))
 
-            # Normalizamos primero a solo dígitos, sacando .0 si vino como float
-            telefono_norm = canonicalize_phone(telefono)
-            if not telefono_norm:
-                skipped.append({"reason": "telefono_invalido", "row": r})
-                continue
             # usamos Archivo_norm si existe, si no, caemos a otras
             archivo_norm = s(
                 r.get("Archivo_norm")
@@ -1784,47 +1724,12 @@ def twilio_webhook():
     # ------------------------------------------------------------------
     # 0) CHEQUEO GLOBAL DE NÚMERO AUTORIZADO
     # ------------------------------------------------------------------
+    # Si el número no está en la base (Excel / mapping), rechazamos de una.
     archivo_norm_incoming = get_archivo_from_incoming(from_whatsapp)
     if not archivo_norm_incoming:
         return build_twilio_response(
             "🤖 Ud. no está registrado/autorizado para utilizar este servicio."
         )
-
-    # ------------------------------------------------------------------
-    # 0.bis) VALIDACIÓN DE DNI OBLIGATORIA
-    # ------------------------------------------------------------------
-    dni_verified = session.get("dni_verified", False)
-    awaiting_dni = session.get("awaiting_dni", False)
-
-    # Guardamos el archivo_norm que viene del Excel para esta sesión
-    session["archivo_norm"] = archivo_norm_incoming
-
-    if not dni_verified:
-        # Intentamos ver si lo que mandó ahora es un DNI (solo dígitos)
-        dni_ingresado = re.sub(r"\D", "", body)
-
-        if awaiting_dni and dni_ingresado:
-            # Ya le habíamos pedido el DNI y ahora respondió algo
-            dni_esperado = extract_dni_from_archivo_norm(archivo_norm_incoming)
-            print("DEBUG DNI:", {"ingresado": dni_ingresado, "esperado": dni_esperado})
-
-            if dni_esperado and dni_ingresado == dni_esperado:
-                # ✅ DNI correcto
-                session["dni_verified"] = True
-                session["awaiting_dni"] = False
-                # seguimos al flujo normal (no hacemos return acá)
-            else:
-                # ❌ DNI incorrecto
-                return build_twilio_response(
-                    "❌ El DNI no coincide con nuestros registros.\n"
-                    "Por favor volvé a ingresarlo (solo números, sin puntos)."
-                )
-        else:
-            # Primera vez o nos mandó botón/texto que NO es DNI -> pedimos DNI
-            session["awaiting_dni"] = True
-            return build_twilio_response(
-                "🔐 Por seguridad, por favor escribí tu DNI (solo números, sin puntos)."
-            )
 
     # ------------------------------------------------------------------
     # 1) RESPUESTAS A PREGUNTAS ABIERTAS DEL FLUJO (ya hay contexto)
