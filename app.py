@@ -93,7 +93,28 @@ def canonicalize_phone(x) -> str:
     # return digits[-10:] if len(digits) > 10 else digits
     return digits
 
-#=============================================================================
+
+#==============================================
+def extract_dni_from_archivo_norm(archivo_norm: str) -> str | None:
+    """
+    Dado un CUIL/CUIT tipo '20-44143190-3' o '20441431903',
+    devuelve el DNI (8 dígitos) si se puede.
+    """
+    if not archivo_norm:
+        return None
+    digits = re.sub(r"\D", "", str(archivo_norm))
+
+    # CUIL típico: 11 dígitos -> XX + DNI(8) + X
+    if len(digits) == 11:
+        return digits[2:10]
+
+    # Si vino raro pero tiene al menos 8 dígitos, tomamos los últimos 8
+    if len(digits) >= 8:
+        return digits[-8:]
+
+    return None
+
+# ===============================
 # =========================
 # SQLITE: tabla de envíos pendientes
 # =========================
@@ -988,22 +1009,22 @@ def build_drive_public_link(file_id: str) -> str:
 
 
 def get_session(telefono_norm: str) -> Dict:
-    """
-    Devuelve (y crea si no existe) la sesión para ese teléfono.
-    """
     if telefono_norm not in SESSIONS:
         SESSIONS[telefono_norm] = {
-            "state": "IDLE",          # para menú de períodos (ya lo tenías)
+            "state": "IDLE",
             "offset": 0,
             "periods": [],
             "options_map": {},
-            # NUEVO: flujo del Word
-            "flow_state": "IDLE",     # 'IDLE', 'ASK_VISUALIZAR', 'ASK_FIRMAR_OBS', 'ASK_DESHACER_OBS'
+            "flow_state": "IDLE",
             "archivo_norm": None,
             "period_label": None,
             "pdf_id": None,
+            # NUEVO: validación de identidad
+            "dni_verified": False,
+            "awaiting_dni": False,
         }
     return SESSIONS[telefono_norm]
+
 
 
 def normalize_to_whatsapp_e164(raw: str) -> str:
@@ -1051,18 +1072,28 @@ def read_envios_rows() -> list[dict]:
         print(f"ERROR en read_envios_rows(): {e}")
         return []
 
+import math
+
+def is_nan_value(v) -> bool:
+    try:
+        return isinstance(v, float) and math.isnan(v)
+    except Exception:
+        return False
 
 
 def find_archivo_by_phone(to_whatsapp: str) -> str | None:
     """
     Buscar en ENVIOS_FILE_ID el archivo_norm (CUIL) por teléfono.
     Compara flexible: ignora espacios/guiones.
+    Ignora filas donde Archivo esté vacío o NaN.
     """
     rows = read_envios_rows()
-    want = re.sub(r"\D", "", to_whatsapp or "")
+    want = re.sub(r"\D", "", to_whatsapp or "")  # solo dígitos del número que viene de Twilio
+
     for r in rows:
         # soportar Telefono / teléfono
         tel = r.get("Telefono") or r.get("Teléfono") or r.get("telefono") or ""
+
         # soportar Archivo_norm / archivo_norm / Archivo / archivo
         arc = (
             r.get("Archivo_norm")
@@ -1071,12 +1102,26 @@ def find_archivo_by_phone(to_whatsapp: str) -> str | None:
             or r.get("archivo")
             or ""
         )
-        if not tel or not arc:
+
+        # ignorar filas sin teléfono o sin archivo
+        if not tel or is_nan_value(tel):
             continue
+        if not arc or is_nan_value(arc):
+            continue
+
         tclean = re.sub(r"\D", "", str(tel))
+        if not tclean:
+            continue
+
         if tclean.endswith(want) or want.endswith(tclean):
-            return str(arc).strip()
+            arc_str = str(arc).strip()
+            if not arc_str or arc_str.lower() == "nan":
+                # si por alguna razón sigue estando en 'nan', lo descartamos
+                return None
+            return arc_str
+
     return None
+
 
 def get_archivo_from_incoming(from_whatsapp: str) -> Optional[str]:
     """
@@ -1739,12 +1784,47 @@ def twilio_webhook():
     # ------------------------------------------------------------------
     # 0) CHEQUEO GLOBAL DE NÚMERO AUTORIZADO
     # ------------------------------------------------------------------
-    # Si el número no está en la base (Excel / mapping), rechazamos de una.
     archivo_norm_incoming = get_archivo_from_incoming(from_whatsapp)
     if not archivo_norm_incoming:
         return build_twilio_response(
             "🤖 Ud. no está registrado/autorizado para utilizar este servicio."
         )
+
+    # ------------------------------------------------------------------
+    # 0.bis) VALIDACIÓN DE DNI OBLIGATORIA
+    # ------------------------------------------------------------------
+    dni_verified = session.get("dni_verified", False)
+    awaiting_dni = session.get("awaiting_dni", False)
+
+    # Guardamos el archivo_norm que viene del Excel para esta sesión
+    session["archivo_norm"] = archivo_norm_incoming
+
+    if not dni_verified:
+        # Intentamos ver si lo que mandó ahora es un DNI (solo dígitos)
+        dni_ingresado = re.sub(r"\D", "", body)
+
+        if awaiting_dni and dni_ingresado:
+            # Ya le habíamos pedido el DNI y ahora respondió algo
+            dni_esperado = extract_dni_from_archivo_norm(archivo_norm_incoming)
+            print("DEBUG DNI:", {"ingresado": dni_ingresado, "esperado": dni_esperado})
+
+            if dni_esperado and dni_ingresado == dni_esperado:
+                # ✅ DNI correcto
+                session["dni_verified"] = True
+                session["awaiting_dni"] = False
+                # seguimos al flujo normal (no hacemos return acá)
+            else:
+                # ❌ DNI incorrecto
+                return build_twilio_response(
+                    "❌ El DNI no coincide con nuestros registros.\n"
+                    "Por favor volvé a ingresarlo (solo números, sin puntos)."
+                )
+        else:
+            # Primera vez o nos mandó botón/texto que NO es DNI -> pedimos DNI
+            session["awaiting_dni"] = True
+            return build_twilio_response(
+                "🔐 Por seguridad, por favor escribí tu DNI (solo números, sin puntos)."
+            )
 
     # ------------------------------------------------------------------
     # 1) RESPUESTAS A PREGUNTAS ABIERTAS DEL FLUJO (ya hay contexto)
