@@ -1186,7 +1186,11 @@ def admin_send_template_all():
 
         for r in rows:
             # columnas esperadas
-            telefono = s(r.get("Telefono") or r.get("Teléfono"))
+            telefono = s(
+                r.get("Telefono_norm")
+                or r.get("Telefono")
+                or r.get("Teléfono")
+            )
 
             # usamos Archivo_norm si existe, si no, caemos a otras
             archivo_norm = s(
@@ -1320,9 +1324,11 @@ def twiml_message_with_link(text: str, link: str) -> Response:
     return Response(twiml, mimetype="text/xml")
 
 def s(x) -> str:
-    """Convierte a string y hace strip sin romper si x es int/float/None."""
     if x is None:
         return ""
+    # si es float tipo 1234.0, lo pasamos a "1234"
+    if isinstance(x, float) and x.is_integer():
+        return str(int(x))
     return str(x).strip()
 
 
