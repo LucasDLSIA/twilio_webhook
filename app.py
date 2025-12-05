@@ -1007,18 +1007,18 @@ def get_session(telefono_norm: str) -> Dict:
 
 
 def normalize_to_whatsapp_e164(s: str) -> str:
-    s = (s or "").strip()
-    # si ya viene con prefijo 'whatsapp:' lo dejamos
-    if s.startswith("whatsapp:"):
-        return s
-    # si viene sólo +54911... le agregamos el prefijo
-    if s.startswith("+"):
-        return "whatsapp:" + s
-    # último recurso: quitar espacios/guiones y asumir +
-    digits = re.sub(r"[^\d+]", "", s)
-    if digits.startswith("+"):
-        return "whatsapp:" + digits
-    return "whatsapp:+" + digits
+    # s debería ser solo dígitos acá
+    digits = re.sub(r"\D", "", s or "")
+
+    if not digits:
+        raise ValueError("teléfono vacío")
+
+    # Si ya empieza con 54 (código país de AR), lo usamos así
+    if digits.startswith("54"):
+        return "whatsapp:+" + digits
+
+    # Si no, le agregamos 54 delante
+    return "whatsapp:+54" + digits
 
 
 import pandas as pd
@@ -1185,6 +1185,11 @@ def admin_send_template_all():
             # columnas esperadas
             telefono = s(r.get("Telefono") or r.get("Teléfono"))
 
+            # Normalizamos primero a solo dígitos, sacando .0 si vino como float
+            telefono_norm = canonicalize_phone(telefono)
+            if not telefono_norm:
+                skipped.append({"reason": "telefono_invalido", "row": r})
+                continue
             # usamos Archivo_norm si existe, si no, caemos a otras
             archivo_norm = s(
                 r.get("Archivo_norm")
