@@ -879,7 +879,13 @@ def build_drive_service():
 def download_envios_excel() -> pd.DataFrame:
     """
     Descarga envios.xlsx desde Drive (por ENVIOS_FILE_ID) y lo devuelve como DataFrame.
-    Columnas esperadas: nombre, telefono, archivo
+
+    Columnas mínimas esperadas en alguna hoja: 'telefono', 'archivo'.
+    Otras columnas opcionales: 'nombre', 'dni', etc.
+    Además agrega:
+      - telefono_norm: solo dígitos normalizados
+      - archivo_norm: CUIL/archivo sin '.pdf'
+      - cuil: alias de archivo_norm (para compatibilidad)
     """
     service = build_drive_service()
 
@@ -891,25 +897,56 @@ def download_envios_excel() -> pd.DataFrame:
     while not done:
         status, done = downloader.next_chunk()
 
+    # Volvemos al inicio del buffer
     fh.seek(0)
 
-    df = pd.read_excel(fh)
+    # Inspeccionamos las hojas del XLSX
+    xls = pd.ExcelFile(fh)
+    print("DEBUG envios.xlsx sheets:", xls.sheet_names)
 
-    # Normalizamos nombres de columnas por si vienen con mayúsculas o espacios
+    df = None
+    chosen_sheet = None
+
+    # Buscamos la hoja que tenga al menos 'telefono' y 'archivo'
+    for sheet in xls.sheet_names:
+        df_tmp = pd.read_excel(xls, sheet_name=sheet)
+        cols_norm = [str(c).strip().lower() for c in df_tmp.columns]
+        if "telefono" in cols_norm and "archivo" in cols_norm:
+            chosen_sheet = sheet
+            df = df_tmp
+            break
+
+    # Si no encontramos ninguna específica, usamos la primera hoja como fallback
+    if df is None:
+        chosen_sheet = xls.sheet_names[0]
+        df = pd.read_excel(xls, sheet_name=chosen_sheet)
+
+    print("DEBUG envios.xlsx using sheet:", chosen_sheet, "cols:", list(df.columns))
+
+    # Normalizamos nombres de columnas
     df.columns = [str(c).strip().lower() for c in df.columns]
+    print("DEBUG envios.xlsx normalized cols:", list(df.columns))
 
-    # Aseguramos las columnas base
+    # Validamos columnas base
     if "telefono" not in df.columns or "archivo" not in df.columns:
-        raise ValueError("El Excel de envíos debe tener columnas 'telefono' y 'archivo'")
+        raise ValueError(
+            "El Excel de envíos debe tener columnas 'telefono' y 'archivo' "
+            f"(columnas actuales: {list(df.columns)})"
+        )
 
     # Normalizamos teléfono
     df["telefono_norm"] = df["telefono"].apply(canonicalize_phone)
-
 
     # Normalizamos archivo (CUIL sin .pdf)
     df["archivo_norm"] = df["archivo"].astype(str).str.strip()
     df["archivo_norm"] = df["archivo_norm"].str.replace(".pdf", "", case=False)
 
+    # Alias CUIL para compatibilidad con otros lugares del código
+    if "cuil" not in df.columns:
+        df["cuil"] = df["archivo_norm"]
+
+    # No tocamos 'dni': queda como df['dni'] si existe,
+    # para que luego get_envios_dni_for lo pueda leer.
     return df
 
 
@@ -1156,8 +1193,13 @@ from io import BytesIO
 
 def read_envios_rows() -> list[dict]:
     """
-    Lee el archivo de envíos desde Drive (mismo que usa download_envios_excel)
-    y devuelve una lista de dicts con claves: 'CUIL', 'Telefono', 'Archivo', etc.
+    Lee el archivo de envíos desde Drive y devuelve una lista de dicts.
+
+    Tras descargarlo, las columnas quedan (ejemplo):
+      nombre, telefono, archivo, dni, telefono_norm, archivo_norm, cuil
+
+    Aquí solo capitalizamos los nombres para que el resto del código pueda usar:
+      'Nombre', 'Telefono', 'Archivo', 'Dni', 'Telefono_norm', 'Archivo_norm', 'Cuil'
     """
     try:
         df = download_envios_excel()
@@ -1165,12 +1207,19 @@ def read_envios_rows() -> list[dict]:
             print("WARN: no se pudo leer el archivo de envíos (vacío o inexistente).")
             return []
 
-        # Normalizamos columnas comunes
+        # Capitalizamos columna → Nombre, Telefono, Archivo, Dni, Telefono_norm, Archivo_norm, Cuil...
         df.columns = [str(c).strip().capitalize() for c in df.columns]
+        print("DEBUG read_envios_rows columns:", list(df.columns))
+
+        # Chequeo liviano (al menos una de estas columnas tiene que existir)
         expected_cols = {"Cuil", "Telefono", "Archivo"}
         cols_ok = expected_cols.intersection(df.columns)
         if not cols_ok:
-            print("WARN: no se encontraron las columnas esperadas en el Excel de envíos.")
+            print(
+                "WARN: no se encontraron las columnas esperadas "
+                f"en el Excel de envíos. Columnas actuales: {list(df.columns)}"
+            )
+
         return df.to_dict(orient="records")
 
     except Exception as e:
