@@ -1,6 +1,5 @@
 # app.py
 import os
-import math
 import io
 import re
 import requests
@@ -20,7 +19,9 @@ from googleapiclient.discovery import build
 from google.oauth2 import service_account
 from googleapiclient.http import MediaIoBaseDownload
 
-import sqlite3
+
+import psycopg2
+import psycopg2.extras
 from pathlib import Path
 
 from openpyxl import Workbook
@@ -29,7 +30,7 @@ from flask import send_file
 from collections import defaultdict
 from datetime import datetime
 import os
-import sqlite3
+
 import time
 
 
@@ -81,17 +82,15 @@ def normalize_phone(whatsapp_from: str) -> str:
 import re
 
 def canonicalize_phone(x) -> str:
+    """Normaliza un teléfono dejando solo dígitos.
+       Sirve para comparar Twilio vs Excel sin lío de 'whatsapp:' ni '+'.
+    """
     raw = s(x)
     raw = raw.replace(",", "").replace(".0", "")
+    # dejar solo dígitos
     digits = re.sub(r"\D", "", raw)
-
-    # Si tiene 11 dígitos pero empieza con 11, probablemente es un celular sin +549
-    # Esto no afecta a nada de Twilio, solo normaliza.
-    
-    # ⚠️ CONTROL EXTRA: si termina en 0 y debería ser de 10 dígitos → quitarlo
-    if len(digits) == 11 and digits.endswith("0"):
-        digits = digits[:-1]
-
+    # si querés, podés quedarte con los últimos 10 dígitos (opcional):
+    # return digits[-10:] if len(digits) > 10 else digits
     return digits
 
 #=============================================================================
@@ -102,20 +101,22 @@ def canonicalize_phone(x) -> str:
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 import os
-import sqlite3
+
 import time
 
 # Ruta del archivo SQLite
 # En local: usa "pending_views.db"
 # En Render con disk persistente, podés usar /data/pending_views.db
-DB_PATH = os.environ.get("PENDING_DB_PATH", "pending_views.db")
-
+DATABASE_URL = os.environ.get("DATABASE_URL")
 
 def get_db_connection():
-    """
-    Devuelve una conexión a SQLite.
-    """
-    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+    if not DATABASE_URL:
+        raise RuntimeError("DATABASE_URL no está configurado")
+
+    conn = psycopg2.connect(
+        DATABASE_URL,
+        cursor_factory=psycopg2.extras.DictCursor
+    )
     return conn
 
 
@@ -126,7 +127,7 @@ def init_db():
     cur.execute(
         """
         CREATE TABLE IF NOT EXISTS pending_views (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id SERIAL PRIMARY KEY,
             to_whatsapp TEXT NOT NULL,
             archivo_norm TEXT NOT NULL,
             period_label TEXT NOT NULL,
@@ -138,7 +139,7 @@ def init_db():
     cur.execute(
         """
         CREATE TABLE IF NOT EXISTS message_status (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id SERIAL PRIMARY KEY,
             message_sid TEXT UNIQUE NOT NULL,
             to_whatsapp TEXT,
             archivo_norm TEXT,
@@ -160,7 +161,7 @@ def init_db():
     cur.execute(
         """
         CREATE TABLE IF NOT EXISTS view_confirmations (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id SERIAL PRIMARY KEY,
             from_whatsapp TEXT NOT NULL,
             archivo_norm TEXT,
             period_label TEXT,
@@ -170,10 +171,11 @@ def init_db():
         """
     )
 
+    # 👇👈 AÑADIR ESTO
     cur.execute(
         """
         CREATE TABLE IF NOT EXISTS recibo_estado (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id SERIAL PRIMARY KEY,
             archivo_norm TEXT NOT NULL,
             period_label TEXT NOT NULL,
             estado TEXT NOT NULL,         -- 'DISPONIBLE', 'FIRMADO', 'OBSERVADO'
@@ -182,10 +184,11 @@ def init_db():
         """
     )
 
+    # 👇👈 AÑADIR ESTO (contador de vistas extra)
     cur.execute(
         """
         CREATE TABLE IF NOT EXISTS recibo_vistas (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id SERIAL PRIMARY KEY,
             archivo_norm TEXT NOT NULL,
             period_label TEXT NOT NULL,
             vistas INTEGER NOT NULL DEFAULT 0,
@@ -194,24 +197,8 @@ def init_db():
         """
     )
 
-    # 👇👇 AÑADIR ESTO – dni_verification
-    cur.execute(
-        """
-        CREATE TABLE IF NOT EXISTS dni_verification (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            archivo_norm TEXT NOT NULL,
-            telefono_norm TEXT NOT NULL,
-            dni TEXT NOT NULL,
-            verified_at INTEGER NOT NULL,
-            UNIQUE(archivo_norm, telefono_norm)
-        );
-        """
-    )
-
     conn.commit()
     conn.close()
-
-
 
 def get_recibo_vistas(archivo_norm: str, period_label: str) -> int:
     """
@@ -224,7 +211,7 @@ def get_recibo_vistas(archivo_norm: str, period_label: str) -> int:
         """
         SELECT vistas
         FROM recibo_vistas
-        WHERE archivo_norm = ? AND period_label = ?;
+        WHERE archivo_norm = %s AND period_label = %s;
         """,
         (archivo_norm, period_label),
     )
@@ -244,8 +231,9 @@ def inc_recibo_vistas(archivo_norm: str, period_label: str) -> int:
     # Si no existe, lo creamos con 0
     cur.execute(
         """
-        INSERT OR IGNORE INTO recibo_vistas (archivo_norm, period_label, vistas)
-        VALUES (?, ?, 0);
+        INSERT INTO recibo_vistas (archivo_norm, period_label, vistas)
+        VALUES (%s, %s, 0)
+        ON CONFLICT (archivo_norm, period_label) DO NOTHING;
         """,
         (archivo_norm, period_label),
     )
@@ -255,7 +243,7 @@ def inc_recibo_vistas(archivo_norm: str, period_label: str) -> int:
         """
         UPDATE recibo_vistas
         SET vistas = vistas + 1
-        WHERE archivo_norm = ? AND period_label = ?;
+        WHERE archivo_norm = %s AND period_label = %s;
         """,
         (archivo_norm, period_label),
     )
@@ -265,7 +253,7 @@ def inc_recibo_vistas(archivo_norm: str, period_label: str) -> int:
         """
         SELECT vistas
         FROM recibo_vistas
-        WHERE archivo_norm = ? AND period_label = ?;
+        WHERE archivo_norm = %s AND period_label = %s;
         """,
         (archivo_norm, period_label),
     )
@@ -284,7 +272,11 @@ def get_recibo_estado(archivo_norm: str, period_label: str) -> str:
     conn = get_db_connection()
     cur = conn.cursor()
     cur.execute(
-        "SELECT estado FROM recibo_estado WHERE archivo_norm = ? AND period_label = ?;",
+        """
+        SELECT estado
+        FROM recibo_estado
+        WHERE archivo_norm = %s AND period_label = %s;
+        """,
         (archivo_norm, period_label),
     )
     row = cur.fetchone()
@@ -308,9 +300,9 @@ def set_recibo_estado(archivo_norm: str, period_label: str, estado: str) -> None
     cur.execute(
         """
         INSERT INTO recibo_estado (archivo_norm, period_label, estado)
-        VALUES (?, ?, ?)
-        ON CONFLICT(archivo_norm, period_label)
-        DO UPDATE SET estado = excluded.estado;
+        VALUES (%s, %s, %s)
+        ON CONFLICT (archivo_norm, period_label)
+        DO UPDATE SET estado = EXCLUDED.estado;
         """,
         (archivo_norm, period_label, estado),
     )
@@ -328,7 +320,7 @@ def save_pending_view(to_whatsapp: str, archivo_norm: str, period_label: str):
     cur.execute(
         """
         INSERT INTO pending_views (to_whatsapp, archivo_norm, period_label, created_at)
-        VALUES (?, ?, ?, ?);
+        VALUES (%s, %s, %s, %s);
         """,
         (to_whatsapp, archivo_norm, period_label, int(time.time())),
     )
@@ -347,7 +339,7 @@ def get_last_pending_view(from_whatsapp: str):
         """
         SELECT archivo_norm, period_label
         FROM pending_views
-        WHERE to_whatsapp = ?
+        WHERE to_whatsapp = %s
         ORDER BY created_at DESC
         LIMIT 1;
         """,
@@ -360,9 +352,6 @@ def get_last_pending_view(from_whatsapp: str):
         return row[0], row[1]
     return None
 
-#============================================
-import time
-from typing import Optional, Tuple
 
 def save_message_sent(
     message_sid: str,
@@ -381,10 +370,11 @@ def save_message_sent(
     now_ts = int(time.time())
     cur.execute(
         """
-        INSERT OR IGNORE INTO message_status (
+        INSERT INTO message_status (
             message_sid, to_whatsapp, archivo_norm, period_label,
             nombre, kind, created_at, last_status, last_status_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?);
+        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+        ON CONFLICT (message_sid) DO NOTHING;
         """,
         (
             message_sid,
@@ -412,11 +402,10 @@ def update_message_status_and_get(
     Actualiza el estado de un mensaje por SID y devuelve (kind, to_whatsapp).
     """
     conn = get_db_connection()
-    conn.row_factory = sqlite3.Row
     cur = conn.cursor()
 
     cur.execute(
-        "SELECT kind, to_whatsapp FROM message_status WHERE message_sid = ?;",
+        "SELECT kind, to_whatsapp FROM message_status WHERE message_sid = %s;",
         (message_sid,),
     )
     row = cur.fetchone()
@@ -428,13 +417,13 @@ def update_message_status_and_get(
         cur.execute(
             """
             UPDATE message_status
-            SET last_status = ?, last_status_at = ?,
-                read_at = CASE WHEN ? = 'read' THEN COALESCE(read_at, ?) ELSE read_at END,
-                delivered_at = CASE WHEN ? = 'delivered' THEN COALESCE(delivered_at, ?) ELSE delivered_at END,
-                failed_at = CASE WHEN ? IN ('failed','undelivered') THEN COALESCE(failed_at, ?) ELSE failed_at END,
-                error_code = COALESCE(?, error_code),
-                error_message = COALESCE(?, error_message)
-            WHERE message_sid = ?;
+            SET last_status = %s, last_status_at = %s,
+                read_at = CASE WHEN %s = 'read' THEN COALESCE(read_at, %s) ELSE read_at END,
+                delivered_at = CASE WHEN %s = 'delivered' THEN COALESCE(delivered_at, %s) ELSE delivered_at END,
+                failed_at = CASE WHEN %s IN ('failed','undelivered') THEN COALESCE(failed_at, %s) ELSE failed_at END,
+                error_code = COALESCE(%s, error_code),
+                error_message = COALESCE(%s, error_message)
+            WHERE message_sid = %s;
             """,
             (
                 status,
@@ -457,9 +446,10 @@ def update_message_status_and_get(
     # Si no existía, lo registramos mínimo
     cur.execute(
         """
-        INSERT OR IGNORE INTO message_status (
+        INSERT INTO message_status (
             message_sid, last_status, last_status_at, error_code, error_message
-        ) VALUES (?, ?, ?, ?, ?);
+        ) VALUES (%s, %s, %s, %s, %s)
+        ON CONFLICT (message_sid) DO NOTHING;
         """,
         (message_sid, status, now_ts, error_code, error_message),
     )
@@ -484,7 +474,7 @@ def save_user_confirmation(from_whatsapp: str, response: str):
         """
         INSERT INTO view_confirmations (
             from_whatsapp, archivo_norm, period_label, response, created_at
-        ) VALUES (?, ?, ?, ?, ?);
+        ) VALUES (%s, %s, %s, %s, %s);
         """,
         (
             from_whatsapp,
@@ -519,12 +509,8 @@ def generate_excel_report() -> str:
     """
     Lee message_status + view_confirmations y genera un Excel en /tmp/reporte_recibos.xlsx
     con una fila por persona/período.
-
-    Además agrega una segunda hoja "DNI" con el estado de verificación
-    por persona según el Excel de envíos y la tabla dni_verification.
     """
     conn = get_db_connection()
-    conn.row_factory = sqlite3.Row
     cur = conn.cursor()
 
     # Traemos TODOS los mensajes registrados
@@ -673,7 +659,7 @@ def generate_excel_report() -> str:
             ]
         )
 
-    # auto ancho de columnas hoja Recibos
+    # auto ancho de columnas
     for col in ws.columns:
         max_len = 0
         col_letter = get_column_letter(col[0].column)
@@ -683,119 +669,6 @@ def generate_excel_report() -> str:
             except Exception:
                 pass
         ws.column_dimensions[col_letter].width = max(10, max_len + 2)
-
-    # ============================
-    # Hoja 2: DNI verificados
-    # ============================
-    try:
-        env_rows = read_envios_rows()
-    except Exception as e:
-        print(f"WARN generate_excel_report DNI sheet: {e}")
-        env_rows = []
-
-    # Cargamos verificaciones de SQLite
-    conn = get_db_connection()
-    conn.row_factory = sqlite3.Row
-    cur = conn.cursor()
-    cur.execute(
-        """
-        SELECT archivo_norm, telefono_norm, dni, verified_at
-        FROM dni_verification;
-        """
-    )
-    dni_rows = cur.fetchall()
-    conn.close()
-
-    # índice por (archivo_norm, telefono_norm_normalizado)
-    dni_index: dict[tuple[str, str], dict] = {}
-    for row in dni_rows:
-        key = (
-            (row["archivo_norm"] or "").strip(),
-            canonicalize_phone(row["telefono_norm"]),
-        )
-        dni_index[key] = {
-            "dni": normalize_dni_digits(row["dni"]),
-            "verified_at": row["verified_at"],
-        }
-
-    ws_dni = wb.create_sheet(title="DNI")
-    headers_dni = [
-        "Nombre",
-        "CUIL/Archivo",
-        "Telefono",
-        "Telefono_norm",
-        "DNI_envios",
-        "DNI_guardado",
-        "Verificado",
-        "Fecha_verificacion",
-    ]
-    ws_dni.append(headers_dni)
-
-    for r in env_rows:
-        nombre = (
-            s(r.get("Nombre"))
-            or s(r.get("Nombre y apellido"))
-            or s(r.get("Apellido y nombre"))
-            or s(r.get("Empleado"))
-            or s(r.get("Persona"))
-        )
-
-        archivo_val = (
-            r.get("Archivo_norm")
-            or r.get("archivo_norm")
-            or r.get("Archivo")
-            or r.get("archivo")
-            or r.get("Cuil")
-            or r.get("CUIL")
-            or ""
-        )
-        archivo_norm_row = str(archivo_val).strip().replace(".pdf", "")
-
-        tel_raw = (
-            r.get("Telefono")
-            or r.get("Teléfono")
-            or r.get("telefono")
-            or ""
-        )
-        tel_norm = canonicalize_phone(tel_raw)
-
-        dni_envios_val = r.get("DNI") or r.get("Dni") or r.get("dni") or ""
-        dni_envios_digits = normalize_dni_digits(dni_envios_val)
-
-        key = (archivo_norm_row, tel_norm)
-        info = dni_index.get(key)
-        if info:
-            verified = "SI"
-            dni_guardado = info["dni"]
-            fecha_ver = ts_to_str(info["verified_at"])
-        else:
-            verified = "NO"
-            dni_guardado = ""
-            fecha_ver = ""
-
-        ws_dni.append(
-            [
-                nombre,
-                archivo_norm_row,
-                tel_raw,
-                tel_norm,
-                dni_envios_digits,
-                dni_guardado,
-                verified,
-                fecha_ver,
-            ]
-        )
-
-    # auto ancho de columnas hoja DNI
-    for col in ws_dni.columns:
-        max_len = 0
-        col_letter = get_column_letter(col[0].column)
-        for cell in col:
-            try:
-                max_len = max(max_len, len(str(cell.value or "")))
-            except Exception:
-                pass
-        ws_dni.column_dimensions[col_letter].width = max(10, max_len + 2)
 
     path = "/tmp/reporte_recibos.xlsx"
     wb.save(path)
@@ -879,13 +752,7 @@ def build_drive_service():
 def download_envios_excel() -> pd.DataFrame:
     """
     Descarga envios.xlsx desde Drive (por ENVIOS_FILE_ID) y lo devuelve como DataFrame.
-
-    Columnas mínimas esperadas en alguna hoja: 'telefono', 'archivo'.
-    Otras columnas opcionales: 'nombre', 'dni', etc.
-    Además agrega:
-      - telefono_norm: solo dígitos normalizados
-      - archivo_norm: CUIL/archivo sin '.pdf'
-      - cuil: alias de archivo_norm (para compatibilidad)
+    Columnas esperadas: nombre, telefono, archivo
     """
     service = build_drive_service()
 
@@ -897,56 +764,25 @@ def download_envios_excel() -> pd.DataFrame:
     while not done:
         status, done = downloader.next_chunk()
 
-    # Volvemos al inicio del buffer
     fh.seek(0)
 
-    # Inspeccionamos las hojas del XLSX
-    xls = pd.ExcelFile(fh)
-    print("DEBUG envios.xlsx sheets:", xls.sheet_names)
+    df = pd.read_excel(fh)
 
-    df = None
-    chosen_sheet = None
-
-    # Buscamos la hoja que tenga al menos 'telefono' y 'archivo'
-    for sheet in xls.sheet_names:
-        df_tmp = pd.read_excel(xls, sheet_name=sheet)
-        cols_norm = [str(c).strip().lower() for c in df_tmp.columns]
-        if "telefono" in cols_norm and "archivo" in cols_norm:
-            chosen_sheet = sheet
-            df = df_tmp
-            break
-
-    # Si no encontramos ninguna específica, usamos la primera hoja como fallback
-    if df is None:
-        chosen_sheet = xls.sheet_names[0]
-        df = pd.read_excel(xls, sheet_name=chosen_sheet)
-
-    print("DEBUG envios.xlsx using sheet:", chosen_sheet, "cols:", list(df.columns))
-
-    # Normalizamos nombres de columnas
+    # Normalizamos nombres de columnas por si vienen con mayúsculas o espacios
     df.columns = [str(c).strip().lower() for c in df.columns]
-    print("DEBUG envios.xlsx normalized cols:", list(df.columns))
 
-    # Validamos columnas base
+    # Aseguramos las columnas base
     if "telefono" not in df.columns or "archivo" not in df.columns:
-        raise ValueError(
-            "El Excel de envíos debe tener columnas 'telefono' y 'archivo' "
-            f"(columnas actuales: {list(df.columns)})"
-        )
+        raise ValueError("El Excel de envíos debe tener columnas 'telefono' y 'archivo'")
 
     # Normalizamos teléfono
     df["telefono_norm"] = df["telefono"].apply(canonicalize_phone)
+
 
     # Normalizamos archivo (CUIL sin .pdf)
     df["archivo_norm"] = df["archivo"].astype(str).str.strip()
     df["archivo_norm"] = df["archivo_norm"].str.replace(".pdf", "", case=False)
 
-    # Alias CUIL para compatibilidad con otros lugares del código
-    if "cuil" not in df.columns:
-        df["cuil"] = df["archivo_norm"]
-
-    # No tocamos 'dni': queda como df['dni'] si existe,
-    # para que luego get_envios_dni_for lo pueda leer.
     return df
 
 
@@ -1172,19 +1008,16 @@ def get_session(telefono_norm: str) -> Dict:
 
 def normalize_to_whatsapp_e164(s: str) -> str:
     s = (s or "").strip()
-    digits = canonicalize_phone(s)
-
-    # Control: celulares argentinos deben tener 12 dígitos cuando armamos el +549...
-    # Esto corrige errores típicos.
-    if len(digits) == 11 and digits.startswith("11"):
-        digits = "549" + digits
-    elif len(digits) == 10:
-        digits = "549" + digits
-    elif len(digits) == 12 and digits.startswith("549"):
-        pass
-    else:
-        print("WARN: teléfono con formato inesperado:", digits)
-
+    # si ya viene con prefijo 'whatsapp:' lo dejamos
+    if s.startswith("whatsapp:"):
+        return s
+    # si viene sólo +54911... le agregamos el prefijo
+    if s.startswith("+"):
+        return "whatsapp:" + s
+    # último recurso: quitar espacios/guiones y asumir +
+    digits = re.sub(r"[^\d+]", "", s)
+    if digits.startswith("+"):
+        return "whatsapp:" + digits
     return "whatsapp:+" + digits
 
 
@@ -1193,13 +1026,8 @@ from io import BytesIO
 
 def read_envios_rows() -> list[dict]:
     """
-    Lee el archivo de envíos desde Drive y devuelve una lista de dicts.
-
-    Tras descargarlo, las columnas quedan (ejemplo):
-      nombre, telefono, archivo, dni, telefono_norm, archivo_norm, cuil
-
-    Aquí solo capitalizamos los nombres para que el resto del código pueda usar:
-      'Nombre', 'Telefono', 'Archivo', 'Dni', 'Telefono_norm', 'Archivo_norm', 'Cuil'
+    Lee el archivo de envíos desde Drive (mismo que usa download_envios_excel)
+    y devuelve una lista de dicts con claves: 'CUIL', 'Telefono', 'Archivo', etc.
     """
     try:
         df = download_envios_excel()
@@ -1207,19 +1035,12 @@ def read_envios_rows() -> list[dict]:
             print("WARN: no se pudo leer el archivo de envíos (vacío o inexistente).")
             return []
 
-        # Capitalizamos columna → Nombre, Telefono, Archivo, Dni, Telefono_norm, Archivo_norm, Cuil...
+        # Normalizamos columnas comunes
         df.columns = [str(c).strip().capitalize() for c in df.columns]
-        print("DEBUG read_envios_rows columns:", list(df.columns))
-
-        # Chequeo liviano (al menos una de estas columnas tiene que existir)
         expected_cols = {"Cuil", "Telefono", "Archivo"}
         cols_ok = expected_cols.intersection(df.columns)
         if not cols_ok:
-            print(
-                "WARN: no se encontraron las columnas esperadas "
-                f"en el Excel de envíos. Columnas actuales: {list(df.columns)}"
-            )
-
+            print("WARN: no se encontraron las columnas esperadas en el Excel de envíos.")
         return df.to_dict(orient="records")
 
     except Exception as e:
@@ -1884,208 +1705,6 @@ def admin_report_excel():
         mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     )
 
-def normalize_dni_digits(val: str) -> str:
-    """
-    Normaliza el DNI:
-    - Acepta números, strings, floats de Excel.
-    - Saca sufijos tipo .0
-    - Devuelve siempre solo dígitos.
-    - Si tiene 7 dígitos, lo rellena a 8 con un 0 a la izquierda.
-    """
-    if val is None:
-        return ""
-
-    # Si viene como float (típico de pandas con Excel), lo pasamos a int
-    # 44143190.0 -> 44143190
-    if isinstance(val, float):
-        try:
-            val = int(val)
-        except Exception:
-            pass
-
-    s_val = str(val).strip()
-
-    # Caso clásico: "44143190.0" -> "44143190"
-    if s_val.endswith(".0"):
-        s_val = s_val[:-2]
-
-    # Ahora sí, dejamos solo dígitos
-    digits = re.sub(r"\D", "", s_val)
-
-    if not digits:
-        return ""
-
-    # Si son 7 dígitos, lo rellenamos a 8 (DNI viejo)
-    if len(digits) == 7:
-        digits = digits.zfill(8)
-
-    # En cualquier otro caso lo dejamos como está
-    return digits
-
-
-def get_envios_dni_for(archivo_norm: str, telefono_norm: str | None = None) -> Optional[str]:
-    """
-    Busca en el Excel de envíos el DNI correspondiente a `archivo_norm`.
-    Opcionalmente usa el teléfono para priorizar filas, pero el identificador
-    principal es el archivo_norm (CUIL/Archivo), porque el teléfono ya se usó
-    para encontrar ese archivo en get_archivo_from_incoming.
-
-    Devuelve el DNI normalizado (solo dígitos) o None si no lo encuentra.
-    """
-    rows = read_envios_rows()
-
-    if not rows:
-        print("DEBUG get_envios_dni_for: no hay filas en envíos")
-        return None
-
-    def norm_arch(x: str) -> tuple[str, str]:
-        raw = str(x or "").strip().replace(".pdf", "")
-        digits = re.sub(r"\D", "", raw)
-        return raw, digits
-
-    base_raw, base_digits = norm_arch(archivo_norm)
-    want_phone = canonicalize_phone(telefono_norm) if telefono_norm else ""
-
-    best_row = None
-    best_score = -1
-
-    for r in rows:
-        # Archivo / CUIL en la fila
-        arc_val = (
-            r.get("Archivo_norm")
-            or r.get("archivo_norm")
-            or r.get("Archivo")
-            or r.get("archivo")
-            or r.get("Cuil")
-            or r.get("CUIL")
-            or ""
-        )
-        row_raw, row_digits = norm_arch(arc_val)
-
-        if not row_raw and not row_digits:
-            continue
-
-        # Coincidencia de archivo por string o por dígitos
-        same_arch = False
-        if base_raw and row_raw and base_raw == row_raw:
-            same_arch = True
-        elif base_digits and row_digits and base_digits == row_digits:
-            same_arch = True
-
-        if not same_arch:
-            continue
-
-        # Score 1 = solo archivo, 2 = archivo + teléfono
-        score = 1
-        if want_phone:
-            tel_raw = (
-                r.get("Telefono")
-                or r.get("Teléfono")
-                or r.get("telefono")
-                or ""
-            )
-            tel_norm_row = canonicalize_phone(tel_raw)
-            if tel_norm_row and (tel_norm_row.endswith(want_phone) or want_phone.endswith(tel_norm_row)):
-                score = 2
-
-        if score > best_score:
-            best_score = score
-            best_row = r
-        print("DEBUG get_envios_dni_for BEST_ROW COMPLETO:")
-        for k, v in best_row.items():
-            print(f"   {k}: {repr(v)}")
-
-    if not best_row:
-        print("DEBUG get_envios_dni_for: sin candidatos para archivo_norm:", archivo_norm)
-        return None
-
-    print("DEBUG get_envios_dni_for best_row keys:", list(best_row.keys()))
-
-    # Intentamos leer DNI de varias formas
-    posibles_keys = [
-        "DNI",
-        "Dni",
-        "dni",
-        "Documento",
-        "documento",
-        "Nro DNI",
-        "Nro dni",
-        "Nro doc",
-        "N° DNI",
-        "Nº DNI",
-    ]
-
-    dni_val = None
-    for k in posibles_keys:
-        if k in best_row:
-            v = best_row.get(k)
-            # ignorar NaN y vacíos
-            if v is not None and str(v).strip() != "" and not (isinstance(v, float) and math.isnan(v)):
-                dni_val = v
-                break
-
-    if dni_val is None:
-        # Búsqueda laxa por nombre de columna
-        for k, v in best_row.items():
-            kl = str(k).lower()
-            if ("dni" in kl or "doc" in kl or "document" in kl):
-                if v is not None and str(v).strip() != "" and not (isinstance(v, float) and math.isnan(v)):
-                    dni_val = v
-                    break
-
-    if dni_val is None:
-        print("DEBUG get_envios_dni_for: fila sin DNI/documento para archivo:", archivo_norm)
-        return None
-
-    dni_digits = normalize_dni_digits(dni_val)
-    print("DEBUG get_envios_dni_for: dni_val crudo =", dni_val, "→ dni_digits =", dni_digits)
-    return dni_digits or None
-
-
-def is_dni_verified(archivo_norm: str, telefono_norm: str) -> bool:
-    """
-    Devuelve True si ya tenemos un DNI verificado para ese archivo_norm + teléfono.
-    """
-    conn = get_db_connection()
-    cur = conn.cursor()
-    cur.execute(
-        """
-        SELECT 1
-        FROM dni_verification
-        WHERE archivo_norm = ? AND telefono_norm = ?
-        LIMIT 1;
-        """,
-        (archivo_norm, canonicalize_phone(telefono_norm)),
-    )
-    row = cur.fetchone()
-    conn.close()
-    return row is not None
-
-
-def save_dni_verification(archivo_norm: str, telefono_norm: str, dni: str) -> None:
-    """
-    Guarda (o actualiza) el DNI verificado para ese archivo_norm + teléfono.
-    """
-    conn = get_db_connection()
-    cur = conn.cursor()
-    cur.execute(
-        """
-        INSERT INTO dni_verification (archivo_norm, telefono_norm, dni, verified_at)
-        VALUES (?, ?, ?, ?)
-        ON CONFLICT(archivo_norm, telefono_norm)
-        DO UPDATE SET dni = excluded.dni, verified_at = excluded.verified_at;
-        """,
-        (
-            (archivo_norm or "").strip(),
-            canonicalize_phone(telefono_norm),
-            normalize_dni_digits(dni),
-            int(time.time()),
-        ),
-    )
-    conn.commit()
-    conn.close()
-
-
 # ==========================
 #  Webhook Twilio
 # ==========================
@@ -2117,71 +1736,12 @@ def twilio_webhook():
         return build_twilio_response(
             "🤖 Ud. no está registrado/autorizado para utilizar este servicio."
         )
-    flow_state = session.get("flow_state", "IDLE")
-
-        # ------------------------------------------------------------------
-    # 0.b) VERIFICACIÓN DE DNI (la primera vez)
-    # ------------------------------------------------------------------
-        # ------------------------------------------------------------------
-    # 0.b) VERIFICACIÓN DE DNI (primera vez o reintentos)
-    # ------------------------------------------------------------------
-    if not is_dni_verified(archivo_norm_incoming, telefono_norm):
-        # Si ya estamos esperando el DNI, este mensaje se interpreta como el DNI
-        if flow_state == "ASK_DNI":
-            dni_digits = normalize_dni_digits(body)
-
-            if not dni_digits:
-                return build_twilio_response(
-                    "🤖 Para continuar, por favor escribí tu *DNI* (solo números, sin puntos ni espacios)."
-                )
-
-            # Aceptamos 7 u 8 dígitos (y normalize_dni_digits ya los corrige)
-            if len(dni_digits) not in (7, 8):
-                return build_twilio_response(
-                    "🤖 El DNI parece inválido. Volvé a ingresarlo con 7 u 8 dígitos (solo números)."
-                )
-
-            # Buscamos el DNI esperado en el Excel de envíos
-            expected_dni = get_envios_dni_for(archivo_norm_incoming, telefono_norm)
-            print("DEBUG DNI expected:", expected_dni, "input:", dni_digits)
-
-            if not expected_dni:
-                return build_twilio_response(
-                    "🤖 No tengo un DNI registrado para tu usuario en el Excel de envíos.\n"
-                    "Por favor comunicate con RRHH para que actualicen tus datos."
-                )
-
-            if dni_digits != expected_dni:
-                # ❌ NO COINCIDE → se queda en ASK_DNI, puede reintentar
-                return build_twilio_response(
-                    "🤖 El DNI que ingresaste no coincide con el que está registrado.\n"
-                    "Verificá que lo escribiste bien y volvé a ingresarlo.\n"
-                    "Si el problema continúa, por favor contactá a RRHH."
-                )
-
-            # ✅ Coincide → guardamos verificación y salimos del flujo de DNI
-            save_dni_verification(archivo_norm_incoming, telefono_norm, dni_digits)
-            session["flow_state"] = "IDLE"
-
-            return build_twilio_response(
-                "✅ DNI verificado correctamente.\n"
-                "A partir de ahora ya no será necesario que lo ingreses de nuevo.\n"
-                "Si querés consultar tu recibo, escribí *ver recibo*."
-            )
-
-        else:
-            # Primera vez: arrancamos el flujo de DNI
-            session["flow_state"] = "ASK_DNI"
-            return build_twilio_response(
-                "🤖 Antes de continuar necesito confirmar tu identidad.\n"
-                "Por favor escribí tu *DNI* (solo números, sin puntos ni espacios)."
-            )
-
 
     # ------------------------------------------------------------------
     # 1) RESPUESTAS A PREGUNTAS ABIERTAS DEL FLUJO (ya hay contexto)
     # ------------------------------------------------------------------
 
+    flow_state = session.get("flow_state", "IDLE")
     archivo_norm = session.get("archivo_norm")
     period_label = session.get("period_label")
 
@@ -2571,59 +2131,6 @@ def ping():
 import threading
 import time
 import requests
-
-@app.route("/admin/clean_db", methods=["POST"])
-def clean_db():
-    token = request.args.get("token")
-    if token != "Legui3009":  # tu token
-        return "NO AUTORIZADO", 403
-
-    try:
-        conn = get_db_connection()
-        cur = conn.cursor()
-
-        # Aseguramos que exista la tabla dni_verification (por si es un SQLite viejo)
-        cur.execute(
-        """
-        CREATE TABLE IF NOT EXISTS dni_verification (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            archivo_norm TEXT NOT NULL,
-            telefono_norm TEXT NOT NULL,
-            dni TEXT NOT NULL,
-            verified_at INTEGER NOT NULL,
-            UNIQUE(archivo_norm, telefono_norm)
-        );
-        """
-    )
-
-
-        # Intentamos borrar datos tabla por tabla; si alguna no existe, la ignoramos
-        tablas = [
-            "pending_views",
-            "message_status",
-            "view_confirmations",
-            "dni_verification",
-            "recibo_estado",
-            "recibo_vistas",
-        ]
-
-        for tabla in tablas:
-            try:
-                cur.execute(f"DELETE FROM {tabla};")
-            except Exception as e:
-                # La tabla no existe: la ignoramos
-                print(f"[clean_db] aviso: no se pudo borrar {tabla}: {e}")
-
-        conn.commit()
-        cur.close()
-        conn.close()
-
-        return "Base limpiada correctamente", 200
-
-    except Exception as e:
-        print("ERROR clean_db:", e)
-        return f"Error al limpiar la base: {e}", 500
-
 
 def keep_alive():
     url = "https://twilio-webhook-lddc.onrender.com/ping"
