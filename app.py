@@ -1154,6 +1154,15 @@ def send_template(to_phone: str, period_label: str, cuil: str | None = None) -> 
         print("ERROR send_template Twilio:", e)
         return None
 
+@app.route("/admin/debug_envios", methods=["GET"])
+def admin_debug_envios():
+    rows = read_envios_rows()
+    out = []
+    for r in rows:
+        if "LEGUI" in str(r.get("Nombre", "")).upper():
+            out.append(r)
+    return {"rows": out}, 200
+
 
 def empty_twiml():
     return Response('<?xml version="1.0" encoding="UTF-8"?><Response></Response>',
