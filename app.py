@@ -1006,18 +1006,22 @@ def get_session(telefono_norm: str) -> Dict:
     return SESSIONS[telefono_norm]
 
 
-def normalize_to_whatsapp_e164(s: str) -> str:
-    # s debería ser solo dígitos acá
-    digits = re.sub(r"\D", "", s or "")
+def normalize_to_whatsapp_e164(raw: str) -> str:
+    """
+    Recibe cualquier cosa (float como 5491136222572.0, string con guiones, etc.)
+    y devuelve siempre algo tipo 'whatsapp:+5491136222572'.
+    """
+    # ya tenés canonicalize_phone que limpia .0, comas, etc.
+    digits = canonicalize_phone(raw)  # deja sólo dígitos y saca '.0'
 
     if not digits:
-        raise ValueError("teléfono vacío")
+        raise ValueError("teléfono vacío o inválido")
 
-    # Si ya empieza con 54 (código país de AR), lo usamos así
+    # Si ya empieza con 54 (código país AR) lo usamos así
     if digits.startswith("54"):
         return "whatsapp:+" + digits
 
-    # Si no, le agregamos 54 delante
+    # Si no, le agregamos 54 adelante
     return "whatsapp:+54" + digits
 
 
