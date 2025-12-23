@@ -105,7 +105,7 @@ import time
 # Ruta del archivo SQLite
 # En local: usa "pending_views.db"
 # En Render con disk persistente, podés usar /data/pending_views.db
-DB_PATH = os.environ.get("PENDING_DB_PATH", "pending_views.db")
+DB_PATH = os.getenv("DB_PATH", "/data/app.db")
 
 
 def get_db_connection():
@@ -2443,6 +2443,11 @@ def admin_clear_all_identity_verification():
 @admin_required
 def admin_clear_all_dni_verification():
     return admin_clear_all_identity_verification()
+
+@app.route("/admin/db_path", methods=["GET"])
+@admin_required
+def admin_db_path():
+    return {"ok": True, "DB_PATH": DB_PATH, "exists": os.path.exists(DB_PATH)}, 200
 
 
 # ==========================
