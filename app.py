@@ -2050,9 +2050,13 @@ def admin_send_template_queue_start():
     if not period_lbl:
         return {"ok": False, "error": "Missing/invalid period"}, 400
 
+    limit = int(request.form.get("limit") or request.args.get("limit") or 0)
 
     # Reutilizá la misma lectura de Excel que ya usás en el masivo
     rows = read_envios_rows()
+
+    if limit > 0:
+        rows = rows[:limit]
 
     require_pdf = (request.form.get("require_pdf") or "true").lower() in ("1","true","yes","y")
     result = enqueue_job(period_lbl, rows, require_pdf=require_pdf)
