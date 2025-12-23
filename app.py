@@ -861,24 +861,16 @@ def _should_fail(row_attempts: int) -> bool:
 
 
 def _send_template_for_row(to_whatsapp: str, archivo_norm: str, period_label: str, nombre: str):
-    """
-    Reusa tu lógica de envío de plantilla (la misma idea que en /admin/send_template_all).
-    En tu archivo ya existe ese flujo con twilio_client.messages.create y save_pending_view().
-    :contentReference[oaicite:2]{index=2}
-    """
-    # IMPORTANTÍSIMO: acá deberías reutilizar exactamente el SID/ContentSid que ya usás.
-    # Como no lo pegué literal, dejé el mismo enfoque:
-    msg = twilio_client.messages.create(
-        from_=TWILIO_WHATSAPP_FROM,
-        to=to_whatsapp,
-        content_sid=TWILIO_CONTENT_SID,  # <- el que ya usás en tu app
-        status_callback=STATUS_CALLBACK_URL,
-        # si usás variables de template, acá iría content_variables=...
-    )
-    # Guardar tracking y pendientes como ya venís haciendo
+    # Reusar el MISMO envío del masivo, así siempre manda {{1}} = nombre
+    sid = send_template_whatsapp_norm(to_whatsapp, nombre)
+
+    if not sid:
+        raise Exception("twilio_error_envio_plantilla")
+
+    # Guardar tracking igual que antes
     try:
         save_message_sent(
-            message_sid=msg.sid,
+            message_sid=sid,
             to_whatsapp=to_whatsapp,
             archivo_norm=archivo_norm,
             period_label=period_label,
@@ -888,8 +880,8 @@ def _send_template_for_row(to_whatsapp: str, archivo_norm: str, period_label: st
     except Exception:
         pass
 
-    # Muy importante: tu app ya usa pending_views para saber qué mandó 
     save_pending_view(to_whatsapp, archivo_norm, period_label)
+
 
 
 def _queue_worker_loop():
