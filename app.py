@@ -1272,11 +1272,6 @@ def period_folder_to_label(folder_name: str) -> Optional[str]:
     return f"{mm}/{yyyy}"
 
 
-def period_label_to_folder(period_label: str) -> str:
-    """
-    Convierte 'mm/aaaa' → 'mm-aaaa'
-    """
-    return period_label.replace("/", "-")
 
 
 def period_sort_key(period_label: str):
@@ -1288,6 +1283,41 @@ def period_sort_key(period_label: str):
         return (0, 0)
     mm, yyyy = m.groups()
     return (int(yyyy), int(mm))
+
+import re
+
+def normalize_period_label(p: str) -> str:
+    """
+    Devuelve 'YYYY-MM' a partir de:
+    - '2025-12'
+    - '12/2025'
+    - '12-2025'
+    - '2025/12'
+    """
+    if not p:
+        return ""
+    p = p.strip()
+
+    # YYYY-MM o YYYY/MM
+    m = re.match(r"^(\d{4})[-/](\d{1,2})$", p)
+    if m:
+        y = int(m.group(1))
+        mm = int(m.group(2))
+        if 1 <= mm <= 12:
+            return f"{y:04d}-{mm:02d}"
+
+    # MM/YYYY o MM-YYYY
+    m = re.match(r"^(\d{1,2})[-/](\d{4})$", p)
+    if m:
+        mm = int(m.group(1))
+        y = int(m.group(2))
+        if 1 <= mm <= 12:
+            return f"{y:04d}-{mm:02d}"
+
+    # Si no matchea, devolvemos tal cual (para no romper),
+    # pero idealmente deberías validar y rechazar.
+    return p
+
 
 
 def list_periods_for_archivo(archivo_norm: str) -> List[str]:
@@ -1339,6 +1369,7 @@ def list_periods_for_archivo(archivo_norm: str) -> List[str]:
     return ordered
 
 
+
 def find_pdf_for_archivo_and_period(archivo_norm: str, period_label: str) -> Optional[str]:
     """
     Dado el CUIL (archivo_norm) y un período (puede venir como 'mm/aaaa' o 'mm-aaaa'),
@@ -1373,8 +1404,8 @@ def find_pdf_for_archivo_and_period(archivo_norm: str, period_label: str) -> Opt
     print("  cantidad de archivos encontrados:", len(files))
 
     # Normalizamos el período que nos llega (10/2025 o 10-2025 -> 10-2025)
-    normalized_period = period_label.replace("/", "-") if period_label else ""
-
+    normalized_period = normalize_period_for_folder(period_label)
+    print("  normalized_period buscado:", normalized_period)
     for f in files:
         parents = f.get("parents", [])
         if not parents:
@@ -1438,6 +1469,40 @@ def norm_period_label(s: str) -> str:
     # último recurso: devolvemos tal cual
     return s
 
+def normalize_period_for_folder(period_label: str) -> str:
+    """
+    Normaliza el período para comparar contra carpetas 'MM-AAAA'.
+    Acepta:
+      - 'MM/AAAA' o 'MM-AAAA'  -> 'MM-AAAA'
+      - 'AAAA-MM'             -> 'MM-AAAA'
+    """
+    if not period_label:
+        return ""
+    s = str(period_label).strip()
+
+    # MM/AAAA o MM-AAAA
+    m = re.match(r"^(\d{1,2})[/-](\d{4})$", s)
+    if m:
+        mm, yyyy = m.groups()
+        return f"{int(mm):02d}-{yyyy}"
+
+    # AAAA-MM o AAAA/MM
+    m = re.match(r"^(\d{4})[/-](\d{1,2})$", s)
+    if m:
+        yyyy, mm = m.groups()
+        return f"{int(mm):02d}-{yyyy}"
+
+    # fallback: solo cambia / por -
+    return s.replace("/", "-")
+
+
+def period_label_to_folder(period_mm_aaaa: str) -> str:
+    """
+    Convierte 'MM/AAAA' -> 'MM-AAAA'
+    """
+    if not period_mm_aaaa:
+        return ""
+    return period_mm_aaaa.replace("/", "-")
 
 
 def build_drive_public_link(file_id: str) -> str:
@@ -1905,9 +1970,11 @@ def twilio_status():
 @admin_required
 def admin_send_template_queue_start():
 
-    period_lbl = request.form.get("period") or request.args.get("period") or ""
-    if not period_lbl:
-        return {"ok": False, "error": "Missing period"}, 400
+    period_lbl_raw = request.form.get("period") or request.args.get("period") or ""
+        period_lbl = normalize_period_label(period_lbl_raw)
+        if not period_lbl:
+            return {"ok": False, "error": "Missing/invalid period"}, 400
+
 
     # Reutilizá la misma lectura de Excel que ya usás en el masivo
     rows = read_envios_rows()
