@@ -671,14 +671,10 @@ QUEUE_MAX_ATTEMPTS = int(os.getenv("QUEUE_MAX_ATTEMPTS", "3"))
 _worker_thread = None
 _worker_stop_flag = False
 
-def enqueue_job(period_label: str, rows: list) -> str:
+def enqueue_job(period_label: str, rows: list, require_pdf: bool = True) -> dict:
     """
-    Crea un job y encola destinatarios (del Excel de envíos) para enviar la plantilla
-    de forma automática en tandas (cola SQLite).
-
-    - Usa las mismas columnas que /admin/send_template_all
-    - Normaliza el número con normalize_to_whatsapp_e164()
-    - (Opcional pero recomendado) Salta filas sin PDF para ese período
+    Crea un job y encola destinatarios para enviar la plantilla en tandas.
+    Devuelve dict con job_id + contadores para debug.
     """
     job_id = str(uuid.uuid4())
     now = int(time.time())
@@ -686,7 +682,6 @@ def enqueue_job(period_label: str, rows: list) -> str:
     conn = get_db_connection()
     cur = conn.cursor()
 
-    # Creamos el job
     cur.execute(
         "INSERT INTO send_jobs (job_id, period_label, created_at, status) VALUES (?, ?, ?, 'PENDING');",
         (job_id, period_label, now),
@@ -696,11 +691,7 @@ def enqueue_job(period_label: str, rows: list) -> str:
     skipped = 0
 
     for r in rows:
-        telefono = s(
-            r.get("Telefono_norm")
-            or r.get("Telefono")
-            or r.get("Teléfono")
-        )
+        telefono = s(r.get("Telefono_norm") or r.get("Telefono") or r.get("Teléfono"))
 
         archivo_norm = s(
             r.get("Archivo_norm")
@@ -710,6 +701,10 @@ def enqueue_job(period_label: str, rows: list) -> str:
             or r.get("CUIL")
             or r.get("Cuil")
         )
+
+        # Si vino con ".pdf", lo limpiamos
+        if archivo_norm.lower().endswith(".pdf"):
+            archivo_norm = archivo_norm[:-4]
 
         nombre = s(
             r.get("Nombre")
@@ -724,24 +719,22 @@ def enqueue_job(period_label: str, rows: list) -> str:
             skipped += 1
             continue
 
-
         try:
             to_whatsapp = normalize_to_whatsapp_e164(telefono)
         except Exception:
             skipped += 1
             continue
 
+        if require_pdf:
+            try:
+                pdf_id = find_pdf_for_archivo_and_period(archivo_norm, period_label)
+            except Exception:
+                pdf_id = None
 
-        try:
-            pdf_id = find_pdf_for_archivo_and_period(archivo_norm, period_label)
-        except Exception:
-            pdf_id = None
+            if not pdf_id:
+                skipped += 1
+                continue
 
-        if not pdf_id:
-            skipped += 1
-            continue
-
-        # Insertamos en cola (evita duplicados por UNIQUE)
         cur.execute(
             """
             INSERT OR IGNORE INTO send_queue
@@ -751,7 +744,6 @@ def enqueue_job(period_label: str, rows: list) -> str:
             (job_id, to_whatsapp, archivo_norm, nombre, period_label, now),
         )
 
-        # rowcount = 1 si insertó, 0 si ya existía (IGNORE)
         if cur.rowcount == 1:
             total_inserted += 1
 
@@ -762,7 +754,8 @@ def enqueue_job(period_label: str, rows: list) -> str:
 
     conn.commit()
     conn.close()
-    return job_id
+
+    return {"job_id": job_id, "enqueued": total_inserted, "skipped": skipped}
 
 
 def _mark_job_running(job_id: str):
@@ -1917,9 +1910,11 @@ def admin_send_template_queue_start():
         return {"ok": False, "error": "Missing period"}, 400
 
     # Reutilizá la misma lectura de Excel que ya usás en el masivo
-    rows = read_envios_rows()  # <- ya existe en tu app (lo usa tu /admin/send_template_all)
+    rows = read_envios_rows()
 
-    job_id = enqueue_job(period_lbl, rows)
+    require_pdf = (request.form.get("require_pdf") or "true").lower() in ("1","true","yes","y")
+    result = enqueue_job(period_lbl, rows, require_pdf=require_pdf)
+    job_id = result["job_id"]
     start_queue_worker_once()
 
     return {
@@ -1927,7 +1922,12 @@ def admin_send_template_queue_start():
         "job_id": job_id,
         "rate_per_min": QUEUE_RATE_PER_MIN,
         "sleep_sec_per_msg": QUEUE_SLEEP_SEC,
+        "total_rows": len(rows),
+        "enqueued": result["enqueued"],
+        "skipped": result["skipped"],
+        "require_pdf": require_pdf,
     }, 200
+
 
 @app.route("/admin/envios_debug", methods=["GET"])
 @admin_required
