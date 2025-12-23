@@ -968,7 +968,12 @@ def ts_to_str(ts: Optional[int]) -> str:
 def generate_excel_report() -> str:
     """
     Lee message_status + view_confirmations y genera un Excel en /tmp/reporte_recibos.xlsx
-    con una fila por persona/período.
+    con UNA fila por (WhatsApp, Período).
+
+    Fixes:
+    - Agrupa por (whatsapp, period_label) para no duplicar plantilla vs PDF.
+    - Agrega columna "Periodo".
+    - Conserva archivo_norm (CUIL) como dato informativo (si aparece).
     """
     conn = get_db_connection()
     conn.row_factory = sqlite3.Row
@@ -996,20 +1001,27 @@ def generate_excel_report() -> str:
     conf_rows = cur.fetchall()
     conn.close()
 
-    # key = (whatsapp, archivo_norm, period_label)
+    # key = (whatsapp, period_label)  ✅ clave correcta
     agg = {}
 
+    def _get_key(whatsapp: str, period: str):
+        return (whatsapp or "", period or "")
+
     for row in msg_rows:
-        key = (
-            row["to_whatsapp"],
-            row["archivo_norm"],
-            row["period_label"],
-        )
+        whatsapp = row["to_whatsapp"] or ""
+        period = row["period_label"] or ""
+        if not whatsapp and not period:
+            continue
+
+        key = _get_key(whatsapp, period)
+
         rec = agg.get(key)
         if not rec:
             rec = {
+                "periodo": period,
                 "nombre": row["nombre"] or "",
-                "whatsapp": row["to_whatsapp"],
+                "archivo_norm": row["archivo_norm"] or "",  # CUIL (si aparece)
+                "whatsapp": whatsapp,
                 "plantilla_sent_at": None,
                 "plantilla_delivered_at": None,
                 "plantilla_read_at": None,
@@ -1023,8 +1035,13 @@ def generate_excel_report() -> str:
             }
             agg[key] = rec
 
+        # Completar datos si llegan después
         if row["nombre"] and not rec["nombre"]:
             rec["nombre"] = row["nombre"]
+        if row["archivo_norm"] and not rec["archivo_norm"]:
+            rec["archivo_norm"] = row["archivo_norm"]
+        if period and not rec["periodo"]:
+            rec["periodo"] = period
 
         kind = row["kind"]
         created_at = row["created_at"]
@@ -1052,17 +1069,21 @@ def generate_excel_report() -> str:
             if failed_at:
                 rec["pdf_failed_at"] = failed_at
 
-    # Mezclamos confirmaciones
+    # Mezclamos confirmaciones (mismo criterio: (whatsapp, period))
     for row in conf_rows:
-        key = (
-            row["from_whatsapp"],
-            row["archivo_norm"],
-            row["period_label"],
-        )
+        whatsapp = row["from_whatsapp"] or ""
+        period = row["period_label"] or ""
+        if not whatsapp and not period:
+            continue
+
+        key = _get_key(whatsapp, period)
+
         if key not in agg:
             agg[key] = {
+                "periodo": period,
                 "nombre": "",
-                "whatsapp": row["from_whatsapp"],
+                "archivo_norm": row["archivo_norm"] or "",
+                "whatsapp": whatsapp,
                 "plantilla_sent_at": None,
                 "plantilla_delivered_at": None,
                 "plantilla_read_at": None,
@@ -1074,11 +1095,17 @@ def generate_excel_report() -> str:
                 "respuesta_usuario": "",
                 "respuesta_timestamp": None,
             }
+
         rec = agg[key]
+
+        # Completar CUIL si aparece
+        if row["archivo_norm"] and not rec["archivo_norm"]:
+            rec["archivo_norm"] = row["archivo_norm"]
+
         ts = row["created_at"]
         # nos quedamos con la última respuesta
         if not rec["respuesta_timestamp"] or (ts and ts > rec["respuesta_timestamp"]):
-            rec["respuesta_usuario"] = row["response"]
+            rec["respuesta_usuario"] = row["response"] or ""
             rec["respuesta_timestamp"] = ts
 
     # Creamos el Excel
@@ -1087,7 +1114,9 @@ def generate_excel_report() -> str:
     ws.title = "Recibos"
 
     headers = [
+        "Periodo",
         "Nombre",
+        "CUIL",
         "WhatsApp",
         "Plantilla_enviada",
         "Plantilla_entregada",
@@ -1102,21 +1131,27 @@ def generate_excel_report() -> str:
     ]
     ws.append(headers)
 
-    for rec in agg.values():
+    # Ordenamos para que quede prolijo: por período y nombre
+    items = list(agg.values())
+    items.sort(key=lambda r: (r.get("periodo") or "", r.get("nombre") or "", r.get("whatsapp") or ""))
+
+    for rec in items:
         ws.append(
             [
-                rec["nombre"],
-                rec["whatsapp"],
-                ts_to_str(rec["plantilla_sent_at"]),
-                ts_to_str(rec["plantilla_delivered_at"]),
-                ts_to_str(rec["plantilla_read_at"]),
-                ts_to_str(rec["plantilla_failed_at"]),
-                ts_to_str(rec["pdf_sent_at"]),
-                ts_to_str(rec["pdf_delivered_at"]),
-                ts_to_str(rec["pdf_read_at"]),
-                ts_to_str(rec["pdf_failed_at"]),
-                rec["respuesta_usuario"],
-                ts_to_str(rec["respuesta_timestamp"]),
+                rec.get("periodo", ""),
+                rec.get("nombre", ""),
+                rec.get("archivo_norm", ""),
+                rec.get("whatsapp", ""),
+                ts_to_str(rec.get("plantilla_sent_at")),
+                ts_to_str(rec.get("plantilla_delivered_at")),
+                ts_to_str(rec.get("plantilla_read_at")),
+                ts_to_str(rec.get("plantilla_failed_at")),
+                ts_to_str(rec.get("pdf_sent_at")),
+                ts_to_str(rec.get("pdf_delivered_at")),
+                ts_to_str(rec.get("pdf_read_at")),
+                ts_to_str(rec.get("pdf_failed_at")),
+                rec.get("respuesta_usuario", ""),
+                ts_to_str(rec.get("respuesta_timestamp")),
             ]
         )
 
@@ -1131,7 +1166,7 @@ def generate_excel_report() -> str:
                 pass
         ws.column_dimensions[col_letter].width = max(10, max_len + 2)
 
-    path = "/data/reporte_recibos.xlsx"
+    path = "/tmp/reporte_recibos.xlsx"
     wb.save(path)
     return path
 
