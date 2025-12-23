@@ -2377,6 +2377,16 @@ import csv
 import io
 from flask import Response
 
+@app.route("/health", methods=["GET"])
+def health():
+    return {
+        "ok": True,
+        "service": "twilio-webhook",
+        "status": "up"
+    }, 200
+
+
+
 @app.route("/admin/report_identity_verification.csv", methods=["GET"])
 @admin_required
 def admin_report_identity_verification():
