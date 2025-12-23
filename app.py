@@ -1009,11 +1009,12 @@ def generate_excel_report() -> str:
 
     for row in msg_rows:
         whatsapp = row["to_whatsapp"] or ""
-        period = row["period_label"] or ""
+        period_raw = row["period_label"] or ""
+        period = norm_period_label(period_raw)  # ✅ ahora unifica 12/2025 y 2025-12
         if not whatsapp and not period:
             continue
 
-        key = _get_key(whatsapp, period)
+        key = (whatsapp, period)
 
         rec = agg.get(key)
         if not rec:
@@ -1478,30 +1479,38 @@ def find_pdf_for_archivo_and_period(archivo_norm: str, period_label: str) -> Opt
 
 def norm_period_label(s: str) -> str:
     """
-    Normaliza un período a 'mm/aaaa'. Acepta 'mm/aaaa', 'mm-aaaa', 'm/aaaa', 'm-aaaa'
-    y también 'mmaaaa' o 'mmyyyy'.
+    Normaliza un período a 'mm/aaaa'.
+    Acepta:
+      - 'mm/aaaa', 'mm-aaaa', 'm/aaaa', 'm-aaaa'
+      - 'mmaaaa' o 'mmyyyy'
+      - 'aaaa-mm' o 'aaaa/mm'  ✅ (nuevo)
     """
     if not s:
         return ""
     s = str(s).strip()
-    # formatos con separador
+
+    # 1) formatos mm/aaaa o mm-aaaa
     m = re.match(r"^(\d{1,2})[/-](\d{4})$", s)
     if m:
         mm, yyyy = m.groups()
         return f"{int(mm):02d}/{yyyy}"
 
-    # formatos pegados tipo mmyyyy
+    # 2) formatos aaaa-mm o aaaa/mm  ✅ nuevo
+    m = re.match(r"^(\d{4})[/-](\d{1,2})$", s)
+    if m:
+        yyyy, mm = m.groups()
+        return f"{int(mm):02d}/{yyyy}"
+
+    # 3) formatos pegados tipo mmyyyy
     m = re.match(r"^(\d{1,2})(\d{4})$", s)
     if m:
         mm, yyyy = m.groups()
         return f"{int(mm):02d}/{yyyy}"
 
-    # si ya viene mm/aaaa correcto, lo dejamos
-    m = re.match(r"^\d{2}/\d{4}$", s)
-    if m:
+    # 4) si ya viene mm/aaaa correcto
+    if re.match(r"^\d{2}/\d{4}$", s):
         return s
 
-    # último recurso: devolvemos tal cual
     return s
 
 def normalize_period_for_folder(period_label: str) -> str:
