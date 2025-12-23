@@ -1929,6 +1929,19 @@ def admin_send_template_queue_start():
         "sleep_sec_per_msg": QUEUE_SLEEP_SEC,
     }, 200
 
+@app.route("/admin/envios_debug", methods=["GET"])
+@admin_required
+def admin_envios_debug():
+    rows = read_envios_rows()
+    sample = rows[:3] if rows else []
+    return {
+        "ok": True,
+        "rows_count": len(rows),
+        "sample_keys": list(sample[0].keys()) if sample else [],
+        "sample_rows": sample,
+    }, 200
+
+
 @app.route("/admin/send_template_queue_status/<job_id>", methods=["GET"])
 @admin_required
 def admin_send_template_queue_status(job_id: str):
