@@ -967,19 +967,20 @@ def ts_to_str(ts: Optional[int]) -> str:
 
 def generate_excel_report() -> str:
     """
-    Lee message_status + view_confirmations y genera un Excel en /tmp/reporte_recibos.xlsx
-    con UNA fila por (WhatsApp, Período).
+    Genera un Excel en /tmp/reporte_recibos.xlsx con UNA fila por (WhatsApp, Período).
 
-    Fixes:
-    - Agrupa por (whatsapp, period_label) para no duplicar plantilla vs PDF.
-    - Agrega columna "Periodo".
-    - Conserva archivo_norm (CUIL) como dato informativo (si aparece).
+    Fixes incluidos:
+    - Agrupa por (whatsapp, periodo_normalizado) para evitar duplicados.
+    - Normaliza periodos a 'mm/aaaa' (incluye 'aaaa-mm').
+    - Para confirmaciones (view_confirmations), si el periodo viene vacío o distinto,
+      lo resuelve desde pending_views usando (whatsapp, archivo_norm) (último envío).
+    - Agrega columna "Periodo" y "CUIL".
     """
+    # 1) Cargamos message_status y view_confirmations
     conn = get_db_connection()
     conn.row_factory = sqlite3.Row
     cur = conn.cursor()
 
-    # Traemos TODOS los mensajes registrados
     cur.execute(
         """
         SELECT
@@ -991,7 +992,6 @@ def generate_excel_report() -> str:
     )
     msg_rows = cur.fetchall()
 
-    # Agregamos confirmaciones
     cur.execute(
         """
         SELECT from_whatsapp, archivo_norm, period_label, response, created_at
@@ -999,29 +999,53 @@ def generate_excel_report() -> str:
         """
     )
     conf_rows = cur.fetchall()
+
+    # 2) Lookup: último period_label por (to_whatsapp, archivo_norm) desde pending_views
+    cur.execute(
+        """
+        SELECT to_whatsapp, archivo_norm, period_label, MAX(created_at) as last_ts
+        FROM pending_views
+        GROUP BY to_whatsapp, archivo_norm;
+        """
+    )
+    pv_rows = cur.fetchall()
     conn.close()
 
-    # key = (whatsapp, period_label)  ✅ clave correcta
+    last_period_by_user = {}
+    for r in pv_rows:
+        w = (r["to_whatsapp"] or "").strip()
+        a = (r["archivo_norm"] or "").strip()
+        p = (r["period_label"] or "").strip()
+        if w and a and p:
+            last_period_by_user[(w, a)] = p
+
+    # 3) Helpers
+    def _norm_period(p: str) -> str:
+        # Usa tu norm_period_label si ya la tenés definida (mejor),
+        # pero asegurate que soporte también 'aaaa-mm'.
+        return norm_period_label(p)
+
+    def _key(whatsapp: str, period_norm: str) -> tuple:
+        return ((whatsapp or "").strip(), (period_norm or "").strip())
+
+    # 4) Agregamos datos desde message_status
     agg = {}
 
-    def _get_key(whatsapp: str, period: str):
-        return (whatsapp or "", period or "")
-
     for row in msg_rows:
-        whatsapp = row["to_whatsapp"] or ""
-        period_raw = row["period_label"] or ""
-        period = norm_period_label(period_raw)  # ✅ ahora unifica 12/2025 y 2025-12
-        if not whatsapp and not period:
+        whatsapp = (row["to_whatsapp"] or "").strip()
+        if not whatsapp:
             continue
 
-        key = (whatsapp, period)
+        period_raw = (row["period_label"] or "").strip()
+        period_norm = _norm_period(period_raw)
 
+        key = _key(whatsapp, period_norm)
         rec = agg.get(key)
         if not rec:
             rec = {
-                "periodo": period,
-                "nombre": row["nombre"] or "",
-                "archivo_norm": row["archivo_norm"] or "",  # CUIL (si aparece)
+                "periodo": period_norm,
+                "nombre": (row["nombre"] or "").strip(),
+                "archivo_norm": (row["archivo_norm"] or "").strip(),
                 "whatsapp": whatsapp,
                 "plantilla_sent_at": None,
                 "plantilla_delivered_at": None,
@@ -1038,13 +1062,13 @@ def generate_excel_report() -> str:
 
         # Completar datos si llegan después
         if row["nombre"] and not rec["nombre"]:
-            rec["nombre"] = row["nombre"]
+            rec["nombre"] = str(row["nombre"]).strip()
         if row["archivo_norm"] and not rec["archivo_norm"]:
-            rec["archivo_norm"] = row["archivo_norm"]
-        if period and not rec["periodo"]:
-            rec["periodo"] = period
+            rec["archivo_norm"] = str(row["archivo_norm"]).strip()
+        if period_norm and not rec["periodo"]:
+            rec["periodo"] = period_norm
 
-        kind = row["kind"]
+        kind = (row["kind"] or "").strip()
         created_at = row["created_at"]
         delivered_at = row["delivered_at"]
         read_at = row["read_at"]
@@ -1070,20 +1094,28 @@ def generate_excel_report() -> str:
             if failed_at:
                 rec["pdf_failed_at"] = failed_at
 
-    # Mezclamos confirmaciones (mismo criterio: (whatsapp, period))
+    # 5) Mezclamos confirmaciones: resolvemos período con pending_views si hace falta
     for row in conf_rows:
-        whatsapp = row["from_whatsapp"] or ""
-        period = row["period_label"] or ""
-        if not whatsapp and not period:
+        whatsapp = (row["from_whatsapp"] or "").strip()
+        if not whatsapp:
             continue
 
-        key = _get_key(whatsapp, period)
+        archivo = (row["archivo_norm"] or "").strip()
+        period_raw = (row["period_label"] or "").strip()
+
+        # Si no vino período, lo resolvemos del último envío a ese whatsapp+archivo
+        if (not period_raw) and whatsapp and archivo:
+            period_raw = (last_period_by_user.get((whatsapp, archivo), "") or "").strip()
+
+        period_norm = _norm_period(period_raw)
+
+        key = _key(whatsapp, period_norm)
 
         if key not in agg:
             agg[key] = {
-                "periodo": period,
+                "periodo": period_norm,
                 "nombre": "",
-                "archivo_norm": row["archivo_norm"] or "",
+                "archivo_norm": archivo,
                 "whatsapp": whatsapp,
                 "plantilla_sent_at": None,
                 "plantilla_delivered_at": None,
@@ -1100,16 +1132,15 @@ def generate_excel_report() -> str:
         rec = agg[key]
 
         # Completar CUIL si aparece
-        if row["archivo_norm"] and not rec["archivo_norm"]:
-            rec["archivo_norm"] = row["archivo_norm"]
+        if archivo and not rec["archivo_norm"]:
+            rec["archivo_norm"] = archivo
 
         ts = row["created_at"]
-        # nos quedamos con la última respuesta
         if not rec["respuesta_timestamp"] or (ts and ts > rec["respuesta_timestamp"]):
-            rec["respuesta_usuario"] = row["response"] or ""
+            rec["respuesta_usuario"] = (row["response"] or "").strip()
             rec["respuesta_timestamp"] = ts
 
-    # Creamos el Excel
+    # 6) Creamos el Excel
     wb = Workbook()
     ws = wb.active
     ws.title = "Recibos"
@@ -1132,7 +1163,7 @@ def generate_excel_report() -> str:
     ]
     ws.append(headers)
 
-    # Ordenamos para que quede prolijo: por período y nombre
+    # Orden prolijo: periodo, nombre, whatsapp
     items = list(agg.values())
     items.sort(key=lambda r: (r.get("periodo") or "", r.get("nombre") or "", r.get("whatsapp") or ""))
 
@@ -1156,7 +1187,7 @@ def generate_excel_report() -> str:
             ]
         )
 
-    # auto ancho de columnas
+    # Auto ancho de columnas
     for col in ws.columns:
         max_len = 0
         col_letter = get_column_letter(col[0].column)
