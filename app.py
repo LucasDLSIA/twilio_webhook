@@ -109,65 +109,154 @@ DB_PATH = os.environ.get("PENDING_DB_PATH", "pending_views.db")
 
 
 def get_db_connection():
-    """
-    Devuelve una conexión a SQLite.
-    """
     conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+    conn.row_factory = sqlite3.Row
     return conn
+
 
 def is_dni_verified(archivo_norm: str) -> bool:
     """
-    Devuelve True si el archivo_norm ya tiene DNI verificado.
+    Compatibilidad hacia atrás.
+    Devuelve True si la identidad (CUIL) ya está verificada
+    usando identity_verification.
     """
-    if not archivo_norm:
-        return False
-    conn = get_db_connection()
-    cur = conn.cursor()
-    cur.execute(
-        "SELECT 1 FROM dni_verification WHERE archivo_norm = ? LIMIT 1;",
-        (archivo_norm,),
-    )
-    row = cur.fetchone()
-    conn.close()
-    return row is not None
+    return is_identity_verified(archivo_norm)
 
 
 def set_dni_verified(archivo_norm: str, dni: str) -> None:
     """
-    Marca como verificado el DNI para ese archivo_norm.
+    Compatibilidad hacia atrás.
+    Marca la identidad como verificada usando el sistema nuevo.
+    El WhatsApp se resuelve automáticamente desde el Excel.
     """
     if not archivo_norm or not dni:
         return
+
+    to_whatsapp = find_whatsapp_by_cuil_from_envios(archivo_norm)
+    if not to_whatsapp:
+        # No se puede verificar sin teléfono asociado
+        return
+
+    set_identity_verified(
+        archivo_norm=archivo_norm,
+        dni=dni,
+        to_whatsapp=to_whatsapp,
+        source="legacy"
+    )
+
+import re
+
+
+def normalize_dni(dni: str) -> str:
+    return re.sub(r"\D+", "", dni or "")
+
+def is_identity_verified(archivo_norm: str) -> bool:
+    if not archivo_norm:
+        return False
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT 1 FROM identity_verification WHERE archivo_norm = ? LIMIT 1;", (archivo_norm,))
+    row = cur.fetchone()
+    conn.close()
+    return row is not None
+
+def get_identity_verification(archivo_norm: str):
+    if not archivo_norm:
+        return None
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT archivo_norm, dni, to_whatsapp, verified_at, source
+        FROM identity_verification
+        WHERE archivo_norm = ?
+        LIMIT 1;
+    """, (archivo_norm,))
+    row = cur.fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+def set_identity_verified(archivo_norm: str, dni: str, to_whatsapp: str, source: str = "manual") -> None:
+    if not archivo_norm:
+        return
+    dni_norm = normalize_dni(dni)
+    if len(dni_norm) not in (7, 8):
+        return
+
+    if not to_whatsapp:
+        return
+    if not to_whatsapp.startswith("whatsapp:"):
+        to_whatsapp = normalize_to_whatsapp_e164(to_whatsapp)
+
     conn = get_db_connection()
     cur = conn.cursor()
     cur.execute(
         """
-        INSERT INTO dni_verification (archivo_norm, dni, verified_at)
-        VALUES (?, ?, ?)
-        ON CONFLICT(archivo_norm)
-        DO UPDATE SET dni = excluded.dni, verified_at = excluded.verified_at;
+        INSERT INTO identity_verification (archivo_norm, dni, to_whatsapp, verified_at, source)
+        VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT(archivo_norm) DO UPDATE SET
+            dni=excluded.dni,
+            to_whatsapp=excluded.to_whatsapp,
+            verified_at=excluded.verified_at,
+            source=excluded.source;
         """,
-        (archivo_norm, dni, int(time.time())),
+        (archivo_norm, dni_norm, to_whatsapp, int(time.time()), source),
     )
     conn.commit()
     conn.close()
+
+def find_phone_in_envios_excel_by_cuil(archivo_norm: str) -> str | None:
+    """
+    Busca el teléfono de esa persona (CUIL) en el Excel de envíos.
+    Devuelve un whatsapp:+... listo para usar.
+    """
+    rows = read_envios_rows()  # ya la usás en envíos masivos/cola
+    target = s(archivo_norm)
+
+    for r in rows:
+        cuil = s(r.get("Archivo_norm") or r.get("archivo_norm") or r.get("CUIL") or r.get("Cuil"))
+        if cuil == target:
+            tel = s(r.get("Telefono_norm") or r.get("Telefono") or r.get("Teléfono"))
+            if not tel:
+                return None
+            return normalize_to_whatsapp_e164(tel)
+
+    return None
+
+def find_whatsapp_by_cuil_from_envios(archivo_norm: str) -> str | None:
+    rows = read_envios_rows()
+    target = s(archivo_norm)
+
+    for r in rows:
+        cuil = s(r.get("Archivo_norm") or r.get("archivo_norm") or r.get("CUIL") or r.get("Cuil"))
+        if cuil == target:
+            tel = s(r.get("Telefono_norm") or r.get("Telefono") or r.get("Teléfono"))
+            if not tel:
+                return None
+            return normalize_to_whatsapp_e164(tel)
+
+    return None
 
 
 def init_db():
     conn = get_db_connection()
     cur = conn.cursor()
+    cur.execute("PRAGMA journal_mode=WAL;")
+    cur.execute("PRAGMA synchronous=NORMAL;")
+
 
     cur.execute(
-        """
-        CREATE TABLE IF NOT EXISTS pending_views (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            to_whatsapp TEXT NOT NULL,
-            archivo_norm TEXT NOT NULL,
-            period_label TEXT NOT NULL,
-            created_at INTEGER NOT NULL
-        );
-        """
-    )
+    """
+    CREATE TABLE IF NOT EXISTS pending_views (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        to_whatsapp TEXT NOT NULL,
+        archivo_norm TEXT NOT NULL,
+        period_label TEXT NOT NULL,
+        created_at INTEGER NOT NULL,
+        UNIQUE(to_whatsapp, archivo_norm, period_label)
+    );
+    """
+)
+
 
     cur.execute(
         """
@@ -229,17 +318,58 @@ def init_db():
         );
         """
     )
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS identity_verification (
+            archivo_norm TEXT PRIMARY KEY,   -- CUIL
+            dni TEXT NOT NULL,
+            to_whatsapp TEXT NOT NULL,       -- whatsapp:+54...
+            verified_at INTEGER NOT NULL,
+            source TEXT NOT NULL             -- 'manual' o 'chat' (o 'legacy')
+        );
+    """)
+
+
+
+
+
+    # ==========================
+    # Cola de envíos (batch/queue)
+    # ==========================
     cur.execute(
         """
-        CREATE TABLE IF NOT EXISTS dni_verification (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            archivo_norm TEXT NOT NULL,
-            dni TEXT NOT NULL,
-            verified_at INTEGER NOT NULL,
-            UNIQUE(archivo_norm)
+        CREATE TABLE IF NOT EXISTS send_jobs (
+            job_id TEXT PRIMARY KEY,
+            period_label TEXT NOT NULL,
+            created_at INTEGER NOT NULL,
+            started_at INTEGER,
+            finished_at INTEGER,
+            status TEXT NOT NULL DEFAULT 'PENDING', -- PENDING/RUNNING/DONE/STOPPED
+            total_enqueued INTEGER NOT NULL DEFAULT 0,
+            total_sent INTEGER NOT NULL DEFAULT 0,
+            total_failed INTEGER NOT NULL DEFAULT 0
         );
         """
     )
+
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS send_queue (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            job_id TEXT NOT NULL,
+            to_whatsapp TEXT NOT NULL,
+            archivo_norm TEXT NOT NULL,
+            nombre TEXT,
+            period_label TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'PENDING',  -- PENDING/SENT/FAILED
+            attempts INTEGER NOT NULL DEFAULT 0,
+            last_error TEXT,
+            created_at INTEGER NOT NULL,
+            sent_at INTEGER,
+            UNIQUE(job_id, to_whatsapp, archivo_norm, period_label)
+        );
+        """
+    )
+
 
     conn.commit()
     conn.close()
@@ -358,7 +488,7 @@ def save_pending_view(to_whatsapp: str, archivo_norm: str, period_label: str):
     cur = conn.cursor()
     cur.execute(
         """
-        INSERT INTO pending_views (to_whatsapp, archivo_norm, period_label, created_at)
+        INSERT OR IGNORE INTO pending_views (to_whatsapp, archivo_norm, period_label, created_at)
         VALUES (?, ?, ?, ?);
         """,
         (to_whatsapp, archivo_norm, period_label, int(time.time())),
@@ -529,11 +659,305 @@ def save_user_confirmation(from_whatsapp: str, response: str):
     conn.close()
 #=============================
 
+import threading
+import uuid
+
+QUEUE_RATE_PER_MIN = int(os.getenv("QUEUE_RATE_PER_MIN", "10"))  # 10/min por defecto
+QUEUE_SLEEP_SEC = 60.0 / max(1, QUEUE_RATE_PER_MIN)             # 6s por mensaje
+QUEUE_MAX_ATTEMPTS = int(os.getenv("QUEUE_MAX_ATTEMPTS", "3"))
+
+_worker_thread = None
+_worker_stop_flag = False
+
+def enqueue_job(period_label: str, rows: list) -> str:
+    """
+    Crea un job y encola destinatarios (del Excel de envíos) para enviar la plantilla
+    de forma automática en tandas (cola SQLite).
+
+    - Usa las mismas columnas que /admin/send_template_all
+    - Normaliza el número con normalize_to_whatsapp_e164()
+    - (Opcional pero recomendado) Salta filas sin PDF para ese período
+    """
+    job_id = str(uuid.uuid4())
+    now = int(time.time())
+
+    conn = get_db_connection()
+    cur = conn.cursor()
+
+    # Creamos el job
+    cur.execute(
+        "INSERT INTO send_jobs (job_id, period_label, created_at, status) VALUES (?, ?, ?, 'PENDING');",
+        (job_id, period_label, now),
+    )
+
+    total_inserted = 0
+    skipped = 0
+
+    for r in rows:
+        telefono = s(
+            r.get("Telefono_norm")
+            or r.get("Telefono")
+            or r.get("Teléfono")
+        )
+
+        archivo_norm = s(
+            r.get("Archivo_norm")
+            or r.get("archivo_norm")
+            or r.get("Archivo")
+            or r.get("archivo")
+            or r.get("CUIL")
+            or r.get("Cuil")
+        )
+
+        nombre = s(
+            r.get("Nombre")
+            or r.get("Nombre y apellido")
+            or r.get("Apellido y nombre")
+            or r.get("Empleado")
+            or r.get("Persona")
+            or r.get("nombre")
+        )
+
+        if not telefono or not archivo_norm:
+            skipped += 1
+            continue
+
+
+        try:
+            to_whatsapp = normalize_to_whatsapp_e164(telefono)
+        except Exception:
+            skipped += 1
+            continue
+
+
+        try:
+            pdf_id = find_pdf_for_archivo_and_period(archivo_norm, period_label)
+        except Exception:
+            pdf_id = None
+
+        if not pdf_id:
+            skipped += 1
+            continue
+
+        # Insertamos en cola (evita duplicados por UNIQUE)
+        cur.execute(
+            """
+            INSERT OR IGNORE INTO send_queue
+            (job_id, to_whatsapp, archivo_norm, nombre, period_label, created_at)
+            VALUES (?, ?, ?, ?, ?, ?);
+            """,
+            (job_id, to_whatsapp, archivo_norm, nombre, period_label, now),
+        )
+
+        # rowcount = 1 si insertó, 0 si ya existía (IGNORE)
+        if cur.rowcount == 1:
+            total_inserted += 1
+
+    cur.execute(
+        "UPDATE send_jobs SET total_enqueued = ? WHERE job_id = ?;",
+        (total_inserted, job_id),
+    )
+
+    conn.commit()
+    conn.close()
+    return job_id
+
+
+def _mark_job_running(job_id: str):
+    conn = get_db_connection()
+    cur = conn.cursor()
+    now = int(time.time())
+    cur.execute(
+        "UPDATE send_jobs SET status='RUNNING', started_at=COALESCE(started_at, ?) WHERE job_id=?;",
+        (now, job_id),
+    )
+    conn.commit()
+    conn.close()
+
+
+def _mark_job_finished(job_id: str, status: str):
+    conn = get_db_connection()
+    cur = conn.cursor()
+    now = int(time.time())
+    cur.execute(
+        "UPDATE send_jobs SET status=?, finished_at=? WHERE job_id=?;",
+        (status, now, job_id),
+    )
+    conn.commit()
+    conn.close()
+
+
+def _update_job_counters(job_id: str):
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT COUNT(*) FROM send_queue WHERE job_id=? AND status='SENT';", (job_id,))
+    sent = int(cur.fetchone()[0])
+    cur.execute("SELECT COUNT(*) FROM send_queue WHERE job_id=? AND status='FAILED';", (job_id,))
+    failed = int(cur.fetchone()[0])
+    cur.execute(
+        "UPDATE send_jobs SET total_sent=?, total_failed=? WHERE job_id=?;",
+        (sent, failed, job_id),
+    )
+    conn.commit()
+    conn.close()
+
+
+def _pick_next_pending(job_id: str):
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT id, to_whatsapp, archivo_norm, nombre, period_label, attempts
+        FROM send_queue
+        WHERE job_id=? AND status='PENDING'
+        ORDER BY id ASC
+        LIMIT 1;
+        """,
+        (job_id,),
+    )
+    row = cur.fetchone()
+    conn.close()
+    return row
+
+
+def _set_queue_row_status(row_id: int, status: str, err: str = None):
+    conn = get_db_connection()
+    cur = conn.cursor()
+    now = int(time.time())
+    if status == "SENT":
+        cur.execute(
+            """
+            UPDATE send_queue
+            SET status='SENT', sent_at=?, last_error=NULL
+            WHERE id=?;
+            """,
+            (now, row_id),
+        )
+    elif status == "FAILED":
+        cur.execute(
+            """
+            UPDATE send_queue
+            SET status='FAILED', last_error=?
+            WHERE id=?;
+            """,
+            (err or "unknown", row_id),
+        )
+    conn.commit()
+    conn.close()
+
+
+def _inc_attempt(row_id: int, err: str = None):
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        UPDATE send_queue
+        SET attempts = attempts + 1, last_error=?
+        WHERE id=?;
+        """,
+        (err or "unknown", row_id),
+    )
+    conn.commit()
+    conn.close()
+
+
+def _should_fail(row_attempts: int) -> bool:
+    return row_attempts + 1 >= QUEUE_MAX_ATTEMPTS
+
+
+def _send_template_for_row(to_whatsapp: str, archivo_norm: str, period_label: str, nombre: str):
+    """
+    Reusa tu lógica de envío de plantilla (la misma idea que en /admin/send_template_all).
+    En tu archivo ya existe ese flujo con twilio_client.messages.create y save_pending_view().
+    :contentReference[oaicite:2]{index=2}
+    """
+    # IMPORTANTÍSIMO: acá deberías reutilizar exactamente el SID/ContentSid que ya usás.
+    # Como no lo pegué literal, dejé el mismo enfoque:
+    msg = twilio_client.messages.create(
+        from_=TWILIO_WHATSAPP_FROM,
+        to=to_whatsapp,
+        content_sid=TWILIO_CONTENT_SID,  # <- el que ya usás en tu app
+        status_callback=STATUS_CALLBACK_URL,
+        # si usás variables de template, acá iría content_variables=...
+    )
+    # Guardar tracking y pendientes como ya venís haciendo
+    try:
+        save_message_sent(
+            message_sid=msg.sid,
+            to_whatsapp=to_whatsapp,
+            archivo_norm=archivo_norm,
+            period_label=period_label,
+            kind="template",
+            nombre=nombre,
+        )
+    except Exception:
+        pass
+
+    # Muy importante: tu app ya usa pending_views para saber qué mandó 
+    save_pending_view(to_whatsapp, archivo_norm, period_label)
+
+
+def _queue_worker_loop():
+    global _worker_stop_flag
+    while not _worker_stop_flag:
+        # tomar el primer job pendiente o corriendo
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT job_id, status
+            FROM send_jobs
+            WHERE status IN ('PENDING','RUNNING')
+            ORDER BY created_at ASC
+            LIMIT 1;
+            """
+        )
+        job = cur.fetchone()
+        conn.close()
+
+        if not job:
+            time.sleep(2.0)
+            continue
+
+        job_id, job_status = job[0], job[1]
+        if job_status == "PENDING":
+            _mark_job_running(job_id)
+
+        # procesar un item
+        row = _pick_next_pending(job_id)
+        if not row:
+            _update_job_counters(job_id)
+            _mark_job_finished(job_id, "DONE")
+            continue
+
+        row_id, to_whatsapp, archivo_norm, nombre, period_label, attempts = row
+        try:
+            _send_template_for_row(to_whatsapp, archivo_norm, period_label, nombre)
+            _set_queue_row_status(row_id, "SENT")
+        except Exception as e:
+            err = str(e)
+            _inc_attempt(row_id, err)
+            if _should_fail(attempts):
+                _set_queue_row_status(row_id, "FAILED", err)
+
+        _update_job_counters(job_id)
+        time.sleep(QUEUE_SLEEP_SEC)
+
+
+def start_queue_worker_once():
+    global _worker_thread
+    if _worker_thread and _worker_thread.is_alive():
+        return
+    _worker_thread = threading.Thread(target=_queue_worker_loop, daemon=True)
+    _worker_thread.start()
+
+
 
 # ⚠️ MUY IMPORTANTE:
 # Llamamos a init_db() al importar el módulo
 # (para que gunicorn lo ejecute siempre)
 init_db()
+start_queue_worker_once()
 
 # ==========================
 
@@ -712,7 +1136,7 @@ def generate_excel_report() -> str:
                 pass
         ws.column_dimensions[col_letter].width = max(10, max_len + 2)
 
-    path = "/tmp/reporte_recibos.xlsx"
+    path = "/data/reporte_recibos.xlsx"
     wb.save(path)
     return path
 
@@ -1190,6 +1614,34 @@ def get_dni_for_archivo(archivo_norm: str) -> str | None:
 
     return None
 
+##################################################################
+# ADMIN / DEBUG / UTILITIES
+from functools import wraps
+
+ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "").strip()
+
+def _get_admin_token_from_request():
+    # 1) Header (recomendado)
+    tok = request.headers.get("X-Admin-Token", "").strip()
+    if tok:
+        return tok
+    # 2) Query param o form (por si llamás desde navegador)
+    tok = (request.args.get("token") or request.form.get("token") or "").strip()
+    return tok
+
+def admin_required(fn):
+    @wraps(fn)
+    def wrapper(*args, **kwargs):
+        if not ADMIN_TOKEN:
+            return {"ok": False, "error": "ADMIN_TOKEN not configured"}, 500
+        if _get_admin_token_from_request() != ADMIN_TOKEN:
+            return {"ok": False, "error": "Unauthorized"}, 401
+        return fn(*args, **kwargs)
+    return wrapper
+
+##################################################################
+
+
 
 def send_template_whatsapp_norm(to_e164: str, name: str) -> str | None:
     """
@@ -1241,6 +1693,7 @@ def send_template(to_phone: str, period_label: str, cuil: str | None = None) -> 
         return None
 
 @app.route("/admin/debug_envios", methods=["GET"])
+@admin_required
 def admin_debug_envios():
     rows = read_envios_rows()
     out = []
@@ -1249,12 +1702,64 @@ def admin_debug_envios():
             out.append(r)
     return {"rows": out}, 200
 
+@app.route("/admin/identity/verify", methods=["POST"])
+@admin_required
+def admin_identity_verify():
+    archivo_norm = (request.form.get("archivo_norm") or "").strip()  # CUIL
+    dni = (request.form.get("dni") or "").strip()
+
+    dni_norm = normalize_dni(dni)
+    if not archivo_norm or len(dni_norm) not in (7, 8):
+        return {"ok": False, "error": "archivo_norm (CUIL) y dni (7/8 dígitos) requeridos"}, 400
+
+    to_whatsapp = find_whatsapp_by_cuil_from_envios(archivo_norm)
+    if not to_whatsapp:
+        return {"ok": False, "error": "No se encontró teléfono para ese CUIL en el Excel de envíos"}, 404
+
+    set_identity_verified(archivo_norm, dni_norm, to_whatsapp, source="manual")
+
+    return {"ok": True, "archivo_norm": archivo_norm, "dni": dni_norm, "to_whatsapp": to_whatsapp}, 200
+
+@app.route("/admin/identity/get/<archivo_norm>", methods=["GET"])
+@admin_required
+def admin_identity_get(archivo_norm: str):
+    rec = get_identity_verification(archivo_norm)
+    if not rec:
+        return {"ok": False, "error": "not found"}, 404
+    return {"ok": True, "identity": rec}, 200
+
 
 def empty_twiml():
     return Response('<?xml version="1.0" encoding="UTF-8"?><Response></Response>',
                     mimetype="text/xml")
 
+@app.route("/admin/verify_person", methods=["POST"])
+@admin_required
+def admin_verify_person():
+    archivo_norm = (request.form.get("archivo_norm") or "").strip()  # CUIL
+    dni = (request.form.get("dni") or "").strip()
+
+    dni_norm = normalize_dni(dni)
+    if not archivo_norm or len(dni_norm) not in (7, 8):
+        return {"ok": False, "error": "archivo_norm (CUIL) y dni (7/8 dígitos) requeridos"}, 400
+
+    to_whatsapp = find_phone_in_envios_excel_by_cuil(archivo_norm)
+    if not to_whatsapp:
+        return {"ok": False, "error": "No se encontró teléfono para ese CUIL en el Excel de envíos"}, 404
+
+    set_identity_verified(archivo_norm, dni_norm, to_whatsapp, source="manual")
+
+    return {
+        "ok": True,
+        "archivo_norm": archivo_norm,
+        "dni": dni_norm,
+        "to_whatsapp": to_whatsapp,
+        "source": "manual"
+    }, 200
+
+
 @app.route("/admin/send_template_all", methods=["POST"])
+@admin_required
 def admin_send_template_all():
     try:
         period_raw = request.form.get("period") or PERIODO_ACTUAL or get_current_period_label()
@@ -1377,11 +1882,72 @@ def admin_send_template_all():
 
 @app.route("/twilio/status", methods=["POST"])
 def twilio_status():
-    data = request.form.to_dict()
-    print("STATUS CALLBACK:", data)
-    # data["MessageStatus"] puede ser: queued/sent/delivered/read/failed
-    # data["To"], data["From"], data["MessageSid"]
+    # Twilio manda form-data
+    message_sid = request.form.get("MessageSid") or request.form.get("SmsSid") or ""
+    status = (request.form.get("MessageStatus") or request.form.get("SmsStatus") or "").lower().strip()
+
+    error_code = request.form.get("ErrorCode")
+    error_message = request.form.get("ErrorMessage")
+
+    # (opcional) log mínimo
+    if not message_sid:
+        return ("", 204)
+
+    try:
+        update_message_status_and_get(
+            message_sid=message_sid,
+            status=status or "unknown",
+            error_code=error_code,
+            error_message=error_message,
+        )
+    except Exception as e:
+        print("ERROR twilio_status update:", e)
+
     return ("", 204)
+
+
+@app.route("/admin/send_template_queue_start", methods=["POST"])
+@admin_required
+def admin_send_template_queue_start():
+
+    period_lbl = request.form.get("period") or request.args.get("period") or ""
+    if not period_lbl:
+        return {"ok": False, "error": "Missing period"}, 400
+
+    # Reutilizá la misma lectura de Excel que ya usás en el masivo
+    rows = read_envios_rows()  # <- ya existe en tu app (lo usa tu /admin/send_template_all)
+
+    job_id = enqueue_job(period_lbl, rows)
+    start_queue_worker_once()
+
+    return {
+        "ok": True,
+        "job_id": job_id,
+        "rate_per_min": QUEUE_RATE_PER_MIN,
+        "sleep_sec_per_msg": QUEUE_SLEEP_SEC,
+    }, 200
+
+@app.route("/admin/send_template_queue_status/<job_id>", methods=["GET"])
+@admin_required
+def admin_send_template_queue_status(job_id: str):
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT job_id, period_label, status, created_at, started_at, finished_at,
+               total_enqueued, total_sent, total_failed
+        FROM send_jobs WHERE job_id=?;
+        """,
+        (job_id,),
+    )
+    row = cur.fetchone()
+    conn.close()
+    if not row:
+        return {"ok": False, "error": "job not found"}, 404
+
+    keys = ["job_id","period_label","status","created_at","started_at","finished_at",
+            "total_enqueued","total_sent","total_failed"]
+    return {"ok": True, "job": dict(zip(keys, row))}, 200
 
 
 # ==========================
@@ -1791,6 +2357,7 @@ def media_proxy(file_id):
     )
 
 @app.route("/admin/report_excel", methods=["GET"])
+@admin_required
 def admin_report_excel():
     path = generate_excel_report()
     return send_file(
@@ -1806,6 +2373,7 @@ from flask import Response
 
 
 @app.route("/admin/report_dni_verification.csv", methods=["GET"])
+@admin_required
 def admin_report_dni_verification():
     """
     Exporta un CSV con las personas que tienen DNI verificado.
@@ -1849,6 +2417,7 @@ def admin_report_dni_verification():
     )
 
 @app.route("/admin/dni_verification/clear_all", methods=["POST"])
+@admin_required
 def admin_clear_all_dni_verification():
     """
     Borra todos los registros de dni_verification.
