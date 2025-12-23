@@ -2075,7 +2075,7 @@ def admin_send_template_queue_start():
 @admin_required
 def admin_envios_debug():
     rows = read_envios_rows()
-    sample = rows[:3] if rows else []
+    sample = rows[:35] if rows else []
     return {
         "ok": True,
         "rows_count": len(rows),
