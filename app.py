@@ -2371,13 +2371,16 @@ import csv
 import io
 from flask import Response
 
+import csv
+import io
+from flask import Response
 
-@app.route("/admin/report_dni_verification.csv", methods=["GET"])
+@app.route("/admin/report_identity_verification.csv", methods=["GET"])
 @admin_required
-def admin_report_dni_verification():
+def admin_report_identity_verification():
     """
-    Exporta un CSV con las personas que tienen DNI verificado.
-    Columnas: archivo_norm, dni, verified_at (fecha/hora local)
+    Exporta un CSV con las identidades verificadas.
+    Columnas: archivo_norm (CUIL), dni, to_whatsapp, verified_at, source
     """
     conn = get_db_connection()
     cur = conn.cursor()
@@ -2386,23 +2389,27 @@ def admin_report_dni_verification():
         SELECT
             archivo_norm,
             dni,
-            datetime(verified_at, 'unixepoch', 'localtime') AS verified_at_local
-        FROM dni_verification
+            to_whatsapp,
+            datetime(verified_at, 'unixepoch', 'localtime') AS verified_at_local,
+            source
+        FROM identity_verification
         ORDER BY verified_at DESC;
         """
     )
     rows = cur.fetchall()
     conn.close()
 
-    # Armar CSV en memoria
     output = io.StringIO()
     writer = csv.writer(output, delimiter=";")
-    writer.writerow(["archivo_norm", "dni", "verified_at"])
+    writer.writerow(["archivo_norm", "dni", "to_whatsapp", "verified_at", "source"])
+
     for row in rows:
         writer.writerow([
             row["archivo_norm"],
             row["dni"],
+            row["to_whatsapp"],
             row["verified_at_local"],
+            row["source"],
         ])
 
     csv_data = output.getvalue()
@@ -2411,25 +2418,31 @@ def admin_report_dni_verification():
     return Response(
         csv_data,
         mimetype="text/csv; charset=utf-8",
-        headers={
-            "Content-Disposition": 'attachment; filename="dni_verification_report.csv"'
-        },
+        headers={"Content-Disposition": 'attachment; filename="identity_verification_report.csv"'},
     )
 
-@app.route("/admin/dni_verification/clear_all", methods=["POST"])
+# Alias por compatibilidad con el nombre viejo (así no se te rompen curls/bookmarks)
+@app.route("/admin/report_dni_verification.csv", methods=["GET"])
 @admin_required
-def admin_clear_all_dni_verification():
-    """
-    Borra todos los registros de dni_verification.
-    Útil para pruebas (forzar que todos vuelvan a pedir DNI).
-    """
+def admin_report_dni_verification():
+    return admin_report_identity_verification()
+
+@app.route("/admin/identity_verification/clear_all", methods=["POST"])
+@admin_required
+def admin_clear_all_identity_verification():
     conn = get_db_connection()
     cur = conn.cursor()
-    cur.execute("DELETE FROM dni_verification;")
+    cur.execute("DELETE FROM identity_verification;")
     deleted = cur.rowcount
     conn.commit()
     conn.close()
     return {"ok": True, "deleted": deleted}, 200
+
+# Alias por compatibilidad (ruta vieja)
+@app.route("/admin/dni_verification/clear_all", methods=["POST"])
+@admin_required
+def admin_clear_all_dni_verification():
+    return admin_clear_all_identity_verification()
 
 
 # ==========================
