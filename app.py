@@ -1971,9 +1971,9 @@ def twilio_status():
 def admin_send_template_queue_start():
 
     period_lbl_raw = request.form.get("period") or request.args.get("period") or ""
-        period_lbl = normalize_period_label(period_lbl_raw)
-        if not period_lbl:
-            return {"ok": False, "error": "Missing/invalid period"}, 400
+    period_lbl = normalize_period_label(period_lbl_raw)
+    if not period_lbl:
+        return {"ok": False, "error": "Missing/invalid period"}, 400
 
 
     # Reutilizá la misma lectura de Excel que ya usás en el masivo
@@ -2438,16 +2438,45 @@ def media_proxy(file_id):
         etag=False
     )
 
-@app.route("/admin/report_excel", methods=["GET"])
+from flask import send_file
+
+@app.route("/admin/report_recibos.xlsx", methods=["GET"])
 @admin_required
-def admin_report_excel():
-    path = generate_excel_report()
+def admin_report_recibos_xlsx():
+    path = generate_excel_report()  # devuelve "/tmp/reporte_recibos.xlsx"
     return send_file(
         path,
         as_attachment=True,
         download_name="reporte_recibos.xlsx",
         mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     )
+
+@app.route("/admin/reset_test_data", methods=["POST"])
+@admin_required
+def admin_reset_test_data():
+    # protección simple anti-accidente
+    confirm = (request.form.get("confirm") or "").strip().upper()
+    if confirm != "YES":
+        return {"ok": False, "error": "Para limpiar, enviá confirm=YES"}, 400
+
+    conn = get_db_connection()
+    cur = conn.cursor()
+
+    # Limpieza de colas y tracking de mensajes
+    cur.execute("DELETE FROM send_queue;")
+    cur.execute("DELETE FROM send_jobs;")
+    cur.execute("DELETE FROM message_status;")
+    cur.execute("DELETE FROM pending_views;")
+    cur.execute("DELETE FROM view_confirmations;")
+
+    # Opcional (si querés resetear estados/vistas por periodo)
+    cur.execute("DELETE FROM recibo_estado;")
+    cur.execute("DELETE FROM recibo_vistas;")
+
+    conn.commit()
+    conn.close()
+    return {"ok": True, "cleared": True}, 200
+
 
 import csv
 import io
