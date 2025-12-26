@@ -3173,6 +3173,177 @@ def twilio_webhook():
     )
     return build_twilio_response(msg)
 
+@app.route("/admin/panel", methods=["GET"])
+@admin_required
+def admin_panel():
+    """
+    Panel HTML simple para operar todo desde el navegador.
+    Requiere ?token=... o header X-Admin-Token.
+    """
+    token = _get_admin_token_from_request()
+
+    # Datos básicos
+    try:
+        envios_rows = read_envios_rows()
+    except Exception:
+        envios_rows = []
+    envios_count = len(envios_rows)
+    envios_sample = envios_rows[:10]
+
+    conn = get_db_connection()
+    conn.row_factory = sqlite3.Row
+    cur = conn.cursor()
+
+    # Identidades verificadas
+    try:
+        cur.execute("SELECT COUNT(*) AS c FROM identity_verification;")
+        row = cur.fetchone()
+        identity_count = row["c"] if row else 0
+    except Exception:
+        identity_count = 0
+
+    # Últimos jobs de cola
+    try:
+        cur.execute(
+            """
+            SELECT job_id, period_label, status, created_at, started_at, finished_at,
+                   total_enqueued, total_sent, total_failed
+            FROM send_jobs
+            ORDER BY created_at DESC
+            LIMIT 10;
+            """
+        )
+        jobs = cur.fetchall()
+    except Exception:
+        jobs = []
+
+    conn.close()
+
+    def fmt_ts(ts):
+        if not ts:
+            return ""
+        try:
+            return datetime.fromtimestamp(int(ts)).strftime("%Y-%m-%d %H:%M:%S")
+        except Exception:
+            return str(ts)
+
+    # Construimos HTML a mano
+    html = []
+    html.append("<!doctype html>")
+    html.append("<html lang='es'>")
+    html.append("<head>")
+    html.append("<meta charset='utf-8'>")
+    html.append("<title>Panel admin recibos</title>")
+    html.append("<style>")
+    html.append("body { font-family: sans-serif; margin: 20px; }")
+    html.append("h1, h2, h3 { margin-bottom: 0.3rem; }")
+    html.append("table { border-collapse: collapse; margin-top: 0.5rem; }")
+    html.append("th, td { border: 1px solid #ccc; padding: 4px 6px; font-size: 13px; }")
+    html.append(".section { border: 1px solid #ddd; padding: 10px; margin-bottom: 16px; }")
+    html.append(".section h2 { margin-top: 0; }")
+    html.append(".small { font-size: 12px; color: #666; }")
+    html.append("input[type='text'], input[type='number'] { padding: 3px; }")
+    html.append("button { padding: 4px 10px; margin-top: 4px; }")
+    html.append("</style>")
+    html.append("</head>")
+    html.append("<body>")
+    html.append("<h1>Panel administrativo - Recibos WhatsApp</h1>")
+    html.append("<p class='small'>Recordá acceder como: "
+                "<code>/admin/panel?token=TU_TOKEN</code></p>")
+
+    # Resumen
+    html.append("<div class='section'>")
+    html.append("<h2>Resumen</h2>")
+    html.append(f"<p>Filas en Excel de envíos: <b>{envios_count}</b></p>")
+    html.append(f"<p>Identidades verificadas: <b>{identity_count}</b></p>")
+    html.append("</div>")
+
+    # Cola de envíos
+    html.append("<div class='section'>")
+    html.append("<h2>Cola de envíos</h2>")
+    html.append("<h3>Crear nuevo envío en cola</h3>")
+    html.append("<form method='post' action='/admin/send_template_queue_start'>")
+    if token:
+        html.append(f"<input type='hidden' name='token' value='{token}'>")
+    html.append("<label>Período: "
+                "<input type='text' name='period' placeholder='12-2025 o 12/2025'></label><br>")
+    html.append("<label>Límite (0 = todos): "
+                "<input type='number' name='limit' min='0' value='0'></label><br>")
+    html.append("<label><input type='checkbox' name='require_pdf' value='true'> "
+                "Requerir PDF existente</label><br>")
+    html.append("<button type='submit'>Encolar envío masivo</button>")
+    html.append("</form>")
+
+    html.append("<h3>Últimos jobs</h3>")
+    html.append("<table>")
+    html.append("<tr><th>Job ID</th><th>Período</th><th>Status</th>"
+                "<th>Encolados</th><th>Enviados</th><th>Fallidos</th>"
+                "<th>Creado</th><th>Inicio</th><th>Fin</th></tr>")
+    for j in jobs:
+        html.append(
+            "<tr>"
+            f"<td style='font-size:10px'>{j['job_id']}</td>"
+            f"<td>{j['period_label']}</td>"
+            f"<td>{j['status']}</td>"
+            f"<td>{j['total_enqueued']}</td>"
+            f"<td>{j['total_sent']}</td>"
+            f"<td>{j['total_failed']}</td>"
+            f"<td>{fmt_ts(j['created_at'])}</td>"
+            f"<td>{fmt_ts(j['started_at'])}</td>"
+            f"<td>{fmt_ts(j['finished_at'])}</td>"
+            "</tr>"
+        )
+    html.append("</table>")
+    html.append("</div>")
+
+    # Reportes
+    html.append("<div class='section'>")
+    html.append("<h2>Reportes</h2>")
+    if token:
+        html.append(
+            f"<p><a href='/admin/report_recibos.xlsx?token={token}' target='_blank'>"
+            "Descargar reporte de recibos (Excel)</a></p>"
+        )
+        html.append(
+            f"<p><a href='/admin/report_identity_verification.csv?token={token}' target='_blank'>"
+            "Descargar identidades verificadas (CSV)</a></p>"
+        )
+    else:
+        html.append("<p class='small'>Agregá ?token=XXXX en la URL para habilitar links directos.</p>")
+    html.append("</div>")
+
+    # Verificación manual de identidad
+    html.append("<div class='section'>")
+    html.append("<h2>Verificación manual de identidad</h2>")
+    html.append("<form method='post' action='/admin/verify_person'>")
+    if token:
+        html.append(f"<input type='hidden' name='token' value='{token}'>")
+    html.append("<label>CUIL (archivo_norm): "
+                "<input type='text' name='archivo_norm' placeholder='20-XXXXXXXX-X'></label><br>")
+    html.append("<label>DNI: "
+                "<input type='text' name='dni' placeholder='solo números'></label><br>")
+    html.append("<button type='submit'>Marcar como verificado (manual)</button>")
+    html.append("</form>")
+    html.append("</div>")
+
+    # Sample de envíos
+    html.append("<div class='section'>")
+    html.append("<h2>Sample de Excel de envíos (primeras 10 filas)</h2>")
+    if envios_sample:
+        cols = list(envios_sample[0].keys())
+        html.append("<table>")
+        html.append("<tr>" + "".join(f"<th>{c}</th>" for c in cols) + "</tr>")
+        for r in envios_sample:
+            html.append("<tr>" + "".join(f"<td>{r.get(c, '')}</td>" for c in cols) + "</tr>")
+        html.append("</table>")
+    else:
+        html.append("<p>No se pudo leer el Excel de envíos.</p>")
+    html.append("</div>")
+
+    html.append("</body></html>")
+    return Response("".join(html), mimetype="text/html")
+
+
 
 @app.route("/ping")
 def ping():
