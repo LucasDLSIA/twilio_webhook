@@ -3300,106 +3300,98 @@ def admin_send_template_queue_stop():
 
 #=============================
 
-@app.route("/admin/send_one", methods=["POST"])
+@app.route("/admin/identity_verification/send", methods=["POST"])
 @admin_required
-def admin_send_one():
+def admin_identity_verification_send():
     """
-    Envía la plantilla SOLO a una persona, buscándola en el Excel de envíos por CUIL (archivo_norm).
-    Usa la misma lógica de admin_send_template_all (nombre, teléfono, pending_view, etc.).
+    Envía plantilla SOLO a los CUIL seleccionados desde el panel.
+    Crea un job acotado (cola corta) para esos destinatarios.
     """
-    archivo_norm = (request.form.get("archivo_norm") or "").strip()
-    period_raw = (request.form.get("period") or "").strip()
-    token = (request.form.get("token") or "").strip()
-    dry_run = (request.form.get("dry_run") or "").lower() in ("1", "true", "yes", "y", "on")
+    token = _get_admin_token_from_request()
+    ids = request.form.getlist("ids")   # archivo_norm seleccionados
+    period_raw = request.form.get("period") or ""
+    period_label = normalize_period_label(period_raw)
 
-    if not archivo_norm or not period_raw:
-        return {"ok": False, "error": "archivo_norm y period son obligatorios"}, 400
+    if not ids:
+        return redirect(f"/admin/panel?token={token or ''}")
 
-    period_lbl = norm_period_label(period_raw)
+    if not period_label:
+        return Response("Falta período (mm/aaaa)", status=400, mimetype="text/plain")
 
-    rows = read_envios_rows()
-    if not rows:
-        return {"ok": False, "error": "no hay filas de envíos"}, 400
+    conn = get_db_connection()
+    conn.row_factory = sqlite3.Row
+    cur = conn.cursor()
 
-    # Buscamos la fila por CUIL
-    target = None
-    for r in rows:
-        cuil_row = s(
+    # obtener teléfono desde excel
+    env = read_envios_rows()
+    tel_map = {}
+    name_map = {}
+    for r in env:
+        archivo_norm = str(
             r.get("Archivo_norm")
+            or r.get("archivo_norm")
             or r.get("Archivo")
+            or r.get("archivo")
             or r.get("CUIL")
             or r.get("Cuil")
-        )
-        if cuil_row == archivo_norm:
-            target = r
-            break
+            or ""
+        ).strip()
+        tel = str(
+            r.get("Telefono_norm")
+            or r.get("Telefono")
+            or ""
+        ).strip()
+        name = (
+            r.get("Nombre")
+            or r.get("Apellido y nombre")
+            or ""
+        ).strip()
+        if archivo_norm:
+            tel_map[archivo_norm] = tel
+            name_map[archivo_norm] = name
 
-    if not target:
-        return {"ok": False, "error": f"no se encontró {archivo_norm} en el Excel de envíos"}, 404
-
-    telefono = s(
-        target.get("Telefono_norm")
-        or target.get("Telefono")
-        or target.get("Teléfono")
+    # Crear job especial
+    job_id = str(uuid.uuid4())
+    now = int(time.time())
+    cur.execute(
+        "INSERT INTO send_jobs (job_id, period_label, created_at, status) VALUES (?, ?, ?, 'PENDING');",
+        (job_id, period_label, now),
     )
+    total_enqueued = 0
 
-    nombre = s(
-        target.get("Nombre")
-        or target.get("Nombre y apellido")
-        or target.get("Apellido y nombre")
-        or target.get("Empleado")
-        or target.get("Persona")
-    )
+    for cuil in ids:
+        tel = tel_map.get(cuil, "")
+        name = name_map.get(cuil, "")
+        if not tel:
+            continue
+        try:
+            to_whatsapp = normalize_to_whatsapp_e164(tel)
+        except:
+            continue
 
-    if not telefono:
-        return {"ok": False, "error": "fila sin teléfono en Excel"}, 400
+        pdf_id = find_pdf_for_archivo_and_period(cuil, period_label)
+        if not pdf_id:
+            continue
 
-    try:
-        to_whatsapp = normalize_to_whatsapp_e164(telefono)
-    except Exception:
-        return {"ok": False, "error": "teléfono inválido"}, 400
-
-    if dry_run:
-        # Solo mostramos lo que *se enviaría*
-        return {
-            "ok": True,
-            "dry_run": True,
-            "archivo_norm": archivo_norm,
-            "period": period_lbl,
-            "to_whatsapp": to_whatsapp,
-            "nombre": nombre,
-        }, 200
-
-    # Envío real de la plantilla (usa tu función actual)
-    sid = send_template_whatsapp_norm(to_whatsapp, nombre)
-
-    if not sid:
-        return {"ok": False, "error": "error al enviar plantilla (Twilio)"}, 500
-
-    # Guardamos en message_status
-    try:
-        save_message_sent(
-            message_sid=sid,
-            to_whatsapp=to_whatsapp,
-            archivo_norm=archivo_norm,
-            period_label=period_lbl,
-            kind="template",
-            nombre=nombre,
+        cur.execute(
+            """
+            INSERT OR IGNORE INTO send_queue
+            (job_id, to_whatsapp, archivo_norm, nombre, period_label, created_at)
+            VALUES (?, ?, ?, ?, ?, ?);
+            """,
+            (job_id, to_whatsapp, cuil, name, period_label, now),
         )
-    except Exception as e:
-        print("ERROR guardando message_status en send_one:", e)
+        if cur.rowcount == 1:
+            total_enqueued += 1
 
-    # Guardamos en pending_views (para trackeo de vista / PDF)
-    try:
-        save_pending_view(to_whatsapp, archivo_norm, period_lbl)
-    except Exception as e:
-        print("ERROR en save_pending_view send_one:", e)
+    cur.execute("UPDATE send_jobs SET total_enqueued=? WHERE job_id=?", (total_enqueued, job_id))
+    conn.commit()
+    conn.close()
 
-    # Volvemos al panel
-    if token:
-        return redirect(f"/admin/panel?token={token}")
+    # lanzar worker
+    start_queue_worker_once()
 
-    return redirect("/admin/panel")
+    return redirect(f"/admin/panel?token={token}&msg=send_ok&job={job_id}&enq={total_enqueued}")
 
 #=============================
 @app.route("/admin/identity_verification/bulk", methods=["POST"])
@@ -4075,17 +4067,19 @@ def admin_panel():
     html.append("<p class='small'>El sistema buscará el número de WhatsApp en el Excel de envíos y guardará la identidad en la tabla <code>identity_verification</code>.</p>")
     html.append("</div>")
 
-    # SECCIÓN: Identidades verificadas (tabla + búsqueda + bulk)
+    # SECCIÓN: Identidades verificadas (tabla + búsqueda + bulk + enviar)
     html.append("<div class='section'>")
     html.append("<div class='section-header'>")
     html.append("<div class='section-title'>Identidades verificadas</div>")
     html.append("<div class='section-sub'>Listado de CUIL + DNI con WhatsApp confirmado.</div>")
     html.append("</div>")
 
-    # Form bulk delete
-    html.append("<form method='post' action='/admin/identity_verification/bulk' id='identityBulkForm'>")
+    # Un solo formulario que contiene checkboxes + acciones
+    html.append("<form method='post' action='/admin/identity_verification/bulk' id='identityForm'>")
     if token:
         html.append(f"<input type='hidden' name='token' value='{esc_html(token)}'>")
+    # este hidden lo usará el JS cuando quieras enviar plantilla
+    html.append("<input type='hidden' name='period' id='identitySendPeriodHidden' value=''>")
 
     # Buscador en vivo
     html.append("<label>Buscar<br>")
@@ -4094,7 +4088,15 @@ def admin_panel():
     # Acciones sobre seleccionados
     html.append("<div class='checkbox-row' style='justify-content: space-between; margin-top: 10px;'>")
     html.append("<span class='small'>Seleccioná con el check de la izquierda y aplicá acciones masivas.</span>")
-    html.append("<button type='submit' class='btn-danger' name='bulk_action' value='delete' onclick='return confirm(\"¿Eliminar identidades seleccionadas?\");'>Eliminar seleccionados</button>")
+    # Botón borrar
+    html.append("<button type='submit' class='btn-danger' name='bulk_action' value='delete' onclick='return confirm(\"¿Eliminar identidades seleccionadas?\");'>🗑️ Eliminar seleccionados</button>")
+    html.append("</div>")
+
+    # Botón enviar + input período
+    html.append("<div class='checkbox-row' style='justify-content: flex-end; margin-top: 6px;'>")
+    html.append("<span class='small'>Período para enviar plantilla:&nbsp;</span>")
+    html.append("<input type='text' id='identitySendPeriodInput' placeholder='mm/aaaa' style='width:90px;'>")
+    html.append("<button type='button' class='btn-primary' style='margin-left:6px;' onclick='identitySendSelected();'>📩 Enviar plantilla a seleccionados</button>")
     html.append("</div>")
 
     # Tabla con scroll
@@ -4146,7 +4148,7 @@ def admin_panel():
 
     html.append("</tbody></table>")
     html.append("</div>")  # identities-table-wrapper
-    html.append("</form>")  # identityBulkForm
+    html.append("</form>")  # identityForm
 
     # SECCIÓN: Subir Excel/CSV de identidades
     html.append("<div style='margin-top: 12px;'>")
@@ -4187,7 +4189,7 @@ def admin_panel():
         html.append("<p class='small'>No se pudo leer el archivo de envíos o está vacío.</p>")
     html.append("</div>")
 
-    # Script para búsqueda y orden
+    # Script para búsqueda, orden y enviar seleccionados
     html.append("""
     <script>
     (function() {
@@ -4214,15 +4216,15 @@ def admin_panel():
         });
       }
 
-      // Seleccionar todo
+      // Seleccionar todo (solo filas visibles)
       if (selectAll) {
         selectAll.addEventListener('change', function() {
           const checked = this.checked;
-          const checkboxes = tbody.querySelectorAll('input[type="checkbox"][name="ids"]');
-          checkboxes.forEach(chk => {
-            if (chk.closest('tr').style.display !== 'none') {
-              chk.checked = checked;
-            }
+          const rows = tbody.querySelectorAll('tr');
+          rows.forEach(row => {
+            if (row.style.display === 'none') return;
+            const chk = row.querySelector("input[type='checkbox'][name='ids']");
+            if (chk) chk.checked = checked;
           });
         });
       }
@@ -4247,6 +4249,27 @@ def admin_panel():
           rows.forEach(r => tbody.appendChild(r));
         });
       });
+
+      // Función global para enviar plantilla a seleccionados
+      window.identitySendSelected = function() {
+        const form = document.getElementById('identityForm');
+        if (!form) return;
+        const periodInput = document.getElementById('identitySendPeriodInput');
+        const periodHidden = document.getElementById('identitySendPeriodHidden');
+        const period = (periodInput ? periodInput.value : '').trim();
+        if (!period) {
+          alert('Ingresá el período (mm/aaaa) para enviar la plantilla.');
+          return;
+        }
+        const anyChecked = form.querySelector("input[name='ids']:checked");
+        if (!anyChecked) {
+          alert('Seleccioná al menos una identidad.');
+          return;
+        }
+        periodHidden.value = period;
+        form.action = '/admin/identity_verification/send';
+        form.submit();
+      };
     })();
     </script>
     """)
