@@ -3177,12 +3177,14 @@ def twilio_webhook():
 @admin_required
 def admin_panel():
     """
-    Panel HTML simple para operar todo desde el navegador.
+    Panel HTML para operar todo desde el navegador.
     Requiere ?token=... o header X-Admin-Token.
     """
     token = _get_admin_token_from_request()
 
-    # Datos básicos
+    # =========================
+    # Datos base
+    # =========================
     try:
         envios_rows = read_envios_rows()
     except Exception:
@@ -3227,108 +3229,407 @@ def admin_panel():
         except Exception:
             return str(ts)
 
-    # Construimos HTML a mano
+    # =========================
+    # HTML
+    # =========================
     html = []
     html.append("<!doctype html>")
     html.append("<html lang='es'>")
     html.append("<head>")
     html.append("<meta charset='utf-8'>")
-    html.append("<title>Panel admin recibos</title>")
-    html.append("<style>")
-    html.append("body { font-family: sans-serif; margin: 20px; }")
-    html.append("h1, h2, h3 { margin-bottom: 0.3rem; }")
-    html.append("table { border-collapse: collapse; margin-top: 0.5rem; }")
-    html.append("th, td { border: 1px solid #ccc; padding: 4px 6px; font-size: 13px; }")
-    html.append(".section { border: 1px solid #ddd; padding: 10px; margin-bottom: 16px; }")
-    html.append(".section h2 { margin-top: 0; }")
-    html.append(".small { font-size: 12px; color: #666; }")
-    html.append("input[type='text'], input[type='number'] { padding: 3px; }")
-    html.append("button { padding: 4px 10px; margin-top: 4px; }")
-    html.append("</style>")
+    html.append("<title>Panel admin - Recibos WhatsApp</title>")
+    html.append("""
+    <style>
+      :root {
+        --bg: #0f172a;
+        --bg-card: #111827;
+        --bg-card-soft: #020617;
+        --accent: #22c55e;
+        --accent-soft: rgba(34, 197, 94, 0.12);
+        --accent-strong: #16a34a;
+        --border-subtle: #1f2937;
+        --text-main: #e5e7eb;
+        --text-muted: #9ca3af;
+        --danger: #ef4444;
+        --danger-soft: rgba(239, 68, 68, 0.12);
+        --warning: #eab308;
+        --warning-soft: rgba(234, 179, 8, 0.12);
+      }
+      * {
+        box-sizing: border-box;
+      }
+      body {
+        margin: 0;
+        font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+        background: radial-gradient(circle at top, #1f2937 0, #020617 55%, #020617 100%);
+        color: var(--text-main);
+      }
+      a {
+        color: var(--accent);
+        text-decoration: none;
+      }
+      a:hover {
+        text-decoration: underline;
+      }
+      .layout {
+        max-width: 1100px;
+        margin: 0 auto;
+        padding: 24px 16px 40px;
+      }
+      .topbar {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        margin-bottom: 24px;
+      }
+      .topbar-title {
+        font-size: 22px;
+        font-weight: 600;
+        display: flex;
+        align-items: center;
+        gap: 8px;
+      }
+      .badge-live {
+        font-size: 11px;
+        text-transform: uppercase;
+        letter-spacing: 0.06em;
+        background: var(--accent-soft);
+        color: var(--accent);
+        border-radius: 999px;
+        padding: 3px 8px;
+      }
+      .topbar-meta {
+        font-size: 12px;
+        color: var(--text-muted);
+      }
+      .grid-summary {
+        display: grid;
+        grid-template-columns: repeat(3, minmax(0, 1fr));
+        gap: 12px;
+        margin-bottom: 20px;
+      }
+      .card {
+        background: radial-gradient(circle at top left, #111827 0, #020617 55%);
+        border-radius: 14px;
+        border: 1px solid var(--border-subtle);
+        padding: 12px 14px;
+      }
+      .card h2 {
+        font-size: 13px;
+        font-weight: 500;
+        margin: 0 0 6px 0;
+        color: var(--text-muted);
+      }
+      .card-main {
+        font-size: 24px;
+        font-weight: 600;
+      }
+      .card-sub {
+        font-size: 11px;
+        color: var(--text-muted);
+        margin-top: 2px;
+      }
+
+      .section {
+        margin-top: 20px;
+        padding: 14px 16px 16px;
+        background: linear-gradient(135deg, #020617 0%, #020617 55%, #0b1120 100%);
+        border-radius: 16px;
+        border: 1px solid var(--border-subtle);
+      }
+      .section-header {
+        display: flex;
+        align-items: baseline;
+        justify-content: space-between;
+        margin-bottom: 8px;
+      }
+      .section-title {
+        font-size: 16px;
+        font-weight: 600;
+      }
+      .section-sub {
+        font-size: 12px;
+        color: var(--text-muted);
+      }
+
+      form {
+        margin-top: 4px;
+      }
+      label {
+        font-size: 12px;
+        color: var(--text-muted);
+        display: block;
+        margin-top: 6px;
+      }
+      input[type='text'],
+      input[type='number'] {
+        margin-top: 3px;
+        padding: 6px 8px;
+        width: 220px;
+        border-radius: 8px;
+        border: 1px solid #374151;
+        background: rgba(15, 23, 42, 0.9);
+        color: var(--text-main);
+        font-size: 13px;
+      }
+      input:focus {
+        outline: 1px solid var(--accent-strong);
+        outline-offset: 1px;
+      }
+      .checkbox-row {
+        display: flex;
+        align-items: center;
+        gap: 6px;
+        margin-top: 8px;
+        font-size: 12px;
+        color: var(--text-muted);
+      }
+      input[type='checkbox'] {
+        accent-color: var(--accent);
+      }
+      .btn-primary {
+        margin-top: 10px;
+        padding: 7px 14px;
+        border-radius: 999px;
+        border: none;
+        cursor: pointer;
+        font-size: 13px;
+        font-weight: 500;
+        background: radial-gradient(circle at top left, var(--accent) 0, var(--accent-strong) 60%);
+        color: #022c22;
+        box-shadow: 0 0 0 1px rgba(34,197,94,0.4), 0 8px 20px rgba(22,163,74,0.25);
+      }
+      .btn-primary:hover {
+        filter: brightness(1.05);
+      }
+
+      .btn-link {
+        background: none;
+        border: none;
+        color: var(--accent);
+        font-size: 12px;
+        padding: 0;
+        cursor: pointer;
+      }
+
+      table {
+        width: 100%;
+        border-collapse: collapse;
+        margin-top: 8px;
+      }
+      th, td {
+        padding: 6px 8px;
+        font-size: 12px;
+        border-bottom: 1px solid #1f2937;
+        text-align: left;
+      }
+      th {
+        color: var(--text-muted);
+        font-weight: 500;
+        background: rgba(15, 23, 42, 0.7);
+      }
+      tr:hover td {
+        background: rgba(15, 23, 42, 0.7);
+      }
+      .mono {
+        font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+        font-size: 11px;
+      }
+      .badge-status {
+        display: inline-flex;
+        align-items: center;
+        padding: 2px 8px;
+        border-radius: 999px;
+        font-size: 11px;
+        font-weight: 500;
+      }
+      .badge-status.pending {
+        background: var(--warning-soft);
+        color: var(--warning);
+      }
+      .badge-status.running {
+        background: #0ea5e933;
+        color: #38bdf8;
+      }
+      .badge-status.done {
+        background: var(--accent-soft);
+        color: var(--accent);
+      }
+      .badge-status.stopped {
+        background: var(--danger-soft);
+        color: var(--danger);
+      }
+      .small {
+        font-size: 11px;
+        color: var(--text-muted);
+      }
+      .links-inline a {
+        margin-right: 12px;
+        font-size: 13px;
+      }
+      .two-cols {
+        display: grid;
+        grid-template-columns: minmax(0, 1.4fr) minmax(0, 1fr);
+        gap: 16px;
+      }
+      @media (max-width: 800px) {
+        .grid-summary {
+          grid-template-columns: 1fr;
+        }
+        .two-cols {
+          grid-template-columns: 1fr;
+        }
+      }
+    </style>
+    """)
     html.append("</head>")
     html.append("<body>")
-    html.append("<h1>Panel administrativo - Recibos WhatsApp</h1>")
-    html.append("<p class='small'>Recordá acceder como: "
-                "<code>/admin/panel?token=TU_TOKEN</code></p>")
+    html.append("<div class='layout'>")
 
-    # Resumen
-    html.append("<div class='section'>")
-    html.append("<h2>Resumen</h2>")
-    html.append(f"<p>Filas en Excel de envíos: <b>{envios_count}</b></p>")
-    html.append(f"<p>Identidades verificadas: <b>{identity_count}</b></p>")
+    # Topbar
+    html.append("<div class='topbar'>")
+    html.append("<div>")
+    html.append("<div class='topbar-title'>")
+    html.append("📲 Panel administrativo &nbsp; <span class='badge-live'>Recibos WhatsApp</span>")
+    html.append("</div>")
+    html.append("<div class='topbar-meta'>Gestioná envíos, verificaciones y reportes desde un solo lugar.</div>")
+    html.append("</div>")
+    html.append("<div class='topbar-meta'>")
+    html.append("Acceso con token: <code>%s</code>" % (token or "—"))
+    html.append("</div>")
     html.append("</div>")
 
-    # Cola de envíos
+    # Summary cards
+    html.append("<div class='grid-summary'>")
+    html.append("<div class='card'>")
+    html.append("<h2>Excel de envíos</h2>")
+    html.append(f"<div class='card-main'>{envios_count}</div>")
+    html.append("<div class='card-sub'>filas detectadas en el archivo de envíos</div>")
+    html.append("</div>")
+
+    html.append("<div class='card'>")
+    html.append("<h2>Identidades verificadas</h2>")
+    html.append(f"<div class='card-main'>{identity_count}</div>")
+    html.append("<div class='card-sub'>CUIL + DNI ya confirmados</div>")
+    html.append("</div>")
+
+    html.append("<div class='card'>")
+    html.append("<h2>Último job de cola</h2>")
+    if jobs:
+        last = jobs[0]
+        html.append(f"<div class='card-main mono'>{last['period_label']}</div>")
+        html.append(f"<div class='card-sub'>estado: {last['status']}, enviados: {last['total_sent']}</div>")
+    else:
+        html.append("<div class='card-main'>—</div>")
+        html.append("<div class='card-sub'>Aún no se registran envíos en cola.</div>")
+    html.append("</div>")
+    html.append("</div>")  # grid-summary
+
+    # SECCIÓN: Cola de envíos
     html.append("<div class='section'>")
-    html.append("<h2>Cola de envíos</h2>")
-    html.append("<h3>Crear nuevo envío en cola</h3>")
+    html.append("<div class='section-header'>")
+    html.append("<div class='section-title'>Cola de envíos masivos</div>")
+    html.append("<div class='section-sub'>Creá jobs en cola y revisá su estado.</div>")
+    html.append("</div>")
+
+    html.append("<div class='two-cols'>")
+
+    # Columna izquierda: formulario
+    html.append("<div>")
+    html.append("<div class='small'>Este formulario usa la misma lógica que <code>/admin/send_template_queue_start</code>.</div>")
     html.append("<form method='post' action='/admin/send_template_queue_start'>")
     if token:
         html.append(f"<input type='hidden' name='token' value='{token}'>")
-    html.append("<label>Período: "
-                "<input type='text' name='period' placeholder='12-2025 o 12/2025'></label><br>")
-    html.append("<label>Límite (0 = todos): "
-                "<input type='number' name='limit' min='0' value='0'></label><br>")
-    html.append("<label><input type='checkbox' name='require_pdf' value='true'> "
-                "Requerir PDF existente</label><br>")
-    html.append("<button type='submit'>Encolar envío masivo</button>")
+    html.append("<label>Período (mm-aaaa o mm/aaaa)<br>")
+    html.append("<input type='text' name='period' placeholder='12-2025'></label>")
+    html.append("<label>Límite de envíos (0 = todos)<br>")
+    html.append("<input type='number' name='limit' min='0' value='0'></label>")
+    html.append("<div class='checkbox-row'>")
+    html.append("<input type='checkbox' name='require_pdf' value='true' id='chk_pdf'>")
+    html.append("<label for='chk_pdf' style='margin-top:0'>Requerir PDF existente para encolar</label>")
+    html.append("</div>")
+    html.append("<button type='submit' class='btn-primary'>Encolar envío masivo</button>")
     html.append("</form>")
+    html.append("<p class='small'>Luego podés consultar el progreso con <code>/admin/send_template_queue_status/&lt;job_id&gt;</code> o desde los jobs listados a la derecha.</p>")
+    html.append("</div>")
 
-    html.append("<h3>Últimos jobs</h3>")
+    # Columna derecha: tabla de jobs
+    html.append("<div>")
+    html.append("<div class='section-sub'>Últimos 10 jobs</div>")
     html.append("<table>")
-    html.append("<tr><th>Job ID</th><th>Período</th><th>Status</th>"
-                "<th>Encolados</th><th>Enviados</th><th>Fallidos</th>"
-                "<th>Creado</th><th>Inicio</th><th>Fin</th></tr>")
+    html.append("<tr><th>Job ID</th><th>Período</th><th>Estado</th>"
+                "<th>Encolados</th><th>Enviados</th><th>Fallidos</th><th>Creado</th></tr>")
     for j in jobs:
-        html.append(
-            "<tr>"
-            f"<td style='font-size:10px'>{j['job_id']}</td>"
-            f"<td>{j['period_label']}</td>"
-            f"<td>{j['status']}</td>"
-            f"<td>{j['total_enqueued']}</td>"
-            f"<td>{j['total_sent']}</td>"
-            f"<td>{j['total_failed']}</td>"
-            f"<td>{fmt_ts(j['created_at'])}</td>"
-            f"<td>{fmt_ts(j['started_at'])}</td>"
-            f"<td>{fmt_ts(j['finished_at'])}</td>"
-            "</tr>"
-        )
+        status = (j["status"] or "").upper()
+        cls = "pending"
+        if status == "RUNNING":
+            cls = "running"
+        elif status == "DONE":
+            cls = "done"
+        elif status == "STOPPED":
+            cls = "stopped"
+        html.append("<tr>")
+        html.append(f"<td class='mono'>{j['job_id'][:8]}…</td>")
+        html.append(f"<td class='mono'>{j['period_label']}</td>")
+        html.append(f"<td><span class='badge-status {cls}'>{status}</span></td>")
+        html.append(f"<td>{j['total_enqueued']}</td>")
+        html.append(f"<td>{j['total_sent']}</td>")
+        html.append(f"<td>{j['total_failed']}</td>")
+        html.append(f"<td class='mono'>{fmt_ts(j['created_at'])}</td>")
+        html.append("</tr>")
+    if not jobs:
+        html.append("<tr><td colspan='7' class='small'>No hay jobs todavía.</td></tr>")
     html.append("</table>")
+    html.append("</div>")  # columna derecha
+
+    html.append("</div>")  # two-cols
+    html.append("</div>")  # section cola
+
+    # SECCIÓN: Reportes
+    html.append("<div class='section'>")
+    html.append("<div class='section-header'>")
+    html.append("<div class='section-title'>Reportes</div>")
+    html.append("<div class='section-sub'>Descargá los datos en Excel / CSV.</div>")
     html.append("</div>")
 
-    # Reportes
-    html.append("<div class='section'>")
-    html.append("<h2>Reportes</h2>")
     if token:
+        html.append("<div class='links-inline'>")
         html.append(
-            f"<p><a href='/admin/report_recibos.xlsx?token={token}' target='_blank'>"
-            "Descargar reporte de recibos (Excel)</a></p>"
+            f"<a href='/admin/report_recibos.xlsx?token={token}' target='_blank'>📄 Descargar reporte de recibos (Excel)</a>"
         )
         html.append(
-            f"<p><a href='/admin/report_identity_verification.csv?token={token}' target='_blank'>"
-            "Descargar identidades verificadas (CSV)</a></p>"
+            f"<a href='/admin/report_identity_verification.csv?token={token}' target='_blank'>🧩 Identidades verificadas (CSV)</a>"
         )
+        html.append("</div>")
     else:
-        html.append("<p class='small'>Agregá ?token=XXXX en la URL para habilitar links directos.</p>")
+        html.append("<p class='small'>Agregá <code>?token=TU_TOKEN</code> a la URL para habilitar los links directos de descarga.</p>")
     html.append("</div>")
 
-    # Verificación manual de identidad
+    # SECCIÓN: Verificación manual
     html.append("<div class='section'>")
-    html.append("<h2>Verificación manual de identidad</h2>")
+    html.append("<div class='section-header'>")
+    html.append("<div class='section-title'>Verificación manual de identidad</div>")
+    html.append("<div class='section-sub'>Marcá un CUIL + DNI como verificado sin pasar por el chat.</div>")
+    html.append("</div>")
+
     html.append("<form method='post' action='/admin/verify_person'>")
     if token:
         html.append(f"<input type='hidden' name='token' value='{token}'>")
-    html.append("<label>CUIL (archivo_norm): "
-                "<input type='text' name='archivo_norm' placeholder='20-XXXXXXXX-X'></label><br>")
-    html.append("<label>DNI: "
-                "<input type='text' name='dni' placeholder='solo números'></label><br>")
-    html.append("<button type='submit'>Marcar como verificado (manual)</button>")
+    html.append("<label>CUIL (archivo_norm)<br>"
+                "<input type='text' name='archivo_norm' placeholder='20-XXXXXXXX-X'></label>")
+    html.append("<label>DNI<br>"
+                "<input type='text' name='dni' placeholder='solo números'></label>")
+    html.append("<button type='submit' class='btn-primary'>Marcar como verificado (manual)</button>")
     html.append("</form>")
+    html.append("<p class='small'>El sistema buscará el número de WhatsApp en el Excel de envíos y guardará la identidad en la tabla <code>identity_verification</code>.</p>")
     html.append("</div>")
 
-    # Sample de envíos
+    # SECCIÓN: Sample de Excel
     html.append("<div class='section'>")
-    html.append("<h2>Sample de Excel de envíos (primeras 10 filas)</h2>")
+    html.append("<div class='section-header'>")
+    html.append("<div class='section-title'>Preview del Excel de envíos</div>")
+    html.append("<div class='section-sub'>Primeras 10 filas detectadas.</div>")
+    html.append("</div>")
     if envios_sample:
         cols = list(envios_sample[0].keys())
         html.append("<table>")
@@ -3337,10 +3638,12 @@ def admin_panel():
             html.append("<tr>" + "".join(f"<td>{r.get(c, '')}</td>" for c in cols) + "</tr>")
         html.append("</table>")
     else:
-        html.append("<p>No se pudo leer el Excel de envíos.</p>")
+        html.append("<p class='small'>No se pudo leer el archivo de envíos o está vacío.</p>")
     html.append("</div>")
 
+    html.append("</div>")  # layout
     html.append("</body></html>")
+
     return Response("".join(html), mimetype="text/html")
 
 
