@@ -1747,6 +1747,42 @@ def find_archivo_by_phone(to_whatsapp: str) -> str | None:
 
     return None
 
+import re  # arriba del archivo, si no lo tenés ya
+
+def empresa_to_slug(empresa: str) -> str:
+    """
+    Convierte el texto de la columna 'Empresa' del Excel a un slug de tenant,
+    por ejemplo:
+      'San Lucas'    -> 'san-lucas'
+      'Sia sueldos'  -> 'sia-sueldos'
+    """
+    if not empresa:
+        return ""
+    s = str(empresa).strip().lower()
+    # espacios múltiples -> un solo guion
+    s = re.sub(r"\s+", "-", s)
+    return s
+
+def read_envios_rows_for_tenant(tenant_slug: str) -> list[dict]:
+    """
+    Devuelve solo las filas del Excel de envíos que pertenecen a ese tenant,
+    según la columna 'Empresa'.
+    """
+    all_rows = read_envios_rows()
+    if not tenant_slug:
+        return all_rows
+
+    tenant_slug = str(tenant_slug).strip().lower()
+    filtered = []
+
+    for r in all_rows:
+        empresa_raw = r.get("Empresa") or r.get("empresa") or ""
+        slug = empresa_to_slug(empresa_raw)
+        if slug == tenant_slug:
+            filtered.append(r)
+
+    return filtered
+
 
 def get_archivo_from_incoming(from_whatsapp: str) -> Optional[str]:
     """
@@ -4913,15 +4949,24 @@ def get_envios_for_client_slug(slug: str) -> list[dict]:
 @app.route("/cliente", methods=["GET"])
 @client_login_required
 def client_portal():
+    """
+    Portal web para el cliente logueado (tenant).
+    Muestra:
+      - Conteo de empleados del Excel de envíos para ese tenant
+      - Form de envío masivo (requiere PDF en /cliente/send_mass)
+      - Form de envío puntual a una persona
+      - Últimos jobs (por ahora globales)
+      - Link para descargar el Excel de reportes del cliente
+    """
     client = g.current_client
     slug = client["slug"]
     name = client["name"]
 
-    # filas del Excel sólo de esta empresa
+    # Filas del Excel solo de esta empresa (columna Empresa en el Excel)
     envios_rows = get_envios_for_client_slug(slug)
     envios_count = len(envios_rows)
 
-    # últimos jobs (globales – si querés se pueden “taggear” por empresa más adelante)
+    # Últimos jobs de cola (de momento globales)
     conn = get_db_connection()
     conn.row_factory = sqlite3.Row
     cur = conn.cursor()
@@ -4948,50 +4993,133 @@ def client_portal():
     html = []
     html.append("<!doctype html><html lang='es'><head><meta charset='utf-8'>")
     html.append(f"<title>Portal cliente - {esc_html(name)}</title>")
-    # Podríamos reusar estilos del admin, pero te hago algo corto:
     html.append("""
     <style>
-      body { margin:0; font-family:system-ui, -apple-system, BlinkMacSystemFont,"Segoe UI",sans-serif;
-             background:#020617; color:#e5e7eb; }
-      .layout { max-width:900px; margin:0 auto; padding:24px 16px 40px; }
-      h1 { font-size:22px; margin-bottom:4px; }
-      .sub { font-size:12px; color:#9ca3af; margin-bottom:20px; }
-      .card { background:#020617; border-radius:14px; border:1px solid #1f2937; padding:14px 16px; margin-bottom:16px; }
-      label { font-size:12px; color:#9ca3af; display:block; margin-top:6px; }
-      input[type='text'], input[type='number'] {
-        margin-top:3px; padding:6px 8px; width:220px; border-radius:8px;
-        border:1px solid #374151; background:#020617; color:#e5e7eb; font-size:13px;
+      body {
+        margin: 0;
+        font-family: system-ui, -apple-system, BlinkMacSystemFont,"Segoe UI",sans-serif;
+        background: radial-gradient(circle at top, #1f2937 0, #020617 55%, #020617 100%);
+        color: #e5e7eb;
       }
-      button { margin-top:10px; padding:7px 14px; border-radius:999px; border:none;
-               cursor:pointer; font-size:13px; font-weight:500;
-               background:radial-gradient(circle at top left,#22c55e 0,#16a34a 60%);
-               color:#022c22; }
-      table { width:100%; border-collapse:collapse; margin-top:8px; font-size:12px; }
-      th, td { padding:6px 8px; border-bottom:1px solid #1f2937; text-align:left; }
-      th { color:#9ca3af; font-weight:500; background:#020617; }
-      .small { font-size:11px; color:#9ca3af; }
-      .topline { display:flex; justify-content:space-between; align-items:center; margin-bottom:12px; }
-      form.inline { display:inline-block; margin-left:8px; }
+      .layout {
+        max-width: 900px;
+        margin: 0 auto;
+        padding: 24px 16px 40px;
+      }
+      h1 { font-size: 22px; margin-bottom: 4px; }
+      .sub { font-size: 12px; color: #9ca3af; margin-bottom: 20px; }
+
+      .card {
+        background: radial-gradient(circle at top left, #111827 0, #020617 55%);
+        border-radius: 14px;
+        border: 1px solid #1f2937;
+        padding: 14px 16px;
+        margin-bottom: 16px;
+      }
+      .card h2 {
+        font-size: 16px;
+        margin: 0 0 8px 0;
+      }
+      label {
+        font-size: 12px;
+        color: #9ca3af;
+        display: block;
+        margin-top: 6px;
+      }
+      input[type='text'], input[type='number'] {
+        margin-top: 3px;
+        padding: 6px 8px;
+        width: 220px;
+        border-radius: 8px;
+        border: 1px solid #374151;
+        background: rgba(15,23,42,0.9);
+        color: #e5e7eb;
+        font-size: 13px;
+      }
+      input:focus {
+        outline: 1px solid #16a34a;
+        outline-offset: 1px;
+      }
+      button {
+        margin-top: 10px;
+        padding: 7px 14px;
+        border-radius: 999px;
+        border: none;
+        cursor: pointer;
+        font-size: 13px;
+        font-weight: 500;
+        background: radial-gradient(circle at top left,#22c55e 0,#16a34a 60%);
+        color: #022c22;
+        box-shadow: 0 0 0 1px rgba(34,197,94,0.4), 0 8px 20px rgba(22,163,74,0.25);
+      }
+      button:hover { filter: brightness(1.05); }
+
+      table {
+        width: 100%;
+        border-collapse: collapse;
+        margin-top: 8px;
+        font-size: 12px;
+      }
+      th, td {
+        padding: 6px 8px;
+        border-bottom: 1px solid #1f2937;
+        text-align: left;
+      }
+      th {
+        color: #9ca3af;
+        font-weight: 500;
+        background: rgba(15,23,42,0.9);
+      }
+      tr:hover td {
+        background: rgba(15,23,42,0.7);
+      }
+      .small {
+        font-size: 11px;
+        color: #9ca3af;
+      }
+      .mono {
+        font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+        font-size: 11px;
+      }
+      .topline {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        margin-bottom: 12px;
+      }
+      form.inline {
+        display: inline-block;
+        margin-left: 8px;
+      }
+      a {
+        color: #22c55e;
+        text-decoration: none;
+      }
+      a:hover { text-decoration: underline; }
     </style>
     """)
     html.append("</head><body><div class='layout'>")
+
+    # Topline con nombre de empresa + logout
     html.append("<div class='topline'>")
-    html.append(f"<div><h1>Portal de recibos - {esc_html(name)}</h1>")
-    html.append("<div class='sub'>Enviá recibos por WhatsApp, revisá estados y descargá el Excel.</div></div>")
+    html.append("<div>")
+    html.append(f"<h1>Portal de recibos - {esc_html(name)}</h1>")
+    html.append("<div class='sub'>Enviá recibos por WhatsApp, revisá estados y descargá el Excel.</div>")
+    html.append("</div>")
     html.append("<form method='post' action='/cliente/logout' class='inline'>")
     html.append("<button type='submit'>Cerrar sesión</button>")
     html.append("</form>")
     html.append("</div>")
 
-    # Resumen simple
+    # Resumen
     html.append("<div class='card'>")
     html.append(f"<div class='small'>Empleados en el Excel de envíos: <b>{envios_count}</b></div>")
     html.append("</div>")
 
     # Envío masivo
     html.append("<div class='card'>")
-    html.append("<h2 style='font-size:16px;margin:0 0 8px;'>Envío masivo de recibos</h2>")
-    html.append("<div class='small'>Envía la plantilla de WhatsApp a todos los empleados de este período (requiere que exista el PDF).</div>")
+    html.append("<h2>Envío masivo de recibos</h2>")
+    html.append("<div class='small'>Envia la plantilla de WhatsApp a todos los empleados de este período (requiere que exista el PDF).</div>")
     html.append("<form method='post' action='/cliente/send_mass'>")
     html.append("<label>Período (mm-aaaa o mm/aaaa)<br><input type='text' name='period' placeholder='12-2025'></label>")
     html.append("<label>Límite de envíos (0 = todos)<br><input type='number' name='limit' min='0' value='0'></label>")
@@ -5001,7 +5129,7 @@ def client_portal():
 
     # Envío puntual
     html.append("<div class='card'>")
-    html.append("<h2 style='font-size:16px;margin:0 0 8px;'>Reenviar a una persona</h2>")
+    html.append("<h2>Reenviar a una persona</h2>")
     html.append("<div class='small'>Ingresá CUIL y período para reenviar el recibo a una persona específica.</div>")
     html.append("<form method='post' action='/cliente/send_one'>")
     html.append("<label>CUIL<br><input type='text' name='archivo_norm' placeholder='20-XXXXXXXX-X'></label>")
@@ -5010,28 +5138,30 @@ def client_portal():
     html.append("</form>")
     html.append("</div>")
 
-    # Estado de jobs
+    # Últimos jobs
     html.append("<div class='card'>")
-    html.append("<h2 style='font-size:16px;margin:0 0 8px;'>Últimos envíos</h2>")
-    html.append("<table><tr><th>Período</th><th>Estado</th><th>Encolados</th><th>Enviados</th><th>Fallidos</th><th>Creado</th></tr>")
-    for j in jobs:
-        status = (j["status"] or "").upper()
-        html.append("<tr>")
-        html.append(f"<td>{esc_html(j['period_label'] or '')}</td>")
-        html.append(f"<td>{esc_html(status)}</td>")
-        html.append(f"<td>{j['total_enqueued']}</td>")
-        html.append(f"<td>{j['total_sent']}</td>")
-        html.append(f"<td>{j['total_failed']}</td>")
-        html.append(f"<td>{esc_html(fmt_ts(j['created_at']))}</td>")
-        html.append("</tr>")
-    if not jobs:
+    html.append("<h2>Últimos envíos</h2>")
+    html.append("<table>")
+    html.append("<tr><th>Período</th><th>Estado</th><th>Encolados</th><th>Enviados</th><th>Fallidos</th><th>Creado</th></tr>")
+    if jobs:
+        for j in jobs:
+            status = (j["status"] or "").upper()
+            html.append("<tr>")
+            html.append(f"<td class='mono'>{esc_html(j['period_label'] or '')}</td>")
+            html.append(f"<td class='mono'>{esc_html(status)}</td>")
+            html.append(f"<td>{j['total_enqueued']}</td>")
+            html.append(f"<td>{j['total_sent']}</td>")
+            html.append(f"<td>{j['total_failed']}</td>")
+            html.append(f"<td class='mono'>{esc_html(fmt_ts(j['created_at']))}</td>")
+            html.append("</tr>")
+    else:
         html.append("<tr><td colspan='6' class='small'>Todavía no hay envíos registrados.</td></tr>")
     html.append("</table>")
     html.append("</div>")
 
-    # Descargar Excel
+    # Reportes
     html.append("<div class='card'>")
-    html.append("<h2 style='font-size:16px;margin:0 0 8px;'>Reportes</h2>")
+    html.append("<h2>Reportes</h2>")
     html.append("<div class='small'>Descargá el Excel con estados de envío y respuestas.</div>")
     html.append("<a href='/cliente/report_recibos.xlsx' target='_blank'>📄 Descargar reporte de recibos (Excel)</a>")
     html.append("</div>")
