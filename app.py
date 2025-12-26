@@ -3406,234 +3406,156 @@ def admin_send_one():
 @admin_required
 def admin_identity_verification_bulk():
     """
-    Operaciones masivas sobre identity_verification:
-    - action=delete        -> borra los seleccionados
-    - action=send_template -> envía la plantilla a los seleccionados para un período
+    Acciones en lote sobre identidades verificadas (por ahora: borrar seleccionados).
     """
     token = _get_admin_token_from_request()
-    action = (request.form.get("action") or "").strip()
-    selected = request.form.getlist("selected") or request.form.getlist("selected[]")
+    ids = request.form.getlist("ids")  # valores = archivo_norm
+    action = request.form.get("bulk_action") or "delete"
 
-    if not selected:
-        # Nada marcado
-        return redirect(f"/admin/panel?token={token}&msg=no_selection")
-
-    # selected viene como "archivo_norm||dni||to_whatsapp"
-    identities = []
-    for val in selected:
-        parts = val.split("||")
-        if len(parts) >= 3:
-            archivo_norm = parts[0]
-            dni = parts[1]
-            to_whatsapp = parts[2]
-            identities.append((archivo_norm, dni, to_whatsapp))
-
-    if not identities:
-        return redirect(f"/admin/panel?token={token}&msg=no_valid_selection")
+    if not ids:
+        return redirect(f"/admin/panel?token={token or ''}")
 
     conn = get_db_connection()
     cur = conn.cursor()
 
     if action == "delete":
-        # Borramos por archivo_norm (CUIL)
-        for archivo_norm, _, _ in identities:
-            cur.execute(
-                "DELETE FROM identity_verification WHERE archivo_norm = ?;",
-                (archivo_norm,),
-            )
-        conn.commit()
-        conn.close()
-        return redirect(f"/admin/panel?token={token}&msg=deleted_{len(identities)}")
-
-    elif action == "send_template":
-        # Se necesita período
-        period_raw = request.form.get("period") or ""
-        period_lbl = normalize_period_label(period_raw)
-        if not period_lbl:
-            conn.close()
-            return redirect(f"/admin/panel?token={token}&msg=invalid_period")
-
-        enviados = 0
-        for archivo_norm, dni, to_whatsapp in identities:
-            try:
-                # Usamos el CUIL como archivo_norm para la variable de plantilla
-                sid = send_template(to_whatsapp, period_lbl, archivo_norm)
-                if sid:
-                    enviados += 1
-            except Exception as e:
-                print("ERROR bulk send_template:", e)
-
-        conn.close()
-        return redirect(
-            f"/admin/panel?token={token}&msg=sent_{enviados}_of_{len(identities)}"
+        placeholders = ",".join("?" * len(ids))
+        cur.execute(
+            f"DELETE FROM identity_verification WHERE archivo_norm IN ({placeholders})",
+            ids,
         )
+        conn.commit()
 
-    else:
-        conn.close()
-        return redirect(f"/admin/panel?token={token}&msg=unknown_action")
+    conn.close()
+    return redirect(f"/admin/panel?token={token or ''}")
 
-@app.route("/admin/identity_upload", methods=["POST"])
+@app.route("/admin/identity_verification/upload", methods=["POST"])
 @admin_required
-def admin_identity_upload():
+def admin_identity_verification_upload():
     """
-    Carga masiva de identidades verificadas desde un Excel/CSV.
-    Columnas aceptadas (cualquier combinación):
-      - CUIL: Archivo_norm, archivo_norm, CUIL, Cuil
-      - DNI: Dni, DNI
-      - Teléfono: Telefono, Teléfono, Telefono_norm, telefono_norm
-      - Nombre: Nombre, Nombre y apellido, Apellido y nombre, nombre
+    Sube un Excel/CSV con identidades validadas y las inserta en identity_verification.
+    Columnas esperadas (nombre flexible):
+      - CUIL / archivo_norm
+      - DNI / dni
+      - WhatsApp / Telefono / Telefono_norm
     """
-    file = request.files.get("file")
     token = _get_admin_token_from_request()
-
-    if not file or file.filename == "":
-        return "No se recibió archivo", 400
+    file = request.files.get("file")
+    if not file or not file.filename:
+        return redirect(f"/admin/panel?token={token or ''}")
 
     filename = file.filename.lower()
 
-    # Guardamos temporalmente
-    import tempfile
-    import pandas as pd
-
-    with tempfile.NamedTemporaryFile(delete=False) as tmp:
-        file.save(tmp.name)
-        tmp_path = tmp.name
-
-    # Detectar tipo
+    rows = []
     try:
         if filename.endswith(".csv"):
-            df = pd.read_csv(tmp_path, dtype=str)
+            # CSV (separador ; o ,)
+            data = file.read().decode("utf-8-sig", errors="ignore")
+            import csv
+            sample = data.splitlines()
+            sniffer = csv.Sniffer()
+            try:
+                dialect = sniffer.sniff("\n".join(sample[:5]))
+            except Exception:
+                dialect = csv.excel
+                dialect.delimiter = ";"
+            reader = csv.DictReader(sample, dialect=dialect)
+            rows = list(reader)
+        elif filename.endswith(".xlsx") or filename.endswith(".xls"):
+            # Excel con openpyxl
+            from openpyxl import load_workbook
+            import io
+            in_mem = io.BytesIO(file.read())
+            wb = load_workbook(in_mem, data_only=True)
+            ws = wb.active
+            headers = []
+            for i, row in enumerate(ws.iter_rows(values_only=True)):
+                if i == 0:
+                    headers = [str(c or "").strip() for c in row]
+                    continue
+                d = {}
+                for h, v in zip(headers, row):
+                    d[h] = v
+                rows.append(d)
         else:
-            df = pd.read_excel(tmp_path, dtype=str)
-    except Exception as e:
-        return f"Error leyendo el archivo: {e}", 400
+            # extensión desconocida, no hacemos nada
+            return redirect(f"/admin/panel?token={token or ''}")
+    except Exception:
+        # ante error de lectura, volvemos al panel
+        return redirect(f"/admin/panel?token={token or ''}")
 
-    df = df.fillna("")
+    inserted = 0
+    now = int(time.time())
 
     conn = get_db_connection()
     cur = conn.cursor()
 
-    inserted = 0
-    updated = 0
-    skipped = 0
-
-    for _, row in df.iterrows():
-        # CUIL
-        archivo_norm = s(
-            row.get("Archivo_norm", "")
-            or row.get("archivo_norm", "")
-            or row.get("Archivo", "")
-            or row.get("archivo", "")
-            or row.get("CUIL", "")
-            or row.get("Cuil", "")
+    for r in rows:
+        # Detectar columnas (varios nombres posibles)
+        archivo_norm = (
+            str(r.get("CUIL") or r.get("archivo_norm") or r.get("Archivo_norm") or "").strip()
         )
-        # DNI (solo dígitos)
-        dni_raw = s(row.get("Dni", "") or row.get("DNI", ""))
-        dni = "".join(ch for ch in dni_raw if ch.isdigit())
+        dni = str(r.get("DNI") or r.get("dni") or "").strip()
+        telefono = str(
+            r.get("WhatsApp")
+            or r.get("Telefono")
+            or r.get("Telefono_norm")
+            or ""
+        ).strip()
 
-        # Nombre (opcional, sólo lo usamos para buscar teléfono si quisiéramos más adelante;
-        # acá lo ignoramos salvo que lo uses para algo más)
-        nombre = s(
-            row.get("Nombre", "")
-            or row.get("Nombre y apellido", "")
-            or row.get("Apellido y nombre", "")
-            or row.get("nombre", "")
-        )
-
-        # Teléfono (opcional)
-        telefono_raw = s(
-            row.get("Telefono", "")
-            or row.get("Teléfono", "")
-            or row.get("Telefono_norm", "")
-            or row.get("telefono_norm", "")
-        )
-        to_whatsapp = ""
-        if telefono_raw:
-            try:
-                to_whatsapp = normalize_to_whatsapp_e164(telefono_raw)
-            except Exception:
-                to_whatsapp = ""
-
-        # Si no hay CUIL o DNI, no podemos verificar identidad
-        if not archivo_norm or not dni:
-            skipped += 1
+        if not archivo_norm or not dni or not telefono:
             continue
 
-        # Si no vino teléfono en el Excel, intentamos buscarlo en el Excel de envíos
-        if not to_whatsapp:
-            try:
-                envios_rows = read_envios_rows()
-            except Exception:
-                envios_rows = []
-            for r in envios_rows:
-                arch_r = s(
-                    r.get("Archivo_norm")
-                    or r.get("archivo_norm")
-                    or r.get("Archivo")
-                    or r.get("archivo")
-                    or r.get("CUIL")
-                    or r.get("Cuil")
-                )
-                if arch_r == archivo_norm:
-                    tel_r = s(
-                        r.get("Telefono_norm")
-                        or r.get("telefono_norm")
-                        or r.get("Telefono")
-                        or r.get("Teléfono")
-                    )
-                    if tel_r:
-                        try:
-                            to_whatsapp = normalize_to_whatsapp_e164(tel_r)
-                        except Exception:
-                            to_whatsapp = ""
-                    break
+        try:
+            to_whatsapp = normalize_to_whatsapp_e164(telefono)
+        except Exception:
+            continue
 
-        # Último fallback: si no hay teléfono, ponemos string vacío.
-        # La tabla exige NOT NULL, así que usamos algo genérico:
-        if not to_whatsapp:
-            to_whatsapp = "whatsapp:+00000000000"
-
-        # Insert / update
+        # Usamos el mismo helper de identidad
         try:
             cur.execute(
                 """
                 INSERT INTO identity_verification (archivo_norm, dni, to_whatsapp, verified_at, source)
-                VALUES (?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, 'upload')
                 ON CONFLICT(archivo_norm)
-                DO UPDATE SET
-                    dni = excluded.dni,
-                    to_whatsapp = excluded.to_whatsapp,
-                    verified_at = excluded.verified_at,
-                    source = excluded.source;
+                DO UPDATE SET dni=excluded.dni,
+                              to_whatsapp=excluded.to_whatsapp,
+                              verified_at=excluded.verified_at,
+                              source=excluded.source;
                 """,
-                (archivo_norm, dni, to_whatsapp, int(time.time()), "bulk_upload"),
+                (archivo_norm, dni, to_whatsapp, now),
             )
-            if cur.rowcount == 1:
-                # Puede ser insert o update según SQLite, pero para llevar un conteo simple:
-                inserted += 1
+            inserted += 1
         except Exception:
-            skipped += 1
+            pass
 
     conn.commit()
     conn.close()
 
-    # Volvemos al panel con un mensajito simple en query string
-    msg = f"bulk_ok=1&ins={inserted}&skip={skipped}"
-    if token:
-        return redirect(f"/admin/panel?token={token}&{msg}")
-    return redirect(f"/admin/panel?{msg}")
+    return redirect(f"/admin/panel?token={token or ''}")
 
-def esc_html(s):
-    if s is None:
-        return ""
-    return (
-        str(s)
-        .replace("&", "&amp;")
-        .replace("<", "&lt;")
-        .replace(">", "&gt;")
-        .replace('"', "&quot;")
-        .replace("'", "&#39;")
+@app.route("/admin/identity_template.csv", methods=["GET"])
+@admin_required
+def admin_identity_template_csv():
+    """
+    Devuelve un CSV de ejemplo para subir identidades verificadas.
+    Columnas: CUIL;DNI;WhatsApp
+    """
+    csv_data = "CUIL;DNI;WhatsApp\n20-12345678-3;12345678;+5491112345678\n"
+    return Response(
+        csv_data,
+        mimetype="text/csv; charset=utf-8",
+        headers={"Content-Disposition": 'attachment; filename="identity_template.csv"'},
     )
+
+import html  # asegurate de tener este import arriba del archivo
+
+def esc_html(value: str) -> str:
+    """
+    Escapa texto para incrustar seguro en HTML.
+    """
+    return html.escape(str(value or ""), quote=True)
+
 
 
 @app.route("/admin/panel", methods=["GET"])
@@ -3655,35 +3577,35 @@ def admin_panel():
     envios_count = len(envios_rows)
     envios_sample = envios_rows[:10]
 
-    # Mapa auxiliar: CUIL (archivo_norm) -> Nombre
-    nombre_por_cuil: dict[str, str] = {}
+    # Mapa CUIL -> nombre (para mostrar nombre en identidades verificadas)
+    cuil_to_name = {}
     for r in envios_rows:
-        archivo_norm = s(
+        archivo_norm = str(
             r.get("Archivo_norm")
             or r.get("archivo_norm")
             or r.get("Archivo")
             or r.get("archivo")
             or r.get("CUIL")
             or r.get("Cuil")
-        )
-        nombre = s(
+            or ""
+        ).strip()
+        nombre = (
             r.get("Nombre")
             or r.get("Nombre y apellido")
             or r.get("Apellido y nombre")
             or r.get("Empleado")
             or r.get("Persona")
             or r.get("nombre")
+            or ""
         )
-        if archivo_norm and nombre and archivo_norm not in nombre_por_cuil:
-            nombre_por_cuil[archivo_norm] = nombre
+        if archivo_norm and nombre and archivo_norm not in cuil_to_name:
+            cuil_to_name[archivo_norm] = str(nombre).strip()
 
     conn = get_db_connection()
     conn.row_factory = sqlite3.Row
     cur = conn.cursor()
 
-    # =========================
-    # Identidades verificadas: cantidad total
-    # =========================
+    # Contador de identidades
     try:
         cur.execute("SELECT COUNT(*) AS c FROM identity_verification;")
         row = cur.fetchone()
@@ -3691,44 +3613,7 @@ def admin_panel():
     except Exception:
         identity_count = 0
 
-    # =========================
-    # Identidades verificadas: últimos 50 (con filtro opcional)
-    # =========================
-    identity_q = request.args.get("identity_q", "") or ""
-    identity_q_like = f"%{identity_q}%" if identity_q else None
-
-    if identity_q_like:
-        cur.execute(
-            """
-            SELECT archivo_norm, dni, to_whatsapp,
-                   datetime(verified_at, 'unixepoch', 'localtime') AS verified_at_local,
-                   source
-            FROM identity_verification
-            WHERE archivo_norm LIKE ?
-               OR dni LIKE ?
-               OR to_whatsapp LIKE ?
-               OR source LIKE ?
-            ORDER BY verified_at DESC
-            LIMIT 50;
-            """,
-            (identity_q_like, identity_q_like, identity_q_like, identity_q_like),
-        )
-    else:
-        cur.execute(
-            """
-            SELECT archivo_norm, dni, to_whatsapp,
-                   datetime(verified_at, 'unixepoch', 'localtime') AS verified_at_local,
-                   source
-            FROM identity_verification
-            ORDER BY verified_at DESC
-            LIMIT 50;
-            """
-        )
-    identity_rows = cur.fetchall()
-
-    # =========================
     # Últimos jobs de cola
-    # =========================
     try:
         cur.execute(
             """
@@ -3742,6 +3627,20 @@ def admin_panel():
         jobs = cur.fetchall()
     except Exception:
         jobs = []
+
+    # Identidades verificadas (últimas 200)
+    cur.execute(
+        """
+        SELECT archivo_norm, dni, to_whatsapp,
+               datetime(verified_at, 'unixepoch', 'localtime') AS verified_at_local,
+               verified_at,
+               source
+        FROM identity_verification
+        ORDER BY verified_at DESC
+        LIMIT 200;
+        """
+    )
+    identity_rows = cur.fetchall()
 
     conn.close()
 
@@ -3927,22 +3826,20 @@ def admin_panel():
       .btn-primary:hover {
         filter: brightness(1.05);
       }
-
-      .btn-secondary {
-        margin-top: 10px;
+      .btn-danger {
+        margin-top: 6px;
         padding: 6px 12px;
         border-radius: 999px;
-        border: 1px solid #374151;
+        border: none;
         cursor: pointer;
         font-size: 12px;
         font-weight: 500;
-        background: #020617;
-        color: var(--text-main);
+        background: var(--danger-soft);
+        color: var(--danger);
       }
-      .btn-secondary:hover {
-        background: #111827;
+      .btn-danger:hover {
+        filter: brightness(1.05);
       }
-
       .btn-link {
         background: none;
         border: none;
@@ -3967,6 +3864,7 @@ def admin_panel():
         color: var(--text-muted);
         font-weight: 500;
         background: rgba(15, 23, 42, 0.7);
+        cursor: default;
       }
       tr:hover td {
         background: rgba(15, 23, 42, 0.7);
@@ -4012,13 +3910,6 @@ def admin_panel():
         grid-template-columns: minmax(0, 1.4fr) minmax(0, 1fr);
         gap: 16px;
       }
-      .scroll-table {
-        max-height: 260px;
-        overflow-y: auto;
-        border-radius: 10px;
-        border: 1px solid #1f2937;
-        margin-top: 8px;
-      }
       @media (max-width: 800px) {
         .grid-summary {
           grid-template-columns: 1fr;
@@ -4026,6 +3917,21 @@ def admin_panel():
         .two-cols {
           grid-template-columns: 1fr;
         }
+      }
+
+      .identities-table-wrapper {
+        margin-top: 8px;
+        max-height: 260px;
+        overflow-y: auto;
+        border-radius: 10px;
+        border: 1px solid #111827;
+      }
+      .sortable {
+        cursor: pointer;
+      }
+      .sortable span {
+        font-size: 10px;
+        opacity: 0.6;
       }
     </style>
     """)
@@ -4042,7 +3948,7 @@ def admin_panel():
     html.append("<div class='topbar-meta'>Gestioná envíos, verificaciones y reportes desde un solo lugar.</div>")
     html.append("</div>")
     html.append("<div class='topbar-meta'>")
-    html.append("Acceso con token: <code>%s</code>" % (token or "—"))
+    html.append("Acceso con token: <code>%s</code>" % (esc_html(token) if token else "—"))
     html.append("</div>")
     html.append("</div>")
 
@@ -4064,19 +3970,19 @@ def admin_panel():
     html.append("<h2>Último job de cola</h2>")
     if jobs:
         last = jobs[0]
-        html.append(f"<div class='card-main mono'>{last['period_label']}</div>")
-        html.append(f"<div class='card-sub'>estado: {last['status']}, enviados: {last['total_sent']}</div>")
+        html.append(f"<div class='card-main mono'>{esc_html(last['period_label'] or '')}</div>")
+        html.append(f"<div class='card-sub'>estado: {esc_html(last['status'] or '')}, enviados: {last['total_sent']}</div>")
     else:
         html.append("<div class='card-main'>—</div>")
         html.append("<div class='card-sub'>Aún no se registran envíos en cola.</div>")
     html.append("</div>")
     html.append("</div>")  # grid-summary
 
-    # SECCIÓN: Cola de envíos
+    # SECCIÓN: Cola de envíos (PDF requerido siempre)
     html.append("<div class='section'>")
     html.append("<div class='section-header'>")
     html.append("<div class='section-title'>Cola de envíos masivos</div>")
-    html.append("<div class='section-sub'>Creá jobs en cola y revisá su estado. (Siempre requiere PDF existente).</div>")
+    html.append("<div class='section-sub'>Creá jobs en cola y revisá su estado. Siempre requiere PDF existente.</div>")
     html.append("</div>")
 
     html.append("<div class='two-cols'>")
@@ -4086,18 +3992,13 @@ def admin_panel():
     html.append("<div class='small'>Este formulario usa la misma lógica que <code>/admin/send_template_queue_start</code>.</div>")
     html.append("<form method='post' action='/admin/send_template_queue_start'>")
     if token:
-        html.append(f"<input type='hidden' name='token' value='{token}'>")
+        html.append(f"<input type='hidden' name='token' value='{esc_html(token)}'>")
     html.append("<label>Período (mm-aaaa o mm/aaaa)<br>")
     html.append("<input type='text' name='period' placeholder='12-2025'></label>")
     html.append("<label>Límite de envíos (0 = todos)<br>")
     html.append("<input type='number' name='limit' min='0' value='0'></label>")
-
-    # Forzar require_pdf = true
-    html.append("<div class='checkbox-row'>")
-    html.append("<input type='checkbox' name='require_pdf' value='true' id='chk_pdf' checked disabled>")
-    html.append("<label for='chk_pdf' style='margin-top:0'>Requerir PDF existente para encolar (forzado)</label>")
-    html.append("</div>")
-
+    # Forzamos require_pdf=true
+    html.append("<input type='hidden' name='require_pdf' value='true'>")
     html.append("<button type='submit' class='btn-primary'>Encolar envío masivo</button>")
     html.append("</form>")
     html.append("<p class='small'>Luego podés consultar el progreso con <code>/admin/send_template_queue_status/&lt;job_id&gt;</code> o desde los jobs listados a la derecha.</p>")
@@ -4106,10 +4007,9 @@ def admin_panel():
     # Columna derecha: tabla de jobs
     html.append("<div>")
     html.append("<div class='section-sub'>Últimos 10 jobs</div>")
-    html.append("<div class='scroll-table'>")
     html.append("<table>")
-    html.append("<thead><tr><th>Job ID</th><th>Período</th><th>Estado</th>"
-                "<th>Encolados</th><th>Enviados</th><th>Fallidos</th><th>Creado</th></tr></thead><tbody>")
+    html.append("<tr><th>Job ID</th><th>Período</th><th>Estado</th>"
+                "<th>Encolados</th><th>Enviados</th><th>Fallidos</th><th>Creado</th></tr>")
     for j in jobs:
         status = (j["status"] or "").upper()
         cls = "pending"
@@ -4120,18 +4020,17 @@ def admin_panel():
         elif status == "STOPPED":
             cls = "stopped"
         html.append("<tr>")
-        html.append(f"<td class='mono'>{j['job_id'][:8]}…</td>")
-        html.append(f"<td class='mono'>{j['period_label']}</td>")
-        html.append(f"<td><span class='badge-status {cls}'>{status}</span></td>")
+        html.append(f"<td class='mono'>{esc_html(j['job_id'][:8])}…</td>")
+        html.append(f"<td class='mono'>{esc_html(j['period_label'] or '')}</td>")
+        html.append(f"<td><span class='badge-status {cls}'>{esc_html(status)}</span></td>")
         html.append(f"<td>{j['total_enqueued']}</td>")
         html.append(f"<td>{j['total_sent']}</td>")
         html.append(f"<td>{j['total_failed']}</td>")
-        html.append(f"<td class='mono'>{fmt_ts(j['created_at'])}</td>")
+        html.append(f"<td class='mono'>{esc_html(fmt_ts(j['created_at']))}</td>")
         html.append("</tr>")
     if not jobs:
         html.append("<tr><td colspan='7' class='small'>No hay jobs todavía.</td></tr>")
-    html.append("</tbody></table>")
-    html.append("</div>")  # scroll-table
+    html.append("</table>")
     html.append("</div>")  # columna derecha
 
     html.append("</div>")  # two-cols
@@ -4147,27 +4046,26 @@ def admin_panel():
     if token:
         html.append("<div class='links-inline'>")
         html.append(
-            f"<a href='/admin/report_recibos.xlsx?token={token}' target='_blank'>📄 Descargar reporte de recibos (Excel)</a>"
+            f"<a href='/admin/report_recibos.xlsx?token={esc_html(token)}' target='_blank'>📄 Descargar reporte de recibos (Excel)</a>"
         )
         html.append(
-            f"<a href='/admin/report_identity_verification.csv?token={token}' target='_blank'>🧩 Identidades verificadas (CSV)</a>"
+            f"<a href='/admin/report_identity_verification.csv?token={esc_html(token)}' target='_blank'>🧩 Identidades verificadas (CSV)</a>"
         )
         html.append("</div>")
     else:
         html.append("<p class='small'>Agregá <code>?token=TU_TOKEN</code> a la URL para habilitar los links directos de descarga.</p>")
     html.append("</div>")
 
-    # SECCIÓN: Verificación manual + carga masiva
+    # SECCIÓN: Verificación manual
     html.append("<div class='section'>")
     html.append("<div class='section-header'>")
     html.append("<div class='section-title'>Verificación manual de identidad</div>")
     html.append("<div class='section-sub'>Marcá un CUIL + DNI como verificado sin pasar por el chat.</div>")
     html.append("</div>")
 
-    # Verificación manual
     html.append("<form method='post' action='/admin/verify_person'>")
     if token:
-        html.append(f"<input type='hidden' name='token' value='{token}'>")
+        html.append(f"<input type='hidden' name='token' value='{esc_html(token)}'>")
     html.append("<label>CUIL (archivo_norm)<br>"
                 "<input type='text' name='archivo_norm' placeholder='20-XXXXXXXX-X'></label>")
     html.append("<label>DNI<br>"
@@ -4175,105 +4073,104 @@ def admin_panel():
     html.append("<button type='submit' class='btn-primary'>Marcar como verificado (manual)</button>")
     html.append("</form>")
     html.append("<p class='small'>El sistema buscará el número de WhatsApp en el Excel de envíos y guardará la identidad en la tabla <code>identity_verification</code>.</p>")
+    html.append("</div>")
 
-    # Carga masiva
-    html.append("<hr style='border:none; border-top:1px solid #1f2937; margin:14px 0;'>")
-    html.append("<div class='section-sub'>Carga masiva desde Excel</div>")
-    html.append("<p class='small'>Subí un Excel o CSV con columnas como <code>Archivo_norm / CUIL</code> y <code>Dni</code>. "
-                "Opcionalmente podés incluir <code>Telefono</code> y <code>Nombre</code>. "
-                "Se registrarán/actualizarán las identidades como verificadas (origen: <b>bulk_upload</b>).</p>")
-
-    html.append("<form method='post' action='/admin/identity_upload' enctype='multipart/form-data'>")
-    if token:
-        html.append(f"<input type='hidden' name='token' value='{token}'>")
-    html.append("<label>Archivo (Excel .xlsx o CSV)<br>"
-                "<input type='file' name='file' accept='.xlsx,.xls,.csv' style='border:none; padding:4px 0;'></label>")
-    html.append("<button type='submit' class='btn-secondary'>Subir identidades validadas</button>")
-    html.append("</form>")
-
-    html.append("</div>")  # sección verificación
-
-    # SECCIÓN: Identidades verificadas (tabla con scroll, búsqueda y selección múltiple)
+    # SECCIÓN: Identidades verificadas (tabla + búsqueda + bulk)
     html.append("<div class='section'>")
     html.append("<div class='section-header'>")
     html.append("<div class='section-title'>Identidades verificadas</div>")
-    html.append("<div class='section-sub'>Ver, filtrar y operar sobre CUIL + DNI verificados.</div>")
+    html.append("<div class='section-sub'>Listado de CUIL + DNI con WhatsApp confirmado.</div>")
     html.append("</div>")
 
-    # Buscador
-    html.append("<div style='display:flex; align-items:center; gap:8px; justify-content:space-between;'>")
-    html.append("<div>")
-    html.append("<label>Búsqueda rápida<br>")
-    html.append(f"<input type='search' id='identityFilter' placeholder='Filtrar por nombre, CUIL, DNI, WhatsApp…' value='{esc_html(identity_q)}'></label>")
-    html.append("</div>")
-    html.append("<div class='small'>Mostrando hasta 50 registros más recientes.</div>")
-    html.append("</div>")
-
-    # Formulario bulk
+    # Form bulk delete
     html.append("<form method='post' action='/admin/identity_verification/bulk' id='identityBulkForm'>")
     if token:
-        html.append(f"<input type='hidden' name='token' value='{token}'>")
-    html.append("<input type='hidden' name='action' id='identityBulkAction' value=''>")
+        html.append(f"<input type='hidden' name='token' value='{esc_html(token)}'>")
 
-    # Contenedor con scroll
-    html.append("<div class='scroll-table'>")
-    html.append("<table>")
-    html.append(
-        "<thead><tr>"
-        "<th><input type='checkbox' onclick='toggleIdentitySelectAll(this)'></th>"
-        "<th>Nombre</th>"
-        "<th>CUIL</th>"
-        "<th>DNI</th>"
-        "<th>WhatsApp</th>"
-        "<th>Verificado</th>"
-        "<th>Origen</th>"
-        "</tr></thead><tbody>"
-    )
+    # Buscador en vivo
+    html.append("<label>Buscar<br>")
+    html.append("<input type='search' id='identityFilter' placeholder='Filtrar por nombre, CUIL, DNI, WhatsApp…'></label>")
 
-    for r in identity_rows:
-        archivo_norm = r["archivo_norm"] or ""
-        dni = r["dni"] or ""
-        tw = r["to_whatsapp"] or ""
-        verif = r["verified_at_local"] or ""
-        source = r["source"] or ""
+    # Acciones sobre seleccionados
+    html.append("<div class='checkbox-row' style='justify-content: space-between; margin-top: 10px;'>")
+    html.append("<span class='small'>Seleccioná con el check de la izquierda y aplicá acciones masivas.</span>")
+    html.append("<button type='submit' class='btn-danger' name='bulk_action' value='delete' onclick='return confirm(\"¿Eliminar identidades seleccionadas?\");'>Eliminar seleccionados</button>")
+    html.append("</div>")
 
-        display_name = nombre_por_cuil.get(archivo_norm, "")
+    # Tabla con scroll
+    html.append("<div class='identities-table-wrapper'>")
+    html.append("<table id='identityTable'>")
+    html.append("<thead><tr>")
+    html.append("<th><input type='checkbox' id='identitySelectAll'></th>")
+    html.append("<th class='sortable' data-sort='name'>Nombre <span>⇵</span></th>")
+    html.append("<th>CUIL</th>")
+    html.append("<th class='sortable' data-sort='dni'>DNI <span>⇵</span></th>")
+    html.append("<th>WhatsApp</th>")
+    html.append("<th>Verificado</th>")
+    html.append("<th>Origen</th>")
+    html.append("</tr></thead>")
+    html.append("<tbody>")
 
-        value = f"{archivo_norm}|{dni}"
+    for row in identity_rows:
+        archivo_norm = row["archivo_norm"]
+        dni = row["dni"]
+        to_whatsapp = row["to_whatsapp"]
+        verified_at_local = row["verified_at_local"]
+        source = row["source"]
+        nombre = cuil_to_name.get(archivo_norm, "")
+
+        search_text = f"{nombre} {archivo_norm} {dni} {to_whatsapp}".lower()
+
         html.append(
-            f"<tr class='identity-row' "
-            f"data-nombre='{esc_html(display_name)}' "
-            f"data-archivo='{esc_html(archivo_norm)}' "
-            f"data-dni='{esc_html(dni)}' "
-            f"data-whatsapp='{esc_html(tw)}' "
-            f"data-source='{esc_html(source)}'>"
+            "<tr data-name='{name}' data-dni='{dni}' data-search='{search}'>".format(
+                name=esc_html(nombre),
+                dni=esc_html(dni),
+                search=esc_html(search_text),
+            )
         )
-        html.append(f"<td><input type='checkbox' class='chk-identity' name='selected' value='{esc_html(value)}'></td>")
-        html.append(f"<td>{esc_html(display_name)}</td>")
+        html.append(
+            "<td><input type='checkbox' name='ids' value='{cuil}'></td>".format(
+                cuil=esc_html(archivo_norm)
+            )
+        )
+        html.append(f"<td>{esc_html(nombre)}</td>")
         html.append(f"<td class='mono'>{esc_html(archivo_norm)}</td>")
         html.append(f"<td class='mono'>{esc_html(dni)}</td>")
-        html.append(f"<td class='mono'>{esc_html(tw)}</td>")
-        html.append(f"<td class='mono'>{esc_html(verif)}</td>")
-        html.append(f"<td class='mono'>{esc_html(source)}</td>")
+        html.append(f"<td class='mono'>{esc_html(to_whatsapp)}</td>")
+        html.append(f"<td class='mono'>{esc_html(verified_at_local or '')}</td>")
+        html.append(f"<td class='mono'>{esc_html(source or '')}</td>")
         html.append("</tr>")
 
     if not identity_rows:
-        html.append("<tr><td colspan='7' class='small'>No hay identidades verificadas todavía.</td></tr>")
+        html.append("<tr><td colspan='7' class='small'>Todavía no hay identidades verificadas.</td></tr>")
 
     html.append("</tbody></table>")
-    html.append("</div>")  # scroll-table
+    html.append("</div>")  # identities-table-wrapper
+    html.append("</form>")  # identityBulkForm
 
-    # Botones bulk
-    html.append("<div style='margin-top:8px; display:flex; gap:8px; align-items:center;'>")
-    html.append("<button type='button' class='btn-secondary' onclick=\"submitIdentityBulk('delete')\">Eliminar seleccionados</button>")
-    html.append("<button type='button' class='btn-secondary' onclick=\"submitIdentityBulk('send_template')\">Enviar plantilla a seleccionados</button>")
-    html.append("<span class='small'>Las operaciones se aplican sólo a las filas marcadas.</span>")
+    # SECCIÓN: Subir Excel/CSV de identidades
+    html.append("<div style='margin-top: 12px;'>")
+    html.append("<div class='section-sub'>Carga masiva de identidades verificadas (CUIL + DNI + WhatsApp).</div>")
+    html.append("<form method='post' action='/admin/identity_verification/upload' enctype='multipart/form-data'>")
+    if token:
+        html.append(f"<input type='hidden' name='token' value='{esc_html(token)}'>")
+    html.append("<label>Archivo (CSV o Excel)<br>")
+    html.append("<input type='file' name='file' accept='.csv,.xlsx,.xls' style='margin-top:6px;'></label><br>")
+    html.append("<button type='submit' class='btn-primary'>Subir identidades</button>")
+    if token:
+        html.append(
+            f" <span class='small' style='margin-left:8px;'>O descargá un <a href='/admin/identity_template.csv?token={esc_html(token)}' target='_blank'>template CSV de ejemplo</a>.</span>"
+        )
+    else:
+        html.append(
+            " <span class='small'>Agregá <code>?token=TU_TOKEN</code> a la URL para habilitar el link de template.</span>"
+        )
+    html.append("</form>")
     html.append("</div>")
 
-    html.append("</form>")  # identityBulkForm
-    html.append("</div>")   # sección identidades
+    html.append("</div>")  # sección identidades
 
-    # SECCIÓN: Preview Excel de envíos
+    # SECCIÓN: Preview del Excel de envíos
     html.append("<div class='section'>")
     html.append("<div class='section-header'>")
     html.append("<div class='section-title'>Preview del Excel de envíos</div>")
@@ -4281,60 +4178,76 @@ def admin_panel():
     html.append("</div>")
     if envios_sample:
         cols = list(envios_sample[0].keys())
-        html.append("<div class='scroll-table' style='max-height:200px;'>")
         html.append("<table>")
-        html.append("<thead><tr>" + "".join(f"<th>{esc_html(c)}</th>" for c in cols) + "</tr></thead><tbody>")
+        html.append("<tr>" + "".join(f"<th>{esc_html(c)}</th>" for c in cols) + "</tr>")
         for r in envios_sample:
-            html.append("<tr>" + "".join(f"<td>{esc_html(str(r.get(c, '')))}</td>" for c in cols) + "</tr>")
-        html.append("</tbody></table>")
-        html.append("</div>")
+            html.append("<tr>" + "".join(f"<td>{esc_html(r.get(c, ''))}</td>" for c in cols) + "</tr>")
+        html.append("</table>")
     else:
         html.append("<p class='small'>No se pudo leer el archivo de envíos o está vacío.</p>")
     html.append("</div>")
 
-    # JS
+    # Script para búsqueda y orden
     html.append("""
     <script>
-      function toggleIdentitySelectAll(master) {
-        var checks = document.querySelectorAll('.chk-identity');
-        for (var i = 0; i < checks.length; i++) {
-          checks[i].checked = master.checked;
-        }
-      }
+    (function() {
+      const table = document.getElementById('identityTable');
+      if (!table) return;
+      const tbody = table.querySelector('tbody');
+      const filterInput = document.getElementById('identityFilter');
+      const selectAll = document.getElementById('identitySelectAll');
+      const headers = table.querySelectorAll('th.sortable');
 
-      function submitIdentityBulk(actionName) {
-        var form = document.getElementById('identityBulkForm');
-        var actionField = document.getElementById('identityBulkAction');
-        actionField.value = actionName || '';
-        form.submit();
-      }
-
-      function filterIdentityTable() {
-        var q = (document.getElementById('identityFilter').value || '').toLowerCase();
-        var rows = document.querySelectorAll('.identity-row');
-        rows.forEach(function(row) {
-          var text = (
-            (row.dataset.nombre || '') + ' ' +
-            (row.dataset.archivo || '') + ' ' +
-            (row.dataset.dni || '') + ' ' +
-            (row.dataset.whatsapp || '') + ' ' +
-            (row.dataset.source || '')
-          ).toLowerCase();
-          if (!q || text.indexOf(q) !== -1) {
-            row.style.display = '';
-          } else {
-            row.style.display = 'none';
-          }
+      // Búsqueda en vivo
+      if (filterInput) {
+        filterInput.addEventListener('input', function() {
+          const q = this.value.toLowerCase().trim();
+          const rows = tbody.querySelectorAll('tr');
+          rows.forEach(row => {
+            const text = (row.getAttribute('data-search') || '').toLowerCase();
+            if (!q || text.indexOf(q) !== -1) {
+              row.style.display = '';
+            } else {
+              row.style.display = 'none';
+            }
+          });
         });
       }
 
-      document.addEventListener('DOMContentLoaded', function() {
-        var input = document.getElementById('identityFilter');
-        if (input) {
-          input.addEventListener('input', filterIdentityTable);
-          filterIdentityTable();
-        }
+      // Seleccionar todo
+      if (selectAll) {
+        selectAll.addEventListener('change', function() {
+          const checked = this.checked;
+          const checkboxes = tbody.querySelectorAll('input[type="checkbox"][name="ids"]');
+          checkboxes.forEach(chk => {
+            if (chk.closest('tr').style.display !== 'none') {
+              chk.checked = checked;
+            }
+          });
+        });
+      }
+
+      // Ordenar por nombre / dni
+      headers.forEach(th => {
+        th.addEventListener('click', function() {
+          const key = th.getAttribute('data-sort');
+          if (!key) return;
+          const current = th.getAttribute('data-dir') || 'asc';
+          const newDir = current === 'asc' ? 'desc' : 'asc';
+          th.setAttribute('data-dir', newDir);
+
+          const rows = Array.from(tbody.querySelectorAll('tr'));
+          rows.sort((a, b) => {
+            const av = (a.getAttribute('data-' + key) || '').toLowerCase();
+            const bv = (b.getAttribute('data-' + key) || '').toLowerCase();
+            if (av < bv) return newDir === 'asc' ? -1 : 1;
+            if (av > bv) return newDir === 'asc' ? 1 : -1;
+            return 0;
+          });
+          rows.forEach(r => tbody.appendChild(r));
+        });
       });
+    })();
     </script>
     """)
 
