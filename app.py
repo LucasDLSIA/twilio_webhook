@@ -3623,6 +3623,18 @@ def admin_identity_upload():
         return redirect(f"/admin/panel?token={token}&{msg}")
     return redirect(f"/admin/panel?{msg}")
 
+def esc_html(s):
+    if s is None:
+        return ""
+    return (
+        str(s)
+        .replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+        .replace('"', "&quot;")
+        .replace("'", "&#39;")
+    )
+
 
 @app.route("/admin/panel", methods=["GET"])
 @admin_required
