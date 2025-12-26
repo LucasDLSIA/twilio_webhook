@@ -3472,6 +3472,156 @@ def admin_identity_verification_bulk():
         conn.close()
         return redirect(f"/admin/panel?token={token}&msg=unknown_action")
 
+@app.route("/admin/identity_upload", methods=["POST"])
+@admin_required
+def admin_identity_upload():
+    """
+    Carga masiva de identidades verificadas desde un Excel/CSV.
+    Columnas aceptadas (cualquier combinación):
+      - CUIL: Archivo_norm, archivo_norm, CUIL, Cuil
+      - DNI: Dni, DNI
+      - Teléfono: Telefono, Teléfono, Telefono_norm, telefono_norm
+      - Nombre: Nombre, Nombre y apellido, Apellido y nombre, nombre
+    """
+    file = request.files.get("file")
+    token = _get_admin_token_from_request()
+
+    if not file or file.filename == "":
+        return "No se recibió archivo", 400
+
+    filename = file.filename.lower()
+
+    # Guardamos temporalmente
+    import tempfile
+    import pandas as pd
+
+    with tempfile.NamedTemporaryFile(delete=False) as tmp:
+        file.save(tmp.name)
+        tmp_path = tmp.name
+
+    # Detectar tipo
+    try:
+        if filename.endswith(".csv"):
+            df = pd.read_csv(tmp_path, dtype=str)
+        else:
+            df = pd.read_excel(tmp_path, dtype=str)
+    except Exception as e:
+        return f"Error leyendo el archivo: {e}", 400
+
+    df = df.fillna("")
+
+    conn = get_db_connection()
+    cur = conn.cursor()
+
+    inserted = 0
+    updated = 0
+    skipped = 0
+
+    for _, row in df.iterrows():
+        # CUIL
+        archivo_norm = s(
+            row.get("Archivo_norm", "")
+            or row.get("archivo_norm", "")
+            or row.get("Archivo", "")
+            or row.get("archivo", "")
+            or row.get("CUIL", "")
+            or row.get("Cuil", "")
+        )
+        # DNI (solo dígitos)
+        dni_raw = s(row.get("Dni", "") or row.get("DNI", ""))
+        dni = "".join(ch for ch in dni_raw if ch.isdigit())
+
+        # Nombre (opcional, sólo lo usamos para buscar teléfono si quisiéramos más adelante;
+        # acá lo ignoramos salvo que lo uses para algo más)
+        nombre = s(
+            row.get("Nombre", "")
+            or row.get("Nombre y apellido", "")
+            or row.get("Apellido y nombre", "")
+            or row.get("nombre", "")
+        )
+
+        # Teléfono (opcional)
+        telefono_raw = s(
+            row.get("Telefono", "")
+            or row.get("Teléfono", "")
+            or row.get("Telefono_norm", "")
+            or row.get("telefono_norm", "")
+        )
+        to_whatsapp = ""
+        if telefono_raw:
+            try:
+                to_whatsapp = normalize_to_whatsapp_e164(telefono_raw)
+            except Exception:
+                to_whatsapp = ""
+
+        # Si no hay CUIL o DNI, no podemos verificar identidad
+        if not archivo_norm or not dni:
+            skipped += 1
+            continue
+
+        # Si no vino teléfono en el Excel, intentamos buscarlo en el Excel de envíos
+        if not to_whatsapp:
+            try:
+                envios_rows = read_envios_rows()
+            except Exception:
+                envios_rows = []
+            for r in envios_rows:
+                arch_r = s(
+                    r.get("Archivo_norm")
+                    or r.get("archivo_norm")
+                    or r.get("Archivo")
+                    or r.get("archivo")
+                    or r.get("CUIL")
+                    or r.get("Cuil")
+                )
+                if arch_r == archivo_norm:
+                    tel_r = s(
+                        r.get("Telefono_norm")
+                        or r.get("telefono_norm")
+                        or r.get("Telefono")
+                        or r.get("Teléfono")
+                    )
+                    if tel_r:
+                        try:
+                            to_whatsapp = normalize_to_whatsapp_e164(tel_r)
+                        except Exception:
+                            to_whatsapp = ""
+                    break
+
+        # Último fallback: si no hay teléfono, ponemos string vacío.
+        # La tabla exige NOT NULL, así que usamos algo genérico:
+        if not to_whatsapp:
+            to_whatsapp = "whatsapp:+00000000000"
+
+        # Insert / update
+        try:
+            cur.execute(
+                """
+                INSERT INTO identity_verification (archivo_norm, dni, to_whatsapp, verified_at, source)
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(archivo_norm)
+                DO UPDATE SET
+                    dni = excluded.dni,
+                    to_whatsapp = excluded.to_whatsapp,
+                    verified_at = excluded.verified_at,
+                    source = excluded.source;
+                """,
+                (archivo_norm, dni, to_whatsapp, int(time.time()), "bulk_upload"),
+            )
+            if cur.rowcount == 1:
+                # Puede ser insert o update según SQLite, pero para llevar un conteo simple:
+                inserted += 1
+        except Exception:
+            skipped += 1
+
+    conn.commit()
+    conn.close()
+
+    # Volvemos al panel con un mensajito simple en query string
+    msg = f"bulk_ok=1&ins={inserted}&skip={skipped}"
+    if token:
+        return redirect(f"/admin/panel?token={token}&{msg}")
+    return redirect(f"/admin/panel?{msg}")
 
 
 @app.route("/admin/panel", methods=["GET"])
@@ -3484,10 +3634,8 @@ def admin_panel():
     token = _get_admin_token_from_request()
 
     # =========================
-    # Datos base
+    # Datos base: Excel de envíos
     # =========================
-    identity_q = (request.args.get("identity_q") or "").strip()
-
     try:
         envios_rows = read_envios_rows()
     except Exception:
@@ -3495,11 +3643,35 @@ def admin_panel():
     envios_count = len(envios_rows)
     envios_sample = envios_rows[:10]
 
+    # Mapa auxiliar: CUIL (archivo_norm) -> Nombre
+    nombre_por_cuil: dict[str, str] = {}
+    for r in envios_rows:
+        archivo_norm = s(
+            r.get("Archivo_norm")
+            or r.get("archivo_norm")
+            or r.get("Archivo")
+            or r.get("archivo")
+            or r.get("CUIL")
+            or r.get("Cuil")
+        )
+        nombre = s(
+            r.get("Nombre")
+            or r.get("Nombre y apellido")
+            or r.get("Apellido y nombre")
+            or r.get("Empleado")
+            or r.get("Persona")
+            or r.get("nombre")
+        )
+        if archivo_norm and nombre and archivo_norm not in nombre_por_cuil:
+            nombre_por_cuil[archivo_norm] = nombre
+
     conn = get_db_connection()
     conn.row_factory = sqlite3.Row
     cur = conn.cursor()
 
-    # Conteo identidades verificadas
+    # =========================
+    # Identidades verificadas: cantidad total
+    # =========================
     try:
         cur.execute("SELECT COUNT(*) AS c FROM identity_verification;")
         row = cur.fetchone()
@@ -3507,20 +3679,44 @@ def admin_panel():
     except Exception:
         identity_count = 0
 
-    # Lista identidades verificadas (sin filtro SQL, se filtra en el front)
-    cur.execute(
-        """
-        SELECT archivo_norm, dni, to_whatsapp,
-               datetime(verified_at, 'unixepoch', 'localtime') AS verified_at_local,
-               source
-        FROM identity_verification
-        ORDER BY verified_at DESC
-        LIMIT 200;
-        """
-    )
+    # =========================
+    # Identidades verificadas: últimos 50 (con filtro opcional)
+    # =========================
+    identity_q = request.args.get("identity_q", "") or ""
+    identity_q_like = f"%{identity_q}%" if identity_q else None
+
+    if identity_q_like:
+        cur.execute(
+            """
+            SELECT archivo_norm, dni, to_whatsapp,
+                   datetime(verified_at, 'unixepoch', 'localtime') AS verified_at_local,
+                   source
+            FROM identity_verification
+            WHERE archivo_norm LIKE ?
+               OR dni LIKE ?
+               OR to_whatsapp LIKE ?
+               OR source LIKE ?
+            ORDER BY verified_at DESC
+            LIMIT 50;
+            """,
+            (identity_q_like, identity_q_like, identity_q_like, identity_q_like),
+        )
+    else:
+        cur.execute(
+            """
+            SELECT archivo_norm, dni, to_whatsapp,
+                   datetime(verified_at, 'unixepoch', 'localtime') AS verified_at_local,
+                   source
+            FROM identity_verification
+            ORDER BY verified_at DESC
+            LIMIT 50;
+            """
+        )
     identity_rows = cur.fetchall()
 
+    # =========================
     # Últimos jobs de cola
+    # =========================
     try:
         cur.execute(
             """
@@ -3544,8 +3740,6 @@ def admin_panel():
             return datetime.fromtimestamp(int(ts)).strftime("%Y-%m-%d %H:%M:%S")
         except Exception:
             return str(ts)
-
-    identity_q_html = esc_html(identity_q)
 
     # =========================
     # HTML
@@ -3647,6 +3841,7 @@ def admin_panel():
         color: var(--text-muted);
         margin-top: 2px;
       }
+
       .section {
         margin-top: 20px;
         padding: 14px 16px 16px;
@@ -3668,6 +3863,7 @@ def admin_panel():
         font-size: 12px;
         color: var(--text-muted);
       }
+
       form {
         margin-top: 4px;
       }
@@ -3678,7 +3874,8 @@ def admin_panel():
         margin-top: 6px;
       }
       input[type='text'],
-      input[type='number'] {
+      input[type='number'],
+      input[type='search'] {
         margin-top: 3px;
         padding: 6px 8px;
         width: 220px;
@@ -3718,21 +3915,31 @@ def admin_panel():
       .btn-primary:hover {
         filter: brightness(1.05);
       }
+
       .btn-secondary {
-        margin-top: 8px;
+        margin-top: 10px;
         padding: 6px 12px;
         border-radius: 999px;
         border: 1px solid #374151;
+        cursor: pointer;
+        font-size: 12px;
+        font-weight: 500;
         background: #020617;
         color: var(--text-main);
+      }
+      .btn-secondary:hover {
+        background: #111827;
+      }
+
+      .btn-link {
+        background: none;
+        border: none;
+        color: var(--accent);
         font-size: 12px;
+        padding: 0;
         cursor: pointer;
       }
-      .btn-secondary.danger {
-        border-color: var(--danger);
-        color: var(--danger);
-        background: var(--danger-soft);
-      }
+
       table {
         width: 100%;
         border-collapse: collapse;
@@ -3793,26 +4000,11 @@ def admin_panel():
         grid-template-columns: minmax(0, 1.4fr) minmax(0, 1fr);
         gap: 16px;
       }
-      .table-scroll {
+      .scroll-table {
         max-height: 260px;
         overflow-y: auto;
         border-radius: 10px;
         border: 1px solid #1f2937;
-        margin-top: 6px;
-      }
-      .table-scroll table {
-        margin-top: 0;
-      }
-      .sticky-header thead th {
-        position: sticky;
-        top: 0;
-        z-index: 1;
-      }
-      .actions-row {
-        display: flex;
-        flex-wrap: wrap;
-        gap: 8px;
-        align-items: center;
         margin-top: 8px;
       }
       @media (max-width: 800px) {
@@ -3821,9 +4013,6 @@ def admin_panel():
         }
         .two-cols {
           grid-template-columns: 1fr;
-        }
-        .table-scroll {
-          max-height: 220px;
         }
       }
     </style>
@@ -3847,19 +4036,18 @@ def admin_panel():
 
     # Summary cards
     html.append("<div class='grid-summary'>")
-    # Excel envíos
     html.append("<div class='card'>")
     html.append("<h2>Excel de envíos</h2>")
     html.append(f"<div class='card-main'>{envios_count}</div>")
     html.append("<div class='card-sub'>filas detectadas en el archivo de envíos</div>")
     html.append("</div>")
-    # Identidades verificadas
+
     html.append("<div class='card'>")
     html.append("<h2>Identidades verificadas</h2>")
     html.append(f"<div class='card-main'>{identity_count}</div>")
     html.append("<div class='card-sub'>CUIL + DNI ya confirmados</div>")
     html.append("</div>")
-    # Último job
+
     html.append("<div class='card'>")
     html.append("<h2>Último job de cola</h2>")
     if jobs:
@@ -3876,14 +4064,14 @@ def admin_panel():
     html.append("<div class='section'>")
     html.append("<div class='section-header'>")
     html.append("<div class='section-title'>Cola de envíos masivos</div>")
-    html.append("<div class='section-sub'>Crea jobs en cola y revisá su estado (siempre con PDF disponible).</div>")
+    html.append("<div class='section-sub'>Creá jobs en cola y revisá su estado. (Siempre requiere PDF existente).</div>")
     html.append("</div>")
 
     html.append("<div class='two-cols'>")
 
     # Columna izquierda: formulario
     html.append("<div>")
-    html.append("<div class='small'>Este formulario usa la misma lógica que <code>/admin/send_template_queue_start</code>. Siempre requiere PDF existente.</div>")
+    html.append("<div class='small'>Este formulario usa la misma lógica que <code>/admin/send_template_queue_start</code>.</div>")
     html.append("<form method='post' action='/admin/send_template_queue_start'>")
     if token:
         html.append(f"<input type='hidden' name='token' value='{token}'>")
@@ -3891,8 +4079,13 @@ def admin_panel():
     html.append("<input type='text' name='period' placeholder='12-2025'></label>")
     html.append("<label>Límite de envíos (0 = todos)<br>")
     html.append("<input type='number' name='limit' min='0' value='0'></label>")
-    # Forzamos require_pdf=true como hidden
-    html.append("<input type='hidden' name='require_pdf' value='true'>")
+
+    # Forzar require_pdf = true
+    html.append("<div class='checkbox-row'>")
+    html.append("<input type='checkbox' name='require_pdf' value='true' id='chk_pdf' checked disabled>")
+    html.append("<label for='chk_pdf' style='margin-top:0'>Requerir PDF existente para encolar (forzado)</label>")
+    html.append("</div>")
+
     html.append("<button type='submit' class='btn-primary'>Encolar envío masivo</button>")
     html.append("</form>")
     html.append("<p class='small'>Luego podés consultar el progreso con <code>/admin/send_template_queue_status/&lt;job_id&gt;</code> o desde los jobs listados a la derecha.</p>")
@@ -3901,7 +4094,7 @@ def admin_panel():
     # Columna derecha: tabla de jobs
     html.append("<div>")
     html.append("<div class='section-sub'>Últimos 10 jobs</div>")
-    html.append("<div class='table-scroll sticky-header'>")
+    html.append("<div class='scroll-table'>")
     html.append("<table>")
     html.append("<thead><tr><th>Job ID</th><th>Período</th><th>Estado</th>"
                 "<th>Encolados</th><th>Enviados</th><th>Fallidos</th><th>Creado</th></tr></thead><tbody>")
@@ -3926,7 +4119,7 @@ def admin_panel():
     if not jobs:
         html.append("<tr><td colspan='7' class='small'>No hay jobs todavía.</td></tr>")
     html.append("</tbody></table>")
-    html.append("</div>")  # table-scroll
+    html.append("</div>")  # scroll-table
     html.append("</div>")  # columna derecha
 
     html.append("</div>")  # two-cols
@@ -3938,6 +4131,7 @@ def admin_panel():
     html.append("<div class='section-title'>Reportes</div>")
     html.append("<div class='section-sub'>Descargá los datos en Excel / CSV.</div>")
     html.append("</div>")
+
     if token:
         html.append("<div class='links-inline'>")
         html.append(
@@ -3951,13 +4145,14 @@ def admin_panel():
         html.append("<p class='small'>Agregá <code>?token=TU_TOKEN</code> a la URL para habilitar los links directos de descarga.</p>")
     html.append("</div>")
 
-    # SECCIÓN: Verificación manual
+    # SECCIÓN: Verificación manual + carga masiva
     html.append("<div class='section'>")
     html.append("<div class='section-header'>")
     html.append("<div class='section-title'>Verificación manual de identidad</div>")
     html.append("<div class='section-sub'>Marcá un CUIL + DNI como verificado sin pasar por el chat.</div>")
     html.append("</div>")
 
+    # Verificación manual
     html.append("<form method='post' action='/admin/verify_person'>")
     if token:
         html.append(f"<input type='hidden' name='token' value='{token}'>")
@@ -3968,32 +4163,54 @@ def admin_panel():
     html.append("<button type='submit' class='btn-primary'>Marcar como verificado (manual)</button>")
     html.append("</form>")
     html.append("<p class='small'>El sistema buscará el número de WhatsApp en el Excel de envíos y guardará la identidad en la tabla <code>identity_verification</code>.</p>")
-    html.append("</div>")
 
-    # SECCIÓN: Identidades verificadas (lista + búsqueda + acciones masivas)
+    # Carga masiva
+    html.append("<hr style='border:none; border-top:1px solid #1f2937; margin:14px 0;'>")
+    html.append("<div class='section-sub'>Carga masiva desde Excel</div>")
+    html.append("<p class='small'>Subí un Excel o CSV con columnas como <code>Archivo_norm / CUIL</code> y <code>Dni</code>. "
+                "Opcionalmente podés incluir <code>Telefono</code> y <code>Nombre</code>. "
+                "Se registrarán/actualizarán las identidades como verificadas (origen: <b>bulk_upload</b>).</p>")
+
+    html.append("<form method='post' action='/admin/identity_upload' enctype='multipart/form-data'>")
+    if token:
+        html.append(f"<input type='hidden' name='token' value='{token}'>")
+    html.append("<label>Archivo (Excel .xlsx o CSV)<br>"
+                "<input type='file' name='file' accept='.xlsx,.xls,.csv' style='border:none; padding:4px 0;'></label>")
+    html.append("<button type='submit' class='btn-secondary'>Subir identidades validadas</button>")
+    html.append("</form>")
+
+    html.append("</div>")  # sección verificación
+
+    # SECCIÓN: Identidades verificadas (tabla con scroll, búsqueda y selección múltiple)
     html.append("<div class='section'>")
     html.append("<div class='section-header'>")
     html.append("<div class='section-title'>Identidades verificadas</div>")
-    html.append("<div class='section-sub'>Filtrá, seleccioná varias y aplicá acciones masivas.</div>")
+    html.append("<div class='section-sub'>Ver, filtrar y operar sobre CUIL + DNI verificados.</div>")
     html.append("</div>")
 
-    # Buscador en vivo
-    html.append("<label>Búsqueda rápida (CUIL, DNI, WhatsApp, origen)<br>")
-    html.append(f"<input type='text' id='identity_search' placeholder='Ej: 20-28, 28169, whatsapp:+54911…' value='{identity_q_html}' oninput='filterIdentityTable()'>")
-    html.append("</label>")
-    html.append("<p class='small'>El filtro se aplica en vivo sobre las filas de la tabla.</p>")
+    # Buscador
+    html.append("<div style='display:flex; align-items:center; gap:8px; justify-content:space-between;'>")
+    html.append("<div>")
+    html.append("<label>Búsqueda rápida<br>")
+    html.append(f"<input type='search' id='identityFilter' placeholder='Filtrar por nombre, CUIL, DNI, WhatsApp…' value='{esc_html(identity_q)}'></label>")
+    html.append("</div>")
+    html.append("<div class='small'>Mostrando hasta 50 registros más recientes.</div>")
+    html.append("</div>")
 
-    # Form bulk
-    html.append("<form method='post' action='/admin/identity_verification/bulk' onsubmit='return confirmBulkAction();'>")
+    # Formulario bulk
+    html.append("<form method='post' action='/admin/identity_verification/bulk' id='identityBulkForm'>")
     if token:
         html.append(f"<input type='hidden' name='token' value='{token}'>")
+    html.append("<input type='hidden' name='action' id='identityBulkAction' value=''>")
 
-    html.append("<div class='table-scroll sticky-header'>")
+    # Contenedor con scroll
+    html.append("<div class='scroll-table'>")
     html.append("<table>")
     html.append(
         "<thead><tr>"
         "<th><input type='checkbox' onclick='toggleIdentitySelectAll(this)'></th>"
-        "<th>CUIL (archivo_norm)</th>"
+        "<th>Nombre</th>"
+        "<th>CUIL</th>"
         "<th>DNI</th>"
         "<th>WhatsApp</th>"
         "<th>Verificado</th>"
@@ -4007,39 +4224,44 @@ def admin_panel():
         tw = r["to_whatsapp"] or ""
         verif = r["verified_at_local"] or ""
         source = r["source"] or ""
+
+        display_name = nombre_por_cuil.get(archivo_norm, "")
+
         value = f"{archivo_norm}|{dni}"
         html.append(
             f"<tr class='identity-row' "
+            f"data-nombre='{esc_html(display_name)}' "
             f"data-archivo='{esc_html(archivo_norm)}' "
             f"data-dni='{esc_html(dni)}' "
             f"data-whatsapp='{esc_html(tw)}' "
             f"data-source='{esc_html(source)}'>"
         )
         html.append(f"<td><input type='checkbox' class='chk-identity' name='selected' value='{esc_html(value)}'></td>")
+        html.append(f"<td>{esc_html(display_name)}</td>")
         html.append(f"<td class='mono'>{esc_html(archivo_norm)}</td>")
         html.append(f"<td class='mono'>{esc_html(dni)}</td>")
         html.append(f"<td class='mono'>{esc_html(tw)}</td>")
         html.append(f"<td class='mono'>{esc_html(verif)}</td>")
         html.append(f"<td class='mono'>{esc_html(source)}</td>")
         html.append("</tr>")
-    if not identity_rows:
-        html.append("<tr><td colspan='6' class='small'>No hay identidades verificadas aún.</td></tr>")
-    html.append("</tbody></table>")
-    html.append("</div>")  # table-scroll
 
-    # Acciones masivas
-    html.append("<div class='actions-row'>")
-    html.append("<span class='small'>Acción para seleccionados:</span>")
-    html.append("<button type='submit' name='action' value='send_template' class='btn-secondary'>Enviar plantilla solo a seleccionados</button>")
-    html.append("<button type='submit' name='action' value='delete' class='btn-secondary danger'>Eliminar verificación seleccionada(s)</button>")
-    html.append("<label style='margin-left:12px;'>Período para envío<br>"
-                "<input type='text' name='period' placeholder='12-2025' style='width:110px;'></label>")
+    if not identity_rows:
+        html.append("<tr><td colspan='7' class='small'>No hay identidades verificadas todavía.</td></tr>")
+
+    html.append("</tbody></table>")
+    html.append("</div>")  # scroll-table
+
+    # Botones bulk
+    html.append("<div style='margin-top:8px; display:flex; gap:8px; align-items:center;'>")
+    html.append("<button type='button' class='btn-secondary' onclick=\"submitIdentityBulk('delete')\">Eliminar seleccionados</button>")
+    html.append("<button type='button' class='btn-secondary' onclick=\"submitIdentityBulk('send_template')\">Enviar plantilla a seleccionados</button>")
+    html.append("<span class='small'>Las operaciones se aplican sólo a las filas marcadas.</span>")
     html.append("</div>")
 
-    html.append("</form>")
-    html.append("</div>")  # sección identidades
+    html.append("</form>")  # identityBulkForm
+    html.append("</div>")   # sección identidades
 
-    # SECCIÓN: Preview Excel envíos
+    # SECCIÓN: Preview Excel de envíos
     html.append("<div class='section'>")
     html.append("<div class='section-header'>")
     html.append("<div class='section-title'>Preview del Excel de envíos</div>")
@@ -4047,91 +4269,66 @@ def admin_panel():
     html.append("</div>")
     if envios_sample:
         cols = list(envios_sample[0].keys())
-        html.append("<div class='table-scroll sticky-header'>")
+        html.append("<div class='scroll-table' style='max-height:200px;'>")
         html.append("<table>")
         html.append("<thead><tr>" + "".join(f"<th>{esc_html(c)}</th>" for c in cols) + "</tr></thead><tbody>")
         for r in envios_sample:
-            html.append("<tr>" + "".join(f"<td>{esc_html(r.get(c, ''))}</td>" for c in cols) + "</tr>")
+            html.append("<tr>" + "".join(f"<td>{esc_html(str(r.get(c, '')))}</td>" for c in cols) + "</tr>")
         html.append("</tbody></table>")
         html.append("</div>")
     else:
         html.append("<p class='small'>No se pudo leer el archivo de envíos o está vacío.</p>")
-    html.append("</div>")  # sección preview
-
-    html.append("</div>")  # layout
+    html.append("</div>")
 
     # JS
     html.append("""
     <script>
-    function filterIdentityTable() {
-      var input = document.getElementById('identity_search');
-      if (!input) return;
-      var q = (input.value || '').toLowerCase().trim();
-      var rows = document.querySelectorAll('.identity-row');
-      if (!rows) return;
-      rows.forEach(function(row) {
-        var text = (
-          (row.dataset.archivo || '') + ' ' +
-          (row.dataset.dni || '') + ' ' +
-          (row.dataset.whatsapp || '') + ' ' +
-          (row.dataset.source || '')
-        ).toLowerCase();
-        if (!q || text.indexOf(q) !== -1) {
-          row.style.display = '';
-        } else {
-          row.style.display = 'none';
+      function toggleIdentitySelectAll(master) {
+        var checks = document.querySelectorAll('.chk-identity');
+        for (var i = 0; i < checks.length; i++) {
+          checks[i].checked = master.checked;
+        }
+      }
+
+      function submitIdentityBulk(actionName) {
+        var form = document.getElementById('identityBulkForm');
+        var actionField = document.getElementById('identityBulkAction');
+        actionField.value = actionName || '';
+        form.submit();
+      }
+
+      function filterIdentityTable() {
+        var q = (document.getElementById('identityFilter').value || '').toLowerCase();
+        var rows = document.querySelectorAll('.identity-row');
+        rows.forEach(function(row) {
+          var text = (
+            (row.dataset.nombre || '') + ' ' +
+            (row.dataset.archivo || '') + ' ' +
+            (row.dataset.dni || '') + ' ' +
+            (row.dataset.whatsapp || '') + ' ' +
+            (row.dataset.source || '')
+          ).toLowerCase();
+          if (!q || text.indexOf(q) !== -1) {
+            row.style.display = '';
+          } else {
+            row.style.display = 'none';
+          }
+        });
+      }
+
+      document.addEventListener('DOMContentLoaded', function() {
+        var input = document.getElementById('identityFilter');
+        if (input) {
+          input.addEventListener('input', filterIdentityTable);
+          filterIdentityTable();
         }
       });
-    }
-
-    function toggleIdentitySelectAll(master) {
-      var checked = master.checked;
-      var chks = document.querySelectorAll('.chk-identity');
-      chks.forEach(function(c) {
-        var row = c.closest('tr');
-        if (row && row.style.display !== 'none') {
-          c.checked = checked;
-        }
-      });
-    }
-
-    function confirmBulkAction() {
-      var action = null;
-      var form = event.target;
-      if (!form) return true;
-      var submitter = event.submitter;
-      if (submitter && submitter.name === 'action') {
-        action = submitter.value;
-      }
-      var anyChecked = false;
-      document.querySelectorAll('.chk-identity').forEach(function(c) {
-        if (c.checked && c.closest('tr').style.display !== 'none') {
-          anyChecked = true;
-        }
-      });
-      if (!anyChecked) {
-        alert('Seleccioná al menos una identidad.');
-        return false;
-      }
-      if (action === 'delete') {
-        return confirm('¿Eliminar las identidades seleccionadas? Esta acción no se puede deshacer.');
-      }
-      if (action === 'send_template') {
-        var periodInput = form.querySelector('input[name="period"]');
-        if (!periodInput || !periodInput.value.trim()) {
-          alert('Indicá el período para el envío (ej: 12-2025).');
-          return false;
-        }
-      }
-      return true;
-    }
-
-    // Aplica el filtro inicial si el input viene con valor (identity_q en la URL)
-    document.addEventListener('DOMContentLoaded', filterIdentityTable);
     </script>
     """)
 
+    html.append("</div>")  # layout
     html.append("</body></html>")
+
     return Response("".join(html), mimetype="text/html")
 
 
