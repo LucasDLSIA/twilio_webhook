@@ -418,6 +418,35 @@ def init_db():
         """
     )
 
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS tenants (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            slug TEXT UNIQUE NOT NULL,        -- ej: 'oribe', 'cliente_x'
+            display_name TEXT NOT NULL,       -- nombre visible: 'ORIBE SRL'
+            created_at INTEGER NOT NULL,
+            active INTEGER NOT NULL DEFAULT 1
+        );
+        """
+    )
+
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS portal_users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            tenant_id INTEGER NOT NULL,
+            email TEXT NOT NULL,
+            password_hash TEXT NOT NULL,
+            is_admin INTEGER NOT NULL DEFAULT 0,      -- admin del portal de ESA empresa
+            created_at INTEGER NOT NULL,
+            last_login_at INTEGER,
+            UNIQUE(tenant_id, email),
+            FOREIGN KEY (tenant_id) REFERENCES tenants(id)
+        );
+        """
+    )
+
+
     conn.commit()
     conn.close()
 
@@ -3622,11 +3651,247 @@ def admin_identity_template_csv():
 
 import html  # asegurate de tener este import arriba del archivo
 
-def esc_html(value: str) -> str:
+from flask import Response, redirect, request
+
+def esc_html(s: str | None) -> str:
+    if s is None:
+        return ""
+    return (
+        str(s)
+        .replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+        .replace('"', "&quot;")
+        .replace("'", "&#39;")
+    )
+
+@app.route("/superadmin/panel", methods=["GET"])
+@admin_required
+def superadmin_panel():
     """
-    Escapa texto para incrustar seguro en HTML.
+    Panel global para ver todas las empresas (tenants) y usuarios de portal.
+    Protegido por el MISMO token de admin (X-Admin-Token o ?token=...).
     """
-    return html.escape(str(value or ""), quote=True)
+    # reutilizamos el helper que ya tenés
+    token = _get_admin_token_from_request()
+
+    conn = get_db_connection()
+    conn.row_factory = sqlite3.Row
+    cur = conn.cursor()
+
+    # Tenants + cantidad de usuarios
+    cur.execute(
+        """
+        SELECT
+            t.id,
+            t.slug,
+            t.display_name,
+            t.created_at,
+            t.active,
+            COUNT(u.id) AS users_count
+        FROM tenants t
+        LEFT JOIN portal_users u ON u.tenant_id = t.id
+        GROUP BY t.id
+        ORDER BY t.created_at DESC;
+        """
+    )
+    tenants = cur.fetchall()
+
+    # Usuarios de portal
+    cur.execute(
+        """
+        SELECT
+            u.id,
+            u.email,
+            u.is_admin,
+            u.created_at,
+            u.last_login_at,
+            t.display_name AS tenant_name,
+            t.slug AS tenant_slug
+        FROM portal_users u
+        JOIN tenants t ON t.id = u.tenant_id
+        ORDER BY t.display_name, u.email;
+        """
+    )
+    users = cur.fetchall()
+    conn.close()
+
+    def fmt_ts(ts):
+        if not ts:
+            return ""
+        try:
+            return datetime.fromtimestamp(int(ts)).strftime("%Y-%m-%d %H:%M:%S")
+        except Exception:
+            return str(ts)
+
+    html = []
+    html.append("<!doctype html>")
+    html.append("<html lang='es'>")
+    html.append("<head>")
+    html.append("<meta charset='utf-8'>")
+    html.append("<title>Superadmin - Multiempresa</title>")
+    html.append("""
+    <style>
+      :root {
+        --bg: #020617;
+        --bg-card: #020617;
+        --border-subtle: #1f2937;
+        --accent: #22c55e;
+        --accent-soft: rgba(34,197,94,0.15);
+        --text-main: #e5e7eb;
+        --text-muted: #9ca3af;
+        --danger: #ef4444;
+      }
+      body {
+        margin: 0;
+        font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+        background: radial-gradient(circle at top, #111827 0, #020617 55%, #020617 100%);
+        color: var(--text-main);
+      }
+      a { color: var(--accent); text-decoration: none; }
+      a:hover { text-decoration: underline; }
+      .layout {
+        max-width: 1100px;
+        margin: 0 auto;
+        padding: 24px 16px 40px;
+      }
+      .topbar {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        margin-bottom: 20px;
+      }
+      .topbar-title {
+        font-size: 22px;
+        font-weight: 600;
+      }
+      .topbar-meta {
+        font-size: 12px;
+        color: var(--text-muted);
+      }
+      .grid {
+        display: grid;
+        grid-template-columns: minmax(0, 1.4fr) minmax(0, 1fr);
+        gap: 16px;
+      }
+      @media (max-width: 800px) {
+        .grid { grid-template-columns: 1fr; }
+      }
+      .card {
+        background: var(--bg-card);
+        border-radius: 14px;
+        border: 1px solid var(--border-subtle);
+        padding: 14px 16px;
+      }
+      .card h2 {
+        margin: 0 0 8px 0;
+        font-size: 15px;
+        font-weight: 600;
+      }
+      .small { font-size: 11px; color: var(--text-muted); }
+      table {
+        width: 100%;
+        border-collapse: collapse;
+        margin-top: 8px;
+      }
+      th, td {
+        padding: 6px 8px;
+        font-size: 12px;
+        border-bottom: 1px solid #1f2937;
+        text-align: left;
+      }
+      th {
+        color: var(--text-muted);
+        background: rgba(15,23,42,0.8);
+      }
+      tr:hover td {
+        background: rgba(15,23,42,0.6);
+      }
+      .mono {
+        font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+        font-size: 11px;
+      }
+      .badge {
+        display: inline-flex;
+        align-items: center;
+        padding: 2px 8px;
+        border-radius: 999px;
+        font-size: 11px;
+        font-weight: 500;
+      }
+      .badge.active {
+        background: var(--accent-soft);
+        color: var(--accent);
+      }
+      .badge.inactive {
+        background: rgba(148,163,184,0.2);
+        color: #cbd5f5;
+      }
+    </style>
+    """)
+    html.append("</head><body>")
+    html.append("<div class='layout'>")
+
+    # Topbar
+    html.append("<div class='topbar'>")
+    html.append("<div>")
+    html.append("<div class='topbar-title'>🛠️ Panel de súper admin</div>")
+    html.append("<div class='topbar-meta'>Ves todas las empresas y usuarios del portal.</div>")
+    html.append("</div>")
+    html.append("<div class='topbar-meta'>Token: <code>%s</code></div>" % esc_html(token or "—"))
+    html.append("</div>")
+
+    html.append("<div class='grid'>")
+
+    # Columna 1: Tenants
+    html.append("<div class='card'>")
+    html.append("<h2>Empresas (tenants)</h2>")
+    html.append("<div class='small'>Total: %d</div>" % len(tenants))
+    html.append("<table>")
+    html.append("<tr><th>ID</th><th>Slug</th><th>Nombre</th><th>Usuarios</th><th>Estado</th><th>Creado</th></tr>")
+    if tenants:
+        for t in tenants:
+            active = bool(t["active"])
+            badge_cls = "active" if active else "inactive"
+            badge_text = "Activa" if active else "Inactiva"
+            html.append("<tr>")
+            html.append(f"<td class='mono'>{t['id']}</td>")
+            html.append(f"<td class='mono'>{esc_html(t['slug'])}</td>")
+            html.append(f"<td>{esc_html(t['display_name'])}</td>")
+            html.append(f"<td>{t['users_count']}</td>")
+            html.append(f"<td><span class='badge {badge_cls}'>{badge_text}</span></td>")
+            html.append(f"<td class='mono'>{esc_html(fmt_ts(t['created_at']))}</td>")
+            html.append("</tr>")
+    else:
+        html.append("<tr><td colspan='6' class='small'>Todavía no hay tenants.</td></tr>")
+    html.append("</table>")
+    html.append("</div>")
+
+    # Columna 2: Usuarios
+    html.append("<div class='card'>")
+    html.append("<h2>Usuarios de portal</h2>")
+    html.append("<div class='small'>Total: %d</div>" % len(users))
+    html.append("<table>")
+    html.append("<tr><th>Empresa</th><th>Email</th><th>Rol</th><th>Creado</th><th>Último login</th></tr>")
+    if users:
+        for u in users:
+            role = "Admin empresa" if u["is_admin"] else "Usuario"
+            html.append("<tr>")
+            html.append(f"<td>{esc_html(u['tenant_name'])}</td>")
+            html.append(f"<td class='mono'>{esc_html(u['email'])}</td>")
+            html.append(f"<td>{esc_html(role)}</td>")
+            html.append(f"<td class='mono'>{esc_html(fmt_ts(u['created_at']))}</td>")
+            html.append(f"<td class='mono'>{esc_html(fmt_ts(u['last_login_at']))}</td>")
+            html.append("</tr>")
+    else:
+        html.append("<tr><td colspan='5' class='small'>No hay usuarios todavía.</td></tr>")
+    html.append("</table>")
+    html.append("</div>")
+
+    html.append("</div>")  # grid
+    html.append("</div></body></html>")
+
+    return Response("".join(html), mimetype="text/html")
 
 
 
