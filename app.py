@@ -1880,24 +1880,25 @@ def empty_twiml():
     return Response('<?xml version="1.0" encoding="UTF-8"?><Response></Response>',
                     mimetype="text/xml")
 
+import urllib.parse
+
 @app.route("/admin/verify_person", methods=["POST"])
 @admin_required
 def admin_verify_person():
     """
     Marca un CUIL + DNI como verificado de forma manual.
-    - Busca el número de WhatsApp y el nombre en el Excel de envíos.
-    - Inserta/actualiza en identity_verification (incluyendo 'nombre').
+    Usa Excel de envíos para encontrar WhatsApp y nombre.
     """
     archivo_norm = (request.form.get("archivo_norm") or "").strip()
     dni = (request.form.get("dni") or "").strip()
+    token = _get_admin_token_from_request()
 
-    if not archivo_norm or not dni:
-        return {"ok": False, "error": "archivo_norm y dni son requeridos"}, 400
+    if not archivo_norm or not dni or not dni.isdigit():
+        return redirect(
+            f"/admin/panel?token={token or ''}&msg=verify_error&detail=CUIL%20y%20DNI%20son%20requeridos"
+        )
 
-    if not dni.isdigit():
-        return {"ok": False, "error": "dni debe ser solo números"}, 400
-
-    # Leemos Excel de envíos para sacar WhatsApp + nombre
+    # Leemos Excel de envíos
     try:
         envios_rows = read_envios_rows()
     except Exception as e:
@@ -1947,17 +1948,15 @@ def admin_verify_person():
         if nombre_row and not nombre:
             nombre = str(nombre_row).strip()
 
-        # Si ya tenemos WhatsApp, podemos cortar
         if to_whatsapp:
             break
 
     if not to_whatsapp:
-        return {
-            "ok": False,
-            "error": "No se encontró número de WhatsApp para ese CUIL en el Excel de envíos",
-        }, 400
+        return redirect(
+            f"/admin/panel?token={token or ''}"
+            "&msg=verify_error&detail=No%20se%20encontr%C3%B3%20WhatsApp%20para%20ese%20CUIL%20en%20env%C3%ADos"
+        )
 
-    # Guardamos en identity_verification (incluyendo nombre)
     conn = get_db_connection()
     cur = conn.cursor()
     cur.execute(
@@ -1971,14 +1970,10 @@ def admin_verify_person():
     conn.commit()
     conn.close()
 
-    return {
-        "ok": True,
-        "archivo_norm": archivo_norm,
-        "dni": dni,
-        "to_whatsapp": to_whatsapp,
-        "nombre": nombre,
-        "source": "manual",
-    }, 200
+    return redirect(
+        f"/admin/panel?token={token or ''}"
+        f"&msg=verify_ok&verify_cuil={urllib.parse.quote(archivo_norm)}"
+    )
 
 
 @app.route("/admin/send_template_all", methods=["POST"])
@@ -3437,7 +3432,8 @@ def admin_identity_verification_upload():
     """
     file = request.files.get("file")
     if not file or file.filename == "":
-        return {"ok": False, "error": "Archivo no enviado"}, 400
+        token = _get_admin_token_from_request()
+        return redirect(f"/admin/panel?token={token or ''}&msg=upload_error&detail=Archivo%20no%20enviado")
 
     filename = file.filename
     ext = os.path.splitext(filename)[1].lower()
@@ -3452,7 +3448,8 @@ def admin_identity_verification_upload():
             df = pd.read_csv(file, sep=None, engine="python")
     except Exception as e:
         print("ERROR leyendo archivo de upload identidades:", e)
-        return {"ok": False, "error": "No se pudo leer el archivo"}, 400
+        token = _get_admin_token_from_request()
+        return redirect(f"/admin/panel?token={token or ''}&msg=upload_error&detail=No%20se%20pudo%20leer%20el%20archivo")
 
     # Normalizamos nombres de columnas a minúscula simple
     df.columns = [str(c).strip().lower() for c in df.columns]
@@ -3525,12 +3522,6 @@ def admin_identity_verification_upload():
 
         nombre = cuil_to_name.get(cuil, "")
 
-        # Si querés ser más estricto y NO insertar si el CUIL no existe en envíos:
-        if not nombre:
-            print(f"WARNING: CUIL {cuil} no encontrado en Excel de envíos, se omite.")
-            skipped += 1
-            continue
-
         cur.execute(
             """
             INSERT OR REPLACE INTO identity_verification
@@ -3546,9 +3537,11 @@ def admin_identity_verification_upload():
 
     print(f"UPLOAD identity_verification: inserted={inserted}, skipped={skipped}")
 
-    # Volvemos al panel
     token = _get_admin_token_from_request()
-    return redirect(f"/admin/panel?token={token or ''}")
+    return redirect(
+        f"/admin/panel?token={token or ''}"
+        f"&msg=upload_ok&upload_ins={inserted}&upload_skip={skipped}"
+    )
 
 
 @app.route("/admin/identity_template.csv", methods=["GET"])
@@ -3578,11 +3571,17 @@ def esc_html(value: str) -> str:
 @app.route("/admin/panel", methods=["GET"])
 @admin_required
 def admin_panel():
-    """
-    Panel HTML para operar todo desde el navegador.
-    Requiere ?token=... o header X-Admin-Token.
-    """
     token = _get_admin_token_from_request()
+
+    msg = request.args.get("msg") or ""
+    detail = request.args.get("detail") or ""
+    upload_ins = request.args.get("upload_ins")
+    upload_skip = request.args.get("upload_skip")
+    verify_cuil = request.args.get("verify_cuil")
+    last_job_from_query = request.args.get("job")
+
+    # ... resto de lo que ya tenés (envios_rows, jobs, identity_rows, etc.)
+
 
     # =========================
     # Datos base: Excel de envíos
@@ -3950,11 +3949,56 @@ def admin_panel():
         font-size: 10px;
         opacity: 0.6;
       }
+              .flash {
+        padding: 10px 12px;
+        border-radius: 10px;
+        margin-bottom: 18px;
+        font-size: 13px;
+        border: 1px solid #374151;
+        background: rgba(15,23,42,0.9);
+      }
+      .flash.ok {
+        border-color: #22c55e;
+        background: rgba(34,197,94,0.08);
+      }
+      .flash.error {
+        border-color: #ef4444;
+        background: rgba(239,68,68,0.08);
+      }
+
     </style>
     """)
     html.append("</head>")
     html.append("<body>")
     html.append("<div class='layout'>")
+
+    # Flash messages
+    if msg:
+        css_class = "flash"
+        text = ""
+        if msg == "upload_ok":
+            css_class += " ok"
+            text = f"Identidades cargadas: {upload_ins or 0} insertadas, {upload_skip or 0} filas saltadas."
+        elif msg == "upload_error":
+            css_class += " error"
+            text = "Error al subir archivo de identidades."
+            if detail:
+                text += " " + esc_html(detail)
+        elif msg == "verify_ok":
+            css_class += " ok"
+            text = f"Identidad verificada correctamente para CUIL {esc_html(verify_cuil or '')}."
+        elif msg == "verify_error":
+            css_class += " error"
+            text = "Error al verificar identidad."
+            if detail:
+                text += " " + esc_html(detail)
+        elif msg == "send_ok":
+            css_class += " ok"
+            text = f"Job de envío creado correctamente (ID: {esc_html(last_job_from_query or '')})."
+
+        if text:
+            html.append(f"<div class='{css_class}'>{text}</div>")
+
 
     # Topbar
     html.append("<div class='topbar'>")
@@ -3987,12 +4031,33 @@ def admin_panel():
     html.append("<h2>Último job de cola</h2>")
     if jobs:
         last = jobs[0]
+        total = last["total_enqueued"] or 0
+        sent = last["total_sent"] or 0
+        status = (last["status"] or "").upper()
+        perc = 0
+        if total > 0:
+            perc = int(100 * sent / total)
+
         html.append(f"<div class='card-main mono'>{esc_html(last['period_label'] or '')}</div>")
-        html.append(f"<div class='card-sub'>estado: {esc_html(last['status'] or '')}, enviados: {last['total_sent']}</div>")
+        # mini barra
+        html.append("""
+        <div style="margin-top:4px; background:#020617; border-radius:999px; height:6px; overflow:hidden;">
+          <div style="height:100%; background:linear-gradient(90deg,#22c55e,#16a34a); width:{perc}%"></div>
+        </div>
+        """.replace("{perc}", str(perc)))
+        html.append(
+            f"<div class='card-sub'>estado: {esc_html(status)}, "
+            f"enviados: {sent}/{total} ({perc}%)</div>"
+        )
+        # Mostrar job_id completo chiquito
+        html.append(
+            f"<div class='small mono' style='margin-top:2px;'>Job ID: {esc_html(last['job_id'])}</div>"
+        )
     else:
         html.append("<div class='card-main'>—</div>")
         html.append("<div class='card-sub'>Aún no se registran envíos en cola.</div>")
     html.append("</div>")
+
     html.append("</div>")  # grid-summary
 
     # SECCIÓN: Cola de envíos (PDF requerido siempre)
