@@ -3402,6 +3402,77 @@ def admin_send_one():
     return redirect("/admin/panel")
 
 #=============================
+@app.route("/admin/identity_verification/bulk", methods=["POST"])
+@admin_required
+def admin_identity_verification_bulk():
+    """
+    Operaciones masivas sobre identity_verification:
+    - action=delete        -> borra los seleccionados
+    - action=send_template -> envía la plantilla a los seleccionados para un período
+    """
+    token = _get_admin_token_from_request()
+    action = (request.form.get("action") or "").strip()
+    selected = request.form.getlist("selected") or request.form.getlist("selected[]")
+
+    if not selected:
+        # Nada marcado
+        return redirect(f"/admin/panel?token={token}&msg=no_selection")
+
+    # selected viene como "archivo_norm||dni||to_whatsapp"
+    identities = []
+    for val in selected:
+        parts = val.split("||")
+        if len(parts) >= 3:
+            archivo_norm = parts[0]
+            dni = parts[1]
+            to_whatsapp = parts[2]
+            identities.append((archivo_norm, dni, to_whatsapp))
+
+    if not identities:
+        return redirect(f"/admin/panel?token={token}&msg=no_valid_selection")
+
+    conn = get_db_connection()
+    cur = conn.cursor()
+
+    if action == "delete":
+        # Borramos por archivo_norm (CUIL)
+        for archivo_norm, _, _ in identities:
+            cur.execute(
+                "DELETE FROM identity_verification WHERE archivo_norm = ?;",
+                (archivo_norm,),
+            )
+        conn.commit()
+        conn.close()
+        return redirect(f"/admin/panel?token={token}&msg=deleted_{len(identities)}")
+
+    elif action == "send_template":
+        # Se necesita período
+        period_raw = request.form.get("period") or ""
+        period_lbl = normalize_period_label(period_raw)
+        if not period_lbl:
+            conn.close()
+            return redirect(f"/admin/panel?token={token}&msg=invalid_period")
+
+        enviados = 0
+        for archivo_norm, dni, to_whatsapp in identities:
+            try:
+                # Usamos el CUIL como archivo_norm para la variable de plantilla
+                sid = send_template(to_whatsapp, period_lbl, archivo_norm)
+                if sid:
+                    enviados += 1
+            except Exception as e:
+                print("ERROR bulk send_template:", e)
+
+        conn.close()
+        return redirect(
+            f"/admin/panel?token={token}&msg=sent_{enviados}_of_{len(identities)}"
+        )
+
+    else:
+        conn.close()
+        return redirect(f"/admin/panel?token={token}&msg=unknown_action")
+
+
 
 @app.route("/admin/panel", methods=["GET"])
 @admin_required
@@ -3422,11 +3493,15 @@ def admin_panel():
     envios_count = len(envios_rows)
     envios_sample = envios_rows[:10]
 
+    # filtro (opcional) para identidades – lo seguimos aceptando,
+    # pero además habrá filtro en vivo con JS.
+    identity_q = (request.args.get("identity_q") or "").strip()
+
     conn = get_db_connection()
     conn.row_factory = sqlite3.Row
     cur = conn.cursor()
 
-    # -------- Identidades verificadas: conteo total --------
+    # Conteo identidades
     try:
         cur.execute("SELECT COUNT(*) AS c FROM identity_verification;")
         row = cur.fetchone()
@@ -3434,41 +3509,32 @@ def admin_panel():
     except Exception:
         identity_count = 0
 
-    # -------- Identidades verificadas: listado + búsqueda --------
-    identity_search = (request.args.get("identity_q") or "").strip()
-    try:
-        if identity_search:
-            like = f"%{identity_search}%"
-            cur.execute(
-                """
-                SELECT archivo_norm, dni, to_whatsapp,
-                       datetime(verified_at, 'unixepoch', 'localtime') AS verified_at_local,
-                       source
-                FROM identity_verification
-                WHERE archivo_norm LIKE ?
-                   OR dni        LIKE ?
-                   OR to_whatsapp LIKE ?
-                ORDER BY verified_at DESC
-                LIMIT 200;
-                """,
-                (like, like, like),
-            )
-        else:
-            cur.execute(
-                """
-                SELECT archivo_norm, dni, to_whatsapp,
-                       datetime(verified_at, 'unixepoch', 'localtime') AS verified_at_local,
-                       source
-                FROM identity_verification
-                ORDER BY verified_at DESC
-                LIMIT 100;
-                """
-            )
-        identity_rows = cur.fetchall()
-    except Exception:
-        identity_rows = []
+    # Listado identidades verificadas
+    where_clause = ""
+    params = []
+    if identity_q:
+        like = f"%{identity_q}%"
+        where_clause = """
+            WHERE archivo_norm LIKE ? OR dni LIKE ?
+                  OR to_whatsapp LIKE ? OR source LIKE ?
+        """
+        params = [like, like, like, like]
 
-    # -------- Últimos jobs de cola --------
+    cur.execute(
+        f"""
+        SELECT archivo_norm, dni, to_whatsapp,
+               datetime(verified_at, 'unixepoch', 'localtime') AS verified_at_local,
+               source
+        FROM identity_verification
+        {where_clause}
+        ORDER BY verified_at DESC
+        LIMIT 200;
+        """,
+        params,
+    )
+    identity_rows = cur.fetchall()
+
+    # Últimos jobs de cola
     try:
         cur.execute(
             """
@@ -3492,6 +3558,17 @@ def admin_panel():
             return datetime.fromtimestamp(int(ts)).strftime("%Y-%m-%d %H:%M:%S")
         except Exception:
             return str(ts)
+
+    # Sanear valor de filtro para HTML
+    def esc_html(text: str) -> str:
+        return (
+            text.replace("&", "&amp;")
+            .replace("<", "&lt;")
+            .replace(">", "&gt;")
+            .replace('"', "&quot;")
+        )
+
+    identity_q_html = esc_html(identity_q)
 
     # =========================
     # HTML
@@ -3629,7 +3706,6 @@ def admin_panel():
       input[type='number'] {
         margin-top: 3px;
         padding: 6px 8px;
-        width: 220px;
         border-radius: 8px;
         border: 1px solid #374151;
         background: rgba(15, 23, 42, 0.9);
@@ -3667,53 +3743,29 @@ def admin_panel():
         filter: brightness(1.05);
       }
       .btn-danger {
-        margin-top: 10px;
-        padding: 6px 12px;
+        margin-top: 6px;
+        padding: 6px 10px;
         border-radius: 999px;
         border: none;
         cursor: pointer;
         font-size: 12px;
         font-weight: 500;
-        background: radial-gradient(circle at top left, var(--danger) 0, #b91c1c 60%);
-        color: #fef2f2;
-        box-shadow: 0 0 0 1px rgba(248,113,113,0.4), 0 8px 20px rgba(239,68,68,0.25);
+        background: var(--danger-soft);
+        color: var(--danger);
       }
-      .btn-danger:hover {
-        filter: brightness(1.05);
-      }
-      .btn-ghost {
-        margin-top: 10px;
+      .btn-secondary {
+        margin-top: 6px;
         padding: 6px 10px;
         border-radius: 999px;
         border: 1px solid #374151;
-        background: rgba(15,23,42,0.9);
-        color: var(--text-main);
-        font-size: 12px;
         cursor: pointer;
-      }
-
-      table {
-        width: 100%;
-        border-collapse: collapse;
-        margin-top: 8px;
-      }
-      th, td {
-        padding: 6px 8px;
         font-size: 12px;
-        border-bottom: 1px solid #1f2937;
-        text-align: left;
-      }
-      th {
-        color: var(--text-muted);
         font-weight: 500;
-        background: rgba(15, 23, 42, 0.7);
+        background: #020617;
+        color: var(--text-main);
       }
-      tr:hover td {
-        background: rgba(15, 23, 42, 0.7);
-      }
-      .mono {
-        font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
-        font-size: 11px;
+      .btn-secondary:hover {
+        background: #111827;
       }
       .badge-status {
         display: inline-flex;
@@ -3752,29 +3804,49 @@ def admin_panel():
         grid-template-columns: minmax(0, 1.4fr) minmax(0, 1fr);
         gap: 16px;
       }
-
-      /* Identidades: altura fija + scroll */
-      .identity-table-wrapper {
+      .mono {
+        font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+        font-size: 11px;
+      }
+      table {
+        width: 100%;
+        border-collapse: collapse;
+        margin-top: 8px;
+      }
+      th, td {
+        padding: 6px 8px;
+        font-size: 12px;
+        border-bottom: 1px solid #1f2937;
+        text-align: left;
+      }
+      th {
+        color: var(--text-muted);
+        font-weight: 500;
+        background: rgba(15, 23, 42, 0.7);
+      }
+      tr:hover td {
+        background: rgba(15, 23, 42, 0.7);
+      }
+      .table-scroll {
         max-height: 260px;
         overflow-y: auto;
         border-radius: 12px;
         border: 1px solid var(--border-subtle);
-        margin-top: 8px;
-      }
-      .identity-table-wrapper table {
-        margin-top: 0;
-      }
-      .toolbar-row {
-        display: flex;
-        flex-wrap: wrap;
-        align-items: center;
-        gap: 10px;
         margin-top: 6px;
       }
-      .toolbar-row .grow {
-        flex: 1 1 auto;
+      .identity-actions {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 8px;
+        align-items: center;
+        margin-top: 6px;
       }
-
+      .identity-actions input[type='text'] {
+        width: 140px;
+      }
+      .search-input {
+        width: 240px;
+      }
       @media (max-width: 800px) {
         .grid-summary {
           grid-template-columns: 1fr;
@@ -3832,7 +3904,7 @@ def admin_panel():
     html.append("<div class='section'>")
     html.append("<div class='section-header'>")
     html.append("<div class='section-title'>Cola de envíos masivos</div>")
-    html.append("<div class='section-sub'>Creá jobs en cola y revisá su estado. (Siempre requiere PDF)</div>")
+    html.append("<div class='section-sub'>Creá jobs en cola y revisá su estado (siempre requiere PDF).</div>")
     html.append("</div>")
 
     html.append("<div class='two-cols'>")
@@ -3847,8 +3919,9 @@ def admin_panel():
     html.append("<input type='text' name='period' placeholder='12-2025'></label>")
     html.append("<label>Límite de envíos (0 = todos)<br>")
     html.append("<input type='number' name='limit' min='0' value='0'></label>")
-    # 🔒 ya no mostramos checkbox de require_pdf; en backend está forzado a True
-    html.append("<p class='small'>Solo se encolan personas que tengan PDF disponible para ese período.</p>")
+    # PDF forzado: no checkbox, pasamos siempre require_pdf=true
+    html.append("<input type='hidden' name='require_pdf' value='true'>")
+    html.append("<p class='small'>Solo se encolan personas que tengan PDF para el período elegido.</p>")
     html.append("<button type='submit' class='btn-primary'>Encolar envío masivo</button>")
     html.append("</form>")
     html.append("<p class='small'>Luego podés consultar el progreso con <code>/admin/send_template_queue_status/&lt;job_id&gt;</code> o desde los jobs listados a la derecha.</p>")
@@ -3925,74 +3998,80 @@ def admin_panel():
     html.append("<p class='small'>El sistema buscará el número de WhatsApp en el Excel de envíos y guardará la identidad en la tabla <code>identity_verification</code>.</p>")
     html.append("</div>")
 
-    # SECCIÓN: Identidades verificadas (lista + búsquedas + acciones masivas)
+    # SECCIÓN: Identidades verificadas (lista con checkboxes + filtro en vivo)
     html.append("<div class='section'>")
     html.append("<div class='section-header'>")
     html.append("<div class='section-title'>Identidades verificadas</div>")
-    html.append("<div class='section-sub'>Filtrá, seleccioná varias y ejecutá acciones masivas.</div>")
+    html.append("<div class='section-sub'>Filtrá, seleccioná y operá en bloque.</div>")
     html.append("</div>")
 
-    # Buscador (GET)
-    html.append("<form method='get' action='/admin/panel' class='toolbar-row'>")
+    # Buscador en vivo
+    html.append("<div class='identity-actions'>")
+    html.append("<div>")
+    html.append("<span class='small'>Buscar:</span><br>")
+    html.append(
+        f"<input type='text' id='identity_search' class='search-input' "
+        f"placeholder='Nombre, CUIL, DNI o WhatsApp' value='{identity_q_html}' "
+        f"oninput='filterIdentityTable()'>"
+    )
+    html.append("</div>")
+    html.append("</div>")
+
+    # Formulario para acciones en masa
+    html.append("<form method='post' action='/admin/identity_verification/bulk' id='identity_bulk_form'>")
     if token:
         html.append(f"<input type='hidden' name='token' value='{token}'>")
-    html.append("<div class='grow'>")
-    html.append("<label>Buscar por CUIL, DNI o WhatsApp<br>")
-    html.append(f"<input type='text' name='identity_q' placeholder='ej: 20-2816 / 28169249 / +54911...' value='{identity_search}'>")
-    html.append("</label>")
-    html.append("</div>")
+
+    html.append("<div class='identity-actions'>")
+    html.append("<button type='submit' name='action' value='delete' class='btn-danger' onclick='return confirm(\"¿Eliminar las identidades seleccionadas?\")'>Eliminar seleccionados</button>")
+    html.append("<span class='small'>|</span>")
     html.append("<div>")
-    html.append("<button type='submit' class='btn-ghost'>Buscar</button>")
+    html.append("<span class='small'>Enviar plantilla a seleccionados para período:</span><br>")
+    html.append("<input type='text' name='period' placeholder='12-2025' style='width:110px;'>")
+    html.append("<button type='submit' name='action' value='send_template' class='btn-secondary'>Enviar plantilla</button>")
     html.append("</div>")
+    html.append("</div>")
+
+    # Tabla con scroll
+    html.append("<div class='table-scroll'>")
+    html.append("<table>")
+    html.append("<tr>"
+                "<th style='width:26px; text-align:center;'>"
+                "<input type='checkbox' id='chk_identity_all' onclick='toggleIdentitySelectAll(this)'></th>"
+                "<th>CUIL</th><th>DNI</th><th>WhatsApp</th><th>Verificado</th><th>Origen</th>"
+                "</tr>")
+    for r in identity_rows:
+        archivo_norm = esc_html(r["archivo_norm"])
+        dni = esc_html(str(r["dni"]))
+        to_wp = esc_html(r["to_whatsapp"])
+        verified = esc_html(r["verified_at_local"] or "")
+        source = esc_html(r["source"] or "")
+        value = f"{archivo_norm}||{dni}||{to_wp}"
+        html.append(
+            "<tr class='identity-row' "
+            f"data-archivo='{archivo_norm}' "
+            f"data-dni='{dni}' "
+            f"data-whatsapp='{to_wp}' "
+            f"data-source='{source}'>"
+        )
+        html.append(
+            f"<td style='text-align:center;'><input type='checkbox' name='selected' value='{value}' class='chk-identity'></td>"
+        )
+        html.append(f"<td class='mono'>{archivo_norm}</td>")
+        html.append(f"<td class='mono'>{dni}</td>")
+        html.append(f"<td class='mono'>{to_wp}</td>")
+        html.append(f"<td class='mono'>{verified}</td>")
+        html.append(f"<td class='mono'>{source}</td>")
+        html.append("</tr>")
+    if not identity_rows:
+        html.append("<tr><td colspan='6' class='small'>No hay identidades verificadas aún.</td></tr>")
+    html.append("</table>")
+    html.append("</div>")  # table-scroll
+
     html.append("</form>")
+    html.append("</div>")  # section identidades
 
-    if identity_rows:
-        # Form de acciones masivas
-        html.append("<form method='post' action='/admin/identity_verification/bulk'>")
-        if token:
-            html.append(f"<input type='hidden' name='token' value='{token}'>")
-
-        # Barra de acciones
-        html.append("<div class='toolbar-row'>")
-        html.append("<div class='grow small'>Seleccioná uno o más CUIL y elegí una acción.</div>")
-        html.append("<div>")
-        html.append("<label style='font-size:11px;'>Período<br>")
-        html.append("<input type='text' name='period' placeholder='12-2025' style='width:110px;'></label>")
-        html.append("</div>")
-        html.append("<div>")
-        html.append("<button type='submit' name='action' value='send_template' class='btn-primary'>Enviar plantilla a seleccionados</button>")
-        html.append("</div>")
-        html.append("<div>")
-        html.append("<button type='submit' name='action' value='delete' class='btn-danger' onclick=\"return confirm('¿Eliminar verificación de los seleccionados?');\">Eliminar seleccionados</button>")
-        html.append("</div>")
-        html.append("</div>")  # toolbar-row
-
-        # Tabla con scroll
-        html.append("<div class='identity-table-wrapper'>")
-        html.append("<table>")
-        html.append("<tr>"
-                    "<th><input type='checkbox' id='chk_identity_all' onclick='toggleAllIdentities(this)'></th>"
-                    "<th>CUIL</th><th>DNI</th><th>WhatsApp</th><th>Verificado</th><th>Origen</th>"
-                    "</tr>")
-        for r in identity_rows:
-            html.append("<tr>")
-            html.append(f"<td><input type='checkbox' name='selected_archivo_norm' value='{r['archivo_norm']}'></td>")
-            html.append(f"<td class='mono'>{r['archivo_norm']}</td>")
-            html.append(f"<td class='mono'>{r['dni']}</td>")
-            html.append(f"<td class='mono'>{r['to_whatsapp']}</td>")
-            html.append(f"<td class='mono'>{r['verified_at_local']}</td>")
-            html.append(f"<td class='small'>{r['source']}</td>")
-            html.append("</tr>")
-        html.append("</table>")
-        html.append("</div>")  # identity-table-wrapper
-
-        html.append("</form>")
-    else:
-        html.append("<p class='small'>Todavía no hay identidades verificadas o la búsqueda no devolvió resultados.</p>")
-
-    html.append("</div>")  # sección identidades
-
-    # SECCIÓN: Sample de Excel de envíos
+    # SECCIÓN: Preview del Excel de envíos
     html.append("<div class='section'>")
     html.append("<div class='section-header'>")
     html.append("<div class='section-title'>Preview del Excel de envíos</div>")
@@ -4001,24 +4080,44 @@ def admin_panel():
     if envios_sample:
         cols = list(envios_sample[0].keys())
         html.append("<table>")
-        html.append("<tr>" + "".join(f"<th>{c}</th>" for c in cols) + "</tr>")
+        html.append("<tr>" + "".join(f"<th>{esc_html(c)}</th>" for c in cols) + "</tr>")
         for r in envios_sample:
-            html.append("<tr>" + "".join(f"<td>{r.get(c, '')}</td>" for c in cols) + "</tr>")
+            html.append("<tr>" + "".join(f"<td>{esc_html(str(r.get(c, '')))}</td>" for c in cols) + "</tr>")
         html.append("</table>")
     else:
         html.append("<p class='small'>No se pudo leer el archivo de envíos o está vacío.</p>")
     html.append("</div>")
 
-    # Script para "seleccionar todos"
+    # Script para filtro en vivo y seleccionar todos
     html.append("""
     <script>
-      function toggleAllIdentities(master) {
-        var checked = master.checked;
-        var boxes = document.querySelectorAll("input[name='selected_archivo_norm']");
-        boxes.forEach(function(cb) {
-          cb.checked = checked;
-        });
-      }
+    function filterIdentityTable() {
+      var q = (document.getElementById('identity_search').value || '').toLowerCase().trim();
+      var rows = document.querySelectorAll('.identity-row');
+      if (!rows) return;
+      rows.forEach(function(row) {
+        var text = (
+          (row.dataset.archivo || '') + ' ' +
+          (row.dataset.dni || '') + ' ' +
+          (row.dataset.whatsapp || '') + ' ' +
+          (row.dataset.source || '')
+        ).toLowerCase();
+        if (!q || text.indexOf(q) !== -1) {
+          row.style.display = '';
+        } else {
+          row.style.display = 'none';
+        }
+      });
+    }
+    function toggleIdentitySelectAll(master) {
+      var checked = master.checked;
+      var chks = document.querySelectorAll('.chk-identity');
+      chks.forEach(function(c) {
+        if (c.closest('tr').style.display !== 'none') {
+          c.checked = checked;
+        }
+      });
+    }
     </script>
     """)
 
