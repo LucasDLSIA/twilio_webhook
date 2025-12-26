@@ -3486,6 +3486,8 @@ def admin_panel():
     # =========================
     # Datos base
     # =========================
+    identity_q = (request.args.get("identity_q") or "").strip()
+
     try:
         envios_rows = read_envios_rows()
     except Exception:
@@ -3493,15 +3495,11 @@ def admin_panel():
     envios_count = len(envios_rows)
     envios_sample = envios_rows[:10]
 
-    # filtro (opcional) para identidades – lo seguimos aceptando,
-    # pero además habrá filtro en vivo con JS.
-    identity_q = (request.args.get("identity_q") or "").strip()
-
     conn = get_db_connection()
     conn.row_factory = sqlite3.Row
     cur = conn.cursor()
 
-    # Conteo identidades
+    # Conteo identidades verificadas
     try:
         cur.execute("SELECT COUNT(*) AS c FROM identity_verification;")
         row = cur.fetchone()
@@ -3509,28 +3507,16 @@ def admin_panel():
     except Exception:
         identity_count = 0
 
-    # Listado identidades verificadas
-    where_clause = ""
-    params = []
-    if identity_q:
-        like = f"%{identity_q}%"
-        where_clause = """
-            WHERE archivo_norm LIKE ? OR dni LIKE ?
-                  OR to_whatsapp LIKE ? OR source LIKE ?
-        """
-        params = [like, like, like, like]
-
+    # Lista identidades verificadas (sin filtro SQL, se filtra en el front)
     cur.execute(
-        f"""
+        """
         SELECT archivo_norm, dni, to_whatsapp,
                datetime(verified_at, 'unixepoch', 'localtime') AS verified_at_local,
                source
         FROM identity_verification
-        {where_clause}
         ORDER BY verified_at DESC
         LIMIT 200;
-        """,
-        params,
+        """
     )
     identity_rows = cur.fetchall()
 
@@ -3558,15 +3544,6 @@ def admin_panel():
             return datetime.fromtimestamp(int(ts)).strftime("%Y-%m-%d %H:%M:%S")
         except Exception:
             return str(ts)
-
-    # Sanear valor de filtro para HTML
-    def esc_html(text: str) -> str:
-        return (
-            text.replace("&", "&amp;")
-            .replace("<", "&lt;")
-            .replace(">", "&gt;")
-            .replace('"', "&quot;")
-        )
 
     identity_q_html = esc_html(identity_q)
 
@@ -3670,7 +3647,6 @@ def admin_panel():
         color: var(--text-muted);
         margin-top: 2px;
       }
-
       .section {
         margin-top: 20px;
         padding: 14px 16px 16px;
@@ -3692,7 +3668,6 @@ def admin_panel():
         font-size: 12px;
         color: var(--text-muted);
       }
-
       form {
         margin-top: 4px;
       }
@@ -3706,6 +3681,7 @@ def admin_panel():
       input[type='number'] {
         margin-top: 3px;
         padding: 6px 8px;
+        width: 220px;
         border-radius: 8px;
         border: 1px solid #374151;
         background: rgba(15, 23, 42, 0.9);
@@ -3742,30 +3718,43 @@ def admin_panel():
       .btn-primary:hover {
         filter: brightness(1.05);
       }
-      .btn-danger {
-        margin-top: 6px;
-        padding: 6px 10px;
-        border-radius: 999px;
-        border: none;
-        cursor: pointer;
-        font-size: 12px;
-        font-weight: 500;
-        background: var(--danger-soft);
-        color: var(--danger);
-      }
       .btn-secondary {
-        margin-top: 6px;
-        padding: 6px 10px;
+        margin-top: 8px;
+        padding: 6px 12px;
         border-radius: 999px;
         border: 1px solid #374151;
-        cursor: pointer;
-        font-size: 12px;
-        font-weight: 500;
         background: #020617;
         color: var(--text-main);
+        font-size: 12px;
+        cursor: pointer;
       }
-      .btn-secondary:hover {
-        background: #111827;
+      .btn-secondary.danger {
+        border-color: var(--danger);
+        color: var(--danger);
+        background: var(--danger-soft);
+      }
+      table {
+        width: 100%;
+        border-collapse: collapse;
+        margin-top: 8px;
+      }
+      th, td {
+        padding: 6px 8px;
+        font-size: 12px;
+        border-bottom: 1px solid #1f2937;
+        text-align: left;
+      }
+      th {
+        color: var(--text-muted);
+        font-weight: 500;
+        background: rgba(15, 23, 42, 0.7);
+      }
+      tr:hover td {
+        background: rgba(15, 23, 42, 0.7);
+      }
+      .mono {
+        font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+        font-size: 11px;
       }
       .badge-status {
         display: inline-flex;
@@ -3804,48 +3793,27 @@ def admin_panel():
         grid-template-columns: minmax(0, 1.4fr) minmax(0, 1fr);
         gap: 16px;
       }
-      .mono {
-        font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
-        font-size: 11px;
-      }
-      table {
-        width: 100%;
-        border-collapse: collapse;
-        margin-top: 8px;
-      }
-      th, td {
-        padding: 6px 8px;
-        font-size: 12px;
-        border-bottom: 1px solid #1f2937;
-        text-align: left;
-      }
-      th {
-        color: var(--text-muted);
-        font-weight: 500;
-        background: rgba(15, 23, 42, 0.7);
-      }
-      tr:hover td {
-        background: rgba(15, 23, 42, 0.7);
-      }
       .table-scroll {
         max-height: 260px;
         overflow-y: auto;
-        border-radius: 12px;
-        border: 1px solid var(--border-subtle);
+        border-radius: 10px;
+        border: 1px solid #1f2937;
         margin-top: 6px;
       }
-      .identity-actions {
+      .table-scroll table {
+        margin-top: 0;
+      }
+      .sticky-header thead th {
+        position: sticky;
+        top: 0;
+        z-index: 1;
+      }
+      .actions-row {
         display: flex;
         flex-wrap: wrap;
         gap: 8px;
         align-items: center;
-        margin-top: 6px;
-      }
-      .identity-actions input[type='text'] {
-        width: 140px;
-      }
-      .search-input {
-        width: 240px;
+        margin-top: 8px;
       }
       @media (max-width: 800px) {
         .grid-summary {
@@ -3853,6 +3821,9 @@ def admin_panel():
         }
         .two-cols {
           grid-template-columns: 1fr;
+        }
+        .table-scroll {
+          max-height: 220px;
         }
       }
     </style>
@@ -3876,18 +3847,19 @@ def admin_panel():
 
     # Summary cards
     html.append("<div class='grid-summary'>")
+    # Excel envíos
     html.append("<div class='card'>")
     html.append("<h2>Excel de envíos</h2>")
     html.append(f"<div class='card-main'>{envios_count}</div>")
     html.append("<div class='card-sub'>filas detectadas en el archivo de envíos</div>")
     html.append("</div>")
-
+    # Identidades verificadas
     html.append("<div class='card'>")
     html.append("<h2>Identidades verificadas</h2>")
     html.append(f"<div class='card-main'>{identity_count}</div>")
     html.append("<div class='card-sub'>CUIL + DNI ya confirmados</div>")
     html.append("</div>")
-
+    # Último job
     html.append("<div class='card'>")
     html.append("<h2>Último job de cola</h2>")
     if jobs:
@@ -3904,14 +3876,14 @@ def admin_panel():
     html.append("<div class='section'>")
     html.append("<div class='section-header'>")
     html.append("<div class='section-title'>Cola de envíos masivos</div>")
-    html.append("<div class='section-sub'>Creá jobs en cola y revisá su estado (siempre requiere PDF).</div>")
+    html.append("<div class='section-sub'>Crea jobs en cola y revisá su estado (siempre con PDF disponible).</div>")
     html.append("</div>")
 
     html.append("<div class='two-cols'>")
 
     # Columna izquierda: formulario
     html.append("<div>")
-    html.append("<div class='small'>Este formulario usa la misma lógica que <code>/admin/send_template_queue_start</code>.</div>")
+    html.append("<div class='small'>Este formulario usa la misma lógica que <code>/admin/send_template_queue_start</code>. Siempre requiere PDF existente.</div>")
     html.append("<form method='post' action='/admin/send_template_queue_start'>")
     if token:
         html.append(f"<input type='hidden' name='token' value='{token}'>")
@@ -3919,9 +3891,8 @@ def admin_panel():
     html.append("<input type='text' name='period' placeholder='12-2025'></label>")
     html.append("<label>Límite de envíos (0 = todos)<br>")
     html.append("<input type='number' name='limit' min='0' value='0'></label>")
-    # PDF forzado: no checkbox, pasamos siempre require_pdf=true
+    # Forzamos require_pdf=true como hidden
     html.append("<input type='hidden' name='require_pdf' value='true'>")
-    html.append("<p class='small'>Solo se encolan personas que tengan PDF para el período elegido.</p>")
     html.append("<button type='submit' class='btn-primary'>Encolar envío masivo</button>")
     html.append("</form>")
     html.append("<p class='small'>Luego podés consultar el progreso con <code>/admin/send_template_queue_status/&lt;job_id&gt;</code> o desde los jobs listados a la derecha.</p>")
@@ -3930,9 +3901,10 @@ def admin_panel():
     # Columna derecha: tabla de jobs
     html.append("<div>")
     html.append("<div class='section-sub'>Últimos 10 jobs</div>")
+    html.append("<div class='table-scroll sticky-header'>")
     html.append("<table>")
-    html.append("<tr><th>Job ID</th><th>Período</th><th>Estado</th>"
-                "<th>Encolados</th><th>Enviados</th><th>Fallidos</th><th>Creado</th></tr>")
+    html.append("<thead><tr><th>Job ID</th><th>Período</th><th>Estado</th>"
+                "<th>Encolados</th><th>Enviados</th><th>Fallidos</th><th>Creado</th></tr></thead><tbody>")
     for j in jobs:
         status = (j["status"] or "").upper()
         cls = "pending"
@@ -3953,7 +3925,8 @@ def admin_panel():
         html.append("</tr>")
     if not jobs:
         html.append("<tr><td colspan='7' class='small'>No hay jobs todavía.</td></tr>")
-    html.append("</table>")
+    html.append("</tbody></table>")
+    html.append("</div>")  # table-scroll
     html.append("</div>")  # columna derecha
 
     html.append("</div>")  # two-cols
@@ -3965,7 +3938,6 @@ def admin_panel():
     html.append("<div class='section-title'>Reportes</div>")
     html.append("<div class='section-sub'>Descargá los datos en Excel / CSV.</div>")
     html.append("</div>")
-
     if token:
         html.append("<div class='links-inline'>")
         html.append(
@@ -3998,80 +3970,76 @@ def admin_panel():
     html.append("<p class='small'>El sistema buscará el número de WhatsApp en el Excel de envíos y guardará la identidad en la tabla <code>identity_verification</code>.</p>")
     html.append("</div>")
 
-    # SECCIÓN: Identidades verificadas (lista con checkboxes + filtro en vivo)
+    # SECCIÓN: Identidades verificadas (lista + búsqueda + acciones masivas)
     html.append("<div class='section'>")
     html.append("<div class='section-header'>")
     html.append("<div class='section-title'>Identidades verificadas</div>")
-    html.append("<div class='section-sub'>Filtrá, seleccioná y operá en bloque.</div>")
+    html.append("<div class='section-sub'>Filtrá, seleccioná varias y aplicá acciones masivas.</div>")
     html.append("</div>")
 
     # Buscador en vivo
-    html.append("<div class='identity-actions'>")
-    html.append("<div>")
-    html.append("<span class='small'>Buscar:</span><br>")
-    html.append(
-        f"<input type='text' id='identity_search' class='search-input' "
-        f"placeholder='Nombre, CUIL, DNI o WhatsApp' value='{identity_q_html}' "
-        f"oninput='filterIdentityTable()'>"
-    )
-    html.append("</div>")
-    html.append("</div>")
+    html.append("<label>Búsqueda rápida (CUIL, DNI, WhatsApp, origen)<br>")
+    html.append(f"<input type='text' id='identity_search' placeholder='Ej: 20-28, 28169, whatsapp:+54911…' value='{identity_q_html}' oninput='filterIdentityTable()'>")
+    html.append("</label>")
+    html.append("<p class='small'>El filtro se aplica en vivo sobre las filas de la tabla.</p>")
 
-    # Formulario para acciones en masa
-    html.append("<form method='post' action='/admin/identity_verification/bulk' id='identity_bulk_form'>")
+    # Form bulk
+    html.append("<form method='post' action='/admin/identity_verification/bulk' onsubmit='return confirmBulkAction();'>")
     if token:
         html.append(f"<input type='hidden' name='token' value='{token}'>")
 
-    html.append("<div class='identity-actions'>")
-    html.append("<button type='submit' name='action' value='delete' class='btn-danger' onclick='return confirm(\"¿Eliminar las identidades seleccionadas?\")'>Eliminar seleccionados</button>")
-    html.append("<span class='small'>|</span>")
-    html.append("<div>")
-    html.append("<span class='small'>Enviar plantilla a seleccionados para período:</span><br>")
-    html.append("<input type='text' name='period' placeholder='12-2025' style='width:110px;'>")
-    html.append("<button type='submit' name='action' value='send_template' class='btn-secondary'>Enviar plantilla</button>")
-    html.append("</div>")
-    html.append("</div>")
-
-    # Tabla con scroll
-    html.append("<div class='table-scroll'>")
+    html.append("<div class='table-scroll sticky-header'>")
     html.append("<table>")
-    html.append("<tr>"
-                "<th style='width:26px; text-align:center;'>"
-                "<input type='checkbox' id='chk_identity_all' onclick='toggleIdentitySelectAll(this)'></th>"
-                "<th>CUIL</th><th>DNI</th><th>WhatsApp</th><th>Verificado</th><th>Origen</th>"
-                "</tr>")
+    html.append(
+        "<thead><tr>"
+        "<th><input type='checkbox' onclick='toggleIdentitySelectAll(this)'></th>"
+        "<th>CUIL (archivo_norm)</th>"
+        "<th>DNI</th>"
+        "<th>WhatsApp</th>"
+        "<th>Verificado</th>"
+        "<th>Origen</th>"
+        "</tr></thead><tbody>"
+    )
+
     for r in identity_rows:
-        archivo_norm = esc_html(r["archivo_norm"])
-        dni = esc_html(str(r["dni"]))
-        to_wp = esc_html(r["to_whatsapp"])
-        verified = esc_html(r["verified_at_local"] or "")
-        source = esc_html(r["source"] or "")
-        value = f"{archivo_norm}||{dni}||{to_wp}"
+        archivo_norm = r["archivo_norm"] or ""
+        dni = r["dni"] or ""
+        tw = r["to_whatsapp"] or ""
+        verif = r["verified_at_local"] or ""
+        source = r["source"] or ""
+        value = f"{archivo_norm}|{dni}"
         html.append(
-            "<tr class='identity-row' "
-            f"data-archivo='{archivo_norm}' "
-            f"data-dni='{dni}' "
-            f"data-whatsapp='{to_wp}' "
-            f"data-source='{source}'>"
+            f"<tr class='identity-row' "
+            f"data-archivo='{esc_html(archivo_norm)}' "
+            f"data-dni='{esc_html(dni)}' "
+            f"data-whatsapp='{esc_html(tw)}' "
+            f"data-source='{esc_html(source)}'>"
         )
-        html.append(
-            f"<td style='text-align:center;'><input type='checkbox' name='selected' value='{value}' class='chk-identity'></td>"
-        )
-        html.append(f"<td class='mono'>{archivo_norm}</td>")
-        html.append(f"<td class='mono'>{dni}</td>")
-        html.append(f"<td class='mono'>{to_wp}</td>")
-        html.append(f"<td class='mono'>{verified}</td>")
-        html.append(f"<td class='mono'>{source}</td>")
+        html.append(f"<td><input type='checkbox' class='chk-identity' name='selected' value='{esc_html(value)}'></td>")
+        html.append(f"<td class='mono'>{esc_html(archivo_norm)}</td>")
+        html.append(f"<td class='mono'>{esc_html(dni)}</td>")
+        html.append(f"<td class='mono'>{esc_html(tw)}</td>")
+        html.append(f"<td class='mono'>{esc_html(verif)}</td>")
+        html.append(f"<td class='mono'>{esc_html(source)}</td>")
         html.append("</tr>")
     if not identity_rows:
         html.append("<tr><td colspan='6' class='small'>No hay identidades verificadas aún.</td></tr>")
-    html.append("</table>")
+    html.append("</tbody></table>")
     html.append("</div>")  # table-scroll
 
-    html.append("</form>")
-    html.append("</div>")  # section identidades
+    # Acciones masivas
+    html.append("<div class='actions-row'>")
+    html.append("<span class='small'>Acción para seleccionados:</span>")
+    html.append("<button type='submit' name='action' value='send_template' class='btn-secondary'>Enviar plantilla solo a seleccionados</button>")
+    html.append("<button type='submit' name='action' value='delete' class='btn-secondary danger'>Eliminar verificación seleccionada(s)</button>")
+    html.append("<label style='margin-left:12px;'>Período para envío<br>"
+                "<input type='text' name='period' placeholder='12-2025' style='width:110px;'></label>")
+    html.append("</div>")
 
-    # SECCIÓN: Preview del Excel de envíos
+    html.append("</form>")
+    html.append("</div>")  # sección identidades
+
+    # SECCIÓN: Preview Excel envíos
     html.append("<div class='section'>")
     html.append("<div class='section-header'>")
     html.append("<div class='section-title'>Preview del Excel de envíos</div>")
@@ -4079,20 +4047,26 @@ def admin_panel():
     html.append("</div>")
     if envios_sample:
         cols = list(envios_sample[0].keys())
+        html.append("<div class='table-scroll sticky-header'>")
         html.append("<table>")
-        html.append("<tr>" + "".join(f"<th>{esc_html(c)}</th>" for c in cols) + "</tr>")
+        html.append("<thead><tr>" + "".join(f"<th>{esc_html(c)}</th>" for c in cols) + "</tr></thead><tbody>")
         for r in envios_sample:
-            html.append("<tr>" + "".join(f"<td>{esc_html(str(r.get(c, '')))}</td>" for c in cols) + "</tr>")
-        html.append("</table>")
+            html.append("<tr>" + "".join(f"<td>{esc_html(r.get(c, ''))}</td>" for c in cols) + "</tr>")
+        html.append("</tbody></table>")
+        html.append("</div>")
     else:
         html.append("<p class='small'>No se pudo leer el archivo de envíos o está vacío.</p>")
-    html.append("</div>")
+    html.append("</div>")  # sección preview
 
-    # Script para filtro en vivo y seleccionar todos
+    html.append("</div>")  # layout
+
+    # JS
     html.append("""
     <script>
     function filterIdentityTable() {
-      var q = (document.getElementById('identity_search').value || '').toLowerCase().trim();
+      var input = document.getElementById('identity_search');
+      if (!input) return;
+      var q = (input.value || '').toLowerCase().trim();
       var rows = document.querySelectorAll('.identity-row');
       if (!rows) return;
       rows.forEach(function(row) {
@@ -4109,21 +4083,55 @@ def admin_panel():
         }
       });
     }
+
     function toggleIdentitySelectAll(master) {
       var checked = master.checked;
       var chks = document.querySelectorAll('.chk-identity');
       chks.forEach(function(c) {
-        if (c.closest('tr').style.display !== 'none') {
+        var row = c.closest('tr');
+        if (row && row.style.display !== 'none') {
           c.checked = checked;
         }
       });
     }
+
+    function confirmBulkAction() {
+      var action = null;
+      var form = event.target;
+      if (!form) return true;
+      var submitter = event.submitter;
+      if (submitter && submitter.name === 'action') {
+        action = submitter.value;
+      }
+      var anyChecked = false;
+      document.querySelectorAll('.chk-identity').forEach(function(c) {
+        if (c.checked && c.closest('tr').style.display !== 'none') {
+          anyChecked = true;
+        }
+      });
+      if (!anyChecked) {
+        alert('Seleccioná al menos una identidad.');
+        return false;
+      }
+      if (action === 'delete') {
+        return confirm('¿Eliminar las identidades seleccionadas? Esta acción no se puede deshacer.');
+      }
+      if (action === 'send_template') {
+        var periodInput = form.querySelector('input[name="period"]');
+        if (!periodInput || !periodInput.value.trim()) {
+          alert('Indicá el período para el envío (ej: 12-2025).');
+          return false;
+        }
+      }
+      return true;
+    }
+
+    // Aplica el filtro inicial si el input viene con valor (identity_q en la URL)
+    document.addEventListener('DOMContentLoaded', filterIdentityTable);
     </script>
     """)
 
-    html.append("</div>")  # layout
     html.append("</body></html>")
-
     return Response("".join(html), mimetype="text/html")
 
 
