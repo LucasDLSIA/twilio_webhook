@@ -32,10 +32,23 @@ import sqlite3
 import time
 
 from flask import Flask, request, Response, abort, jsonify, send_file, make_response, redirect
+from werkzeug.security import generate_password_hash, check_password_hash
+from flask import (
+    Flask,
+    request,
+    Response,
+    redirect,
+    url_for,
+    session,
+    g,
+    )
+from werkzeug.security import generate_password_hash, check_password_hash
+
 
 
 
 app = Flask(__name__)
+app.secret_key = os.getenv("FLASK_SECRET_KEY", "dev-secret-change-me")
 
 
 # ==========================
@@ -392,6 +405,18 @@ def init_db():
         # Si ya existe, va a tirar error y lo ignoramos
         pass
 
+        # Tabla de clientes (usuarios del portal)
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS clients (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            slug TEXT UNIQUE NOT NULL,        -- identificador de empresa, ej: 'ORIBE'
+            name TEXT NOT NULL,               -- nombre legible: 'ORIBE SRL'
+            username TEXT UNIQUE NOT NULL,    -- login
+            password_hash TEXT NOT NULL       -- hash con werkzeug (no texto plano)
+        );
+        """
+    )
 
     conn.commit()
     conn.close()
@@ -3427,19 +3452,28 @@ def admin_identity_verification_bulk():
 def admin_identity_verification_upload():
     """
     Carga masiva de identidades verificadas desde CSV/Excel.
-    Espera columnas tipo: archivo_norm / CUIL, dni / DNI, to_whatsapp / Telefono...
-    Además, busca el nombre en el Excel de envíos y lo guarda en identity_verification.
+
+    Reglas:
+    - El CUIL (archivo_norm / CUIL / archivo) DEBE existir en el Excel de envíos.
+    - El nombre y el WhatsApp se toman SIEMPRE desde el Excel de envíos.
+    - Del archivo subido solo se usa el DNI.
+    - Filas sin CUIL o DNI, o sin match en envíos -> se saltan.
     """
     file = request.files.get("file")
+    token = _get_admin_token_from_request()
+
     if not file or file.filename == "":
-        token = _get_admin_token_from_request()
-        return redirect(f"/admin/panel?token={token or ''}&msg=upload_error&detail=Archivo%20no%20enviado")
+        return redirect(
+            f"/admin/panel?token={token or ''}"
+            "&msg=upload_error&detail=Archivo%20no%20enviado"
+        )
 
     filename = file.filename
     ext = os.path.splitext(filename)[1].lower()
 
     import pandas as pd
 
+    # Leer CSV/Excel
     try:
         if ext in (".xlsx", ".xls"):
             df = pd.read_excel(file)
@@ -3448,22 +3482,28 @@ def admin_identity_verification_upload():
             df = pd.read_csv(file, sep=None, engine="python")
     except Exception as e:
         print("ERROR leyendo archivo de upload identidades:", e)
-        token = _get_admin_token_from_request()
-        return redirect(f"/admin/panel?token={token or ''}&msg=upload_error&detail=No%20se%20pudo%20leer%20el%20archivo")
+        return redirect(
+            f"/admin/panel?token={token or ''}"
+            "&msg=upload_error&detail=No%20se%20pudo%20leer%20el%20archivo"
+        )
 
-    # Normalizamos nombres de columnas a minúscula simple
+    # Normalizar nombres de columnas a minúscula
     df.columns = [str(c).strip().lower() for c in df.columns]
 
-    # Mapa CUIL -> nombre desde Excel de envíos
+    # ============================
+    # Construimos mapa desde envíos
+    #   CUIL -> {nombre, to_whatsapp}
+    # ============================
     try:
         envios_rows = read_envios_rows()
     except Exception as e:
         print("ERROR read_envios_rows en upload:", e)
         envios_rows = []
 
-    cuil_to_name = {}
+    cuil_to_data: dict[str, dict] = {}
+
     for r in envios_rows:
-        cuil_row = str(
+        archivo_norm = str(
             r.get("Archivo_norm")
             or r.get("archivo_norm")
             or r.get("Archivo")
@@ -3472,7 +3512,11 @@ def admin_identity_verification_upload():
             or r.get("Cuil")
             or ""
         ).strip()
-        nombre_row = (
+
+        if not archivo_norm:
+            continue
+
+        nombre = (
             r.get("Nombre")
             or r.get("Nombre y apellido")
             or r.get("Apellido y nombre")
@@ -3481,8 +3525,30 @@ def admin_identity_verification_upload():
             or r.get("nombre")
             or ""
         )
-        if cuil_row and nombre_row and cuil_row not in cuil_to_name:
-            cuil_to_name[cuil_row] = str(nombre_row).strip()
+        nombre = str(nombre).strip()
+
+        telefono = str(
+            r.get("Telefono_norm")
+            or r.get("Telefono")
+            or r.get("Teléfono")
+            or ""
+        ).strip()
+
+        if not telefono:
+            continue
+
+        try:
+            to_whatsapp = normalize_to_whatsapp_e164(telefono)
+        except Exception:
+            # Si no podemos normalizar el teléfono de envíos, no usamos ese CUIL
+            continue
+
+        # Guardamos solo el primero que encontremos por CUIL
+        if archivo_norm not in cuil_to_data:
+            cuil_to_data[archivo_norm] = {
+                "nombre": nombre,
+                "to_whatsapp": to_whatsapp,
+            }
 
     conn = get_db_connection()
     cur = conn.cursor()
@@ -3491,37 +3557,34 @@ def admin_identity_verification_upload():
     skipped = 0
 
     for _, row in df.iterrows():
+        # CUIL desde el archivo subido
         cuil = str(
             row.get("archivo_norm")
             or row.get("cuil")
             or row.get("archivo")
             or ""
         ).strip()
+
         dni = str(
             row.get("dni")
             or row.get("documento")
             or ""
         ).strip()
-        to_whatsapp = str(
-            row.get("to_whatsapp")
-            or row.get("whatsapp")
-            or row.get("telefono_norm")
-            or row.get("telefono")
-            or ""
-        ).strip()
 
-        if not cuil or not dni or not to_whatsapp:
+        if not cuil or not dni or not dni.isdigit():
             skipped += 1
             continue
 
-        try:
-            to_whatsapp = normalize_to_whatsapp_e164(to_whatsapp)
-        except Exception:
+        env_data = cuil_to_data.get(cuil)
+        if not env_data:
+            # No existe ese CUIL en el Excel de envíos -> saltamos
             skipped += 1
             continue
 
-        nombre = cuil_to_name.get(cuil, "")
+        nombre = env_data["nombre"]
+        to_whatsapp = env_data["to_whatsapp"]
 
+        # Insertamos / actualizamos identity_verification
         cur.execute(
             """
             INSERT OR REPLACE INTO identity_verification
@@ -3537,7 +3600,6 @@ def admin_identity_verification_upload():
 
     print(f"UPLOAD identity_verification: inserted={inserted}, skipped={skipped}")
 
-    token = _get_admin_token_from_request()
     return redirect(
         f"/admin/panel?token={token or ''}"
         f"&msg=upload_ok&upload_ins={inserted}&upload_skip={skipped}"
@@ -4379,6 +4441,342 @@ def ping():
 import threading
 import time
 import requests
+
+#=================================
+#Clientes
+
+def get_client_by_username(username: str):
+    conn = get_db_connection()
+    conn.row_factory = sqlite3.Row
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM clients WHERE username = ?;", (username,))
+    row = cur.fetchone()
+    conn.close()
+    return row
+
+def get_client_by_id(client_id: int):
+    conn = get_db_connection()
+    conn.row_factory = sqlite3.Row
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM clients WHERE id = ?;", (client_id,))
+    row = cur.fetchone()
+    conn.close()
+    return row
+
+@app.route("/admin/create_client", methods=["POST"])
+@admin_required
+def admin_create_client():
+    """
+    Crea un usuario cliente (empresa) para el portal.
+    Se llama con: slug, name, username, password
+    """
+    slug = (request.form.get("slug") or "").strip()
+    name = (request.form.get("name") or "").strip()
+    username = (request.form.get("username") or "").strip()
+    password = (request.form.get("password") or "").strip()
+
+    if not slug or not name or not username or not password:
+        return {"ok": False, "error": "slug, name, username y password son requeridos"}, 400
+
+    password_hash = generate_password_hash(password)
+
+    conn = get_db_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute(
+            """
+            INSERT INTO clients (slug, name, username, password_hash)
+            VALUES (?, ?, ?, ?);
+            """,
+            (slug, name, username, password_hash),
+        )
+        conn.commit()
+    except sqlite3.IntegrityError as e:
+        conn.close()
+        return {"ok": False, "error": f"Error de integridad: {e}"}, 400
+
+    conn.close()
+    return {"ok": True, "slug": slug, "username": username}, 200
+
+from functools import wraps
+
+def client_login_required(fn):
+    @wraps(fn)
+    def wrapper(*args, **kwargs):
+        client_id = session.get("client_id")
+        if not client_id:
+            # no está logueado -> login
+            return redirect(url_for("client_login"))
+        client = get_client_by_id(client_id)
+        if not client:
+            session.clear()
+            return redirect(url_for("client_login"))
+        # dejamos el cliente en g para usarlo en los handlers
+        g.current_client = client
+        return fn(*args, **kwargs)
+    return wrapper
+
+@app.route("/cliente/login", methods=["GET", "POST"])
+def client_login():
+    """
+    Login simple para el portal del cliente.
+    """
+    error = ""
+    if request.method == "POST":
+        username = (request.form.get("username") or "").strip()
+        password = (request.form.get("password") or "").strip()
+
+        user = get_client_by_username(username)
+        if not user or not check_password_hash(user["password_hash"], password):
+            error = "Usuario o contraseña incorrectos."
+        else:
+            # login OK
+            session["client_id"] = user["id"]
+            session["client_username"] = user["username"]
+            return redirect(url_for("client_portal"))
+
+    # HTML minimalista (después lo tuneamos si querés)
+    html = []
+    html.append("<!doctype html><html lang='es'><head><meta charset='utf-8'>")
+    html.append("<title>Login cliente - Recibos</title>")
+    html.append("""
+    <style>
+      body {
+        margin: 0;
+        font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+        background: radial-gradient(circle at top, #1f2937 0, #020617 55%, #020617 100%);
+        color: #e5e7eb;
+        display:flex;
+        align-items:center;
+        justify-content:center;
+        height:100vh;
+      }
+      .card {
+        background:#020617;
+        border-radius:16px;
+        border:1px solid #1f2937;
+        padding:24px 28px;
+        width:280px;
+      }
+      h1 {
+        font-size:18px;
+        margin-top:0;
+        margin-bottom:12px;
+      }
+      label {
+        font-size:12px;
+        color:#9ca3af;
+        display:block;
+        margin-top:8px;
+      }
+      input[type='text'], input[type='password'] {
+        margin-top:3px;
+        width:100%;
+        padding:6px 8px;
+        border-radius:8px;
+        border:1px solid #374151;
+        background:rgba(15,23,42,0.9);
+        color:#e5e7eb;
+        font-size:13px;
+      }
+      input:focus {
+        outline:1px solid #22c55e;
+        outline-offset:1px;
+      }
+      button {
+        margin-top:14px;
+        width:100%;
+        padding:8px 12px;
+        border-radius:999px;
+        border:none;
+        cursor:pointer;
+        font-size:13px;
+        font-weight:500;
+        background:radial-gradient(circle at top left,#22c55e 0,#16a34a 60%);
+        color:#022c22;
+      }
+      .error {
+        margin-top:10px;
+        font-size:12px;
+        color:#f97373;
+      }
+    </style>
+    """)
+    html.append("</head><body>")
+    html.append("<div class='card'>")
+    html.append("<h1>Portal de recibos</h1>")
+    html.append("<form method='post'>")
+    html.append("<label>Usuario<br><input type='text' name='username' autocomplete='username'></label>")
+    html.append("<label>Contraseña<br><input type='password' name='password' autocomplete='current-password'></label>")
+    html.append("<button type='submit'>Ingresar</button>")
+    html.append("</form>")
+    if error:
+        html.append(f"<div class='error'>{esc_html(error)}</div>")
+    html.append("</div>")
+    html.append("</body></html>")
+    return Response("".join(html), mimetype="text/html")
+
+@app.route("/cliente/logout", methods=["POST"])
+@client_login_required
+def client_logout():
+    session.clear()
+    return redirect(url_for("client_login"))
+
+def get_envios_for_client_slug(slug: str) -> list[dict]:
+    """
+    Devuelve sólo las filas del Excel de envíos que correspondan
+    a la empresa cuyo slug coincida con la columna 'Empresa' (o similar).
+    """
+    try:
+        rows = read_envios_rows()
+    except Exception:
+        return []
+
+    filtered = []
+    for r in rows:
+        empresa = str(
+            r.get("Empresa")
+            or r.get("empresa")
+            or r.get("Cliente")
+            or r.get("cliente")
+            or ""
+        ).strip()
+        if empresa == slug:
+            filtered.append(r)
+    return filtered
+
+@app.route("/cliente", methods=["GET"])
+@client_login_required
+def client_portal():
+    client = g.current_client
+    slug = client["slug"]
+    name = client["name"]
+
+    # filas del Excel sólo de esta empresa
+    envios_rows = get_envios_for_client_slug(slug)
+    envios_count = len(envios_rows)
+
+    # últimos jobs (globales – si querés se pueden “taggear” por empresa más adelante)
+    conn = get_db_connection()
+    conn.row_factory = sqlite3.Row
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT job_id, period_label, status, created_at, started_at, finished_at,
+               total_enqueued, total_sent, total_failed
+        FROM send_jobs
+        ORDER BY created_at DESC
+        LIMIT 10;
+        """
+    )
+    jobs = cur.fetchall()
+    conn.close()
+
+    def fmt_ts(ts):
+        if not ts:
+            return ""
+        try:
+            return datetime.fromtimestamp(int(ts)).strftime("%Y-%m-%d %H:%M:%S")
+        except Exception:
+            return str(ts)
+
+    html = []
+    html.append("<!doctype html><html lang='es'><head><meta charset='utf-8'>")
+    html.append(f"<title>Portal cliente - {esc_html(name)}</title>")
+    # Podríamos reusar estilos del admin, pero te hago algo corto:
+    html.append("""
+    <style>
+      body { margin:0; font-family:system-ui, -apple-system, BlinkMacSystemFont,"Segoe UI",sans-serif;
+             background:#020617; color:#e5e7eb; }
+      .layout { max-width:900px; margin:0 auto; padding:24px 16px 40px; }
+      h1 { font-size:22px; margin-bottom:4px; }
+      .sub { font-size:12px; color:#9ca3af; margin-bottom:20px; }
+      .card { background:#020617; border-radius:14px; border:1px solid #1f2937; padding:14px 16px; margin-bottom:16px; }
+      label { font-size:12px; color:#9ca3af; display:block; margin-top:6px; }
+      input[type='text'], input[type='number'] {
+        margin-top:3px; padding:6px 8px; width:220px; border-radius:8px;
+        border:1px solid #374151; background:#020617; color:#e5e7eb; font-size:13px;
+      }
+      button { margin-top:10px; padding:7px 14px; border-radius:999px; border:none;
+               cursor:pointer; font-size:13px; font-weight:500;
+               background:radial-gradient(circle at top left,#22c55e 0,#16a34a 60%);
+               color:#022c22; }
+      table { width:100%; border-collapse:collapse; margin-top:8px; font-size:12px; }
+      th, td { padding:6px 8px; border-bottom:1px solid #1f2937; text-align:left; }
+      th { color:#9ca3af; font-weight:500; background:#020617; }
+      .small { font-size:11px; color:#9ca3af; }
+      .topline { display:flex; justify-content:space-between; align-items:center; margin-bottom:12px; }
+      form.inline { display:inline-block; margin-left:8px; }
+    </style>
+    """)
+    html.append("</head><body><div class='layout'>")
+    html.append("<div class='topline'>")
+    html.append(f"<div><h1>Portal de recibos - {esc_html(name)}</h1>")
+    html.append("<div class='sub'>Enviá recibos por WhatsApp, revisá estados y descargá el Excel.</div></div>")
+    html.append("<form method='post' action='/cliente/logout' class='inline'>")
+    html.append("<button type='submit'>Cerrar sesión</button>")
+    html.append("</form>")
+    html.append("</div>")
+
+    # Resumen simple
+    html.append("<div class='card'>")
+    html.append(f"<div class='small'>Empleados en el Excel de envíos: <b>{envios_count}</b></div>")
+    html.append("</div>")
+
+    # Envío masivo
+    html.append("<div class='card'>")
+    html.append("<h2 style='font-size:16px;margin:0 0 8px;'>Envío masivo de recibos</h2>")
+    html.append("<div class='small'>Envía la plantilla de WhatsApp a todos los empleados de este período (requiere que exista el PDF).</div>")
+    html.append("<form method='post' action='/cliente/send_mass'>")
+    html.append("<label>Período (mm-aaaa o mm/aaaa)<br><input type='text' name='period' placeholder='12-2025'></label>")
+    html.append("<label>Límite de envíos (0 = todos)<br><input type='number' name='limit' min='0' value='0'></label>")
+    html.append("<button type='submit'>Encolar envío masivo</button>")
+    html.append("</form>")
+    html.append("</div>")
+
+    # Envío puntual
+    html.append("<div class='card'>")
+    html.append("<h2 style='font-size:16px;margin:0 0 8px;'>Reenviar a una persona</h2>")
+    html.append("<div class='small'>Ingresá CUIL y período para reenviar el recibo a una persona específica.</div>")
+    html.append("<form method='post' action='/cliente/send_one'>")
+    html.append("<label>CUIL<br><input type='text' name='archivo_norm' placeholder='20-XXXXXXXX-X'></label>")
+    html.append("<label>Período (mm-aaaa o mm/aaaa)<br><input type='text' name='period' placeholder='12-2025'></label>")
+    html.append("<button type='submit'>Enviar a esta persona</button>")
+    html.append("</form>")
+    html.append("</div>")
+
+    # Estado de jobs
+    html.append("<div class='card'>")
+    html.append("<h2 style='font-size:16px;margin:0 0 8px;'>Últimos envíos</h2>")
+    html.append("<table><tr><th>Período</th><th>Estado</th><th>Encolados</th><th>Enviados</th><th>Fallidos</th><th>Creado</th></tr>")
+    for j in jobs:
+        status = (j["status"] or "").upper()
+        html.append("<tr>")
+        html.append(f"<td>{esc_html(j['period_label'] or '')}</td>")
+        html.append(f"<td>{esc_html(status)}</td>")
+        html.append(f"<td>{j['total_enqueued']}</td>")
+        html.append(f"<td>{j['total_sent']}</td>")
+        html.append(f"<td>{j['total_failed']}</td>")
+        html.append(f"<td>{esc_html(fmt_ts(j['created_at']))}</td>")
+        html.append("</tr>")
+    if not jobs:
+        html.append("<tr><td colspan='6' class='small'>Todavía no hay envíos registrados.</td></tr>")
+    html.append("</table>")
+    html.append("</div>")
+
+    # Descargar Excel
+    html.append("<div class='card'>")
+    html.append("<h2 style='font-size:16px;margin:0 0 8px;'>Reportes</h2>")
+    html.append("<div class='small'>Descargá el Excel con estados de envío y respuestas.</div>")
+    html.append("<a href='/cliente/report_recibos.xlsx' target='_blank'>📄 Descargar reporte de recibos (Excel)</a>")
+    html.append("</div>")
+
+    html.append("</div></body></html>")
+    return Response("".join(html), mimetype="text/html")
+
+
+#=================================
+
 
 def keep_alive():
     url = "https://twilio-webhook-lddc.onrender.com/ping"
