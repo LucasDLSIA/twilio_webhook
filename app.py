@@ -374,6 +374,24 @@ def init_db():
         """
     )
 
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS identity_verification (
+            archivo_norm TEXT PRIMARY KEY,   -- CUIL
+            dni TEXT NOT NULL,
+            to_whatsapp TEXT NOT NULL,       -- whatsapp:+54...
+            verified_at INTEGER NOT NULL,
+            source TEXT NOT NULL,            -- 'manual' o 'chat' (o 'legacy')
+            nombre TEXT                      -- nombre tomado del Excel de envíos
+        );
+    """)
+
+    # Por si la tabla ya existía sin la columna 'nombre', la agregamos con ALTER TABLE
+    try:
+        cur.execute("ALTER TABLE identity_verification ADD COLUMN nombre TEXT;")
+    except Exception:
+        # Si ya existe, va a tirar error y lo ignoramos
+        pass
+
 
     conn.commit()
     conn.close()
@@ -1866,30 +1884,30 @@ def empty_twiml():
 @admin_required
 def admin_verify_person():
     """
-    Marca manualmente una identidad como verificada:
-    - Recibe archivo_norm (CUIL) y dni
-    - Busca el teléfono en el Excel de envíos
-    - Guarda en identity_verification con source='manual'
-    - Vuelve al panel admin
+    Marca un CUIL + DNI como verificado de forma manual.
+    - Busca el número de WhatsApp y el nombre en el Excel de envíos.
+    - Inserta/actualiza en identity_verification (incluyendo 'nombre').
     """
-    token = _get_admin_token_from_request()
     archivo_norm = (request.form.get("archivo_norm") or "").strip()
     dni = (request.form.get("dni") or "").strip()
 
     if not archivo_norm or not dni:
-        # Si falta algo, devolvemos 400 o redirigimos con error simple
-        if token:
-            return redirect(f"/admin/panel?token={token}")
-        return redirect("/admin/panel")
+        return {"ok": False, "error": "archivo_norm y dni son requeridos"}, 400
 
-    # Buscar teléfono en Excel de envíos
+    if not dni.isdigit():
+        return {"ok": False, "error": "dni debe ser solo números"}, 400
+
+    # Leemos Excel de envíos para sacar WhatsApp + nombre
     try:
-        rows = read_envios_rows()
-    except Exception:
-        rows = []
+        envios_rows = read_envios_rows()
+    except Exception as e:
+        print("ERROR read_envios_rows en verify_person:", e)
+        envios_rows = []
 
-    telefono = ""
-    for r in rows:
+    to_whatsapp = None
+    nombre = ""
+
+    for r in envios_rows:
         cuil_row = str(
             r.get("Archivo_norm")
             or r.get("archivo_norm")
@@ -1900,48 +1918,67 @@ def admin_verify_person():
             or ""
         ).strip()
 
-        if cuil_row == archivo_norm:
-            telefono = str(
-                r.get("Telefono_norm")
-                or r.get("Telefono")
-                or r.get("Teléfono")
-                or ""
-            ).strip()
+        if cuil_row != archivo_norm:
+            continue
+
+        telefono = str(
+            r.get("Telefono_norm")
+            or r.get("Telefono")
+            or r.get("Teléfono")
+            or ""
+        ).strip()
+
+        nombre_row = (
+            r.get("Nombre")
+            or r.get("Nombre y apellido")
+            or r.get("Apellido y nombre")
+            or r.get("Empleado")
+            or r.get("Persona")
+            or r.get("nombre")
+            or ""
+        )
+
+        if telefono:
+            try:
+                to_whatsapp = normalize_to_whatsapp_e164(telefono)
+            except Exception:
+                pass
+
+        if nombre_row and not nombre:
+            nombre = str(nombre_row).strip()
+
+        # Si ya tenemos WhatsApp, podemos cortar
+        if to_whatsapp:
             break
 
-    if not telefono:
-        # No encontramos teléfono, igual registramos la verificación
-        to_whatsapp = ""
-    else:
-        try:
-            to_whatsapp = normalize_to_whatsapp_e164(telefono)
-        except Exception:
-            to_whatsapp = ""
+    if not to_whatsapp:
+        return {
+            "ok": False,
+            "error": "No se encontró número de WhatsApp para ese CUIL en el Excel de envíos",
+        }, 400
 
-    now = int(time.time())
-
+    # Guardamos en identity_verification (incluyendo nombre)
     conn = get_db_connection()
     cur = conn.cursor()
     cur.execute(
         """
-        INSERT INTO identity_verification (archivo_norm, dni, to_whatsapp, verified_at, source)
-        VALUES (?, ?, ?, ?, 'manual')
-        ON CONFLICT(archivo_norm)
-        DO UPDATE SET
-          dni = excluded.dni,
-          to_whatsapp = excluded.to_whatsapp,
-          verified_at = excluded.verified_at,
-          source = 'manual';
+        INSERT OR REPLACE INTO identity_verification
+            (archivo_norm, dni, to_whatsapp, verified_at, source, nombre)
+        VALUES (?, ?, ?, ?, ?, ?);
         """,
-        (archivo_norm, dni, to_whatsapp, now),
+        (archivo_norm, dni, to_whatsapp, int(time.time()), "manual", nombre),
     )
     conn.commit()
     conn.close()
 
-    # Volvemos al panel con el token (si estaba)
-    if token:
-        return redirect(f"/admin/panel?token={token}")
-    return redirect("/admin/panel")
+    return {
+        "ok": True,
+        "archivo_norm": archivo_norm,
+        "dni": dni,
+        "to_whatsapp": to_whatsapp,
+        "nombre": nombre,
+        "source": "manual",
+    }, 200
 
 
 @app.route("/admin/send_template_all", methods=["POST"])
@@ -3304,94 +3341,63 @@ def admin_send_template_queue_stop():
 @admin_required
 def admin_identity_verification_send():
     """
-    Envía plantilla SOLO a los CUIL seleccionados desde el panel.
-    Crea un job acotado (cola corta) para esos destinatarios.
+    Encola envíos SOLO para las identidades seleccionadas en el panel,
+    usando el mismo Excel de envíos (read_envios_rows) y la misma lógica de enqueue_job,
+    pero filtrando por los CUILs (archivo_norm) marcados.
     """
     token = _get_admin_token_from_request()
-    ids = request.form.getlist("ids")   # archivo_norm seleccionados
+
+    # Período desde el form (viene del input de arriba del botón "Enviar plantilla a seleccionados")
     period_raw = request.form.get("period") or ""
-    period_label = normalize_period_label(period_raw)
+    period_lbl = normalize_period_label(period_raw)  # misma función que usás en el masivo
+    if not period_lbl:
+        # Período inválido → mensaje en el panel
+        return redirect(f"/admin/panel?token={token}&msg=bad_period")
 
-    if not ids:
-        return redirect(f"/admin/panel?token={token or ''}")
+    # CUILs seleccionados en la tabla (checkboxes name='ids')
+    selected_ids = request.form.getlist("ids")
+    selected_ids = [s.strip() for s in selected_ids if s.strip()]
+    if not selected_ids:
+        return redirect(f"/admin/panel?token={token}&msg=no_ids")
 
-    if not period_label:
-        return Response("Falta período (mm/aaaa)", status=400, mimetype="text/plain")
+    selected_set = set(selected_ids)
 
-    conn = get_db_connection()
-    conn.row_factory = sqlite3.Row
-    cur = conn.cursor()
+    # Leemos el Excel de envíos
+    try:
+        all_rows = read_envios_rows()
+    except Exception:
+        all_rows = []
 
-    # obtener teléfono desde excel
-    env = read_envios_rows()
-    tel_map = {}
-    name_map = {}
-    for r in env:
-        archivo_norm = str(
+    # Filtramos SOLO las filas cuyo archivo_norm/CUIL esté en selected_set
+    filtered_rows = []
+    for r in all_rows:
+        archivo_norm = s(
             r.get("Archivo_norm")
             or r.get("archivo_norm")
             or r.get("Archivo")
             or r.get("archivo")
             or r.get("CUIL")
             or r.get("Cuil")
-            or ""
-        ).strip()
-        tel = str(
-            r.get("Telefono_norm")
-            or r.get("Telefono")
-            or ""
-        ).strip()
-        name = (
-            r.get("Nombre")
-            or r.get("Apellido y nombre")
-            or ""
-        ).strip()
-        if archivo_norm:
-            tel_map[archivo_norm] = tel
-            name_map[archivo_norm] = name
-
-    # Crear job especial
-    job_id = str(uuid.uuid4())
-    now = int(time.time())
-    cur.execute(
-        "INSERT INTO send_jobs (job_id, period_label, created_at, status) VALUES (?, ?, ?, 'PENDING');",
-        (job_id, period_label, now),
-    )
-    total_enqueued = 0
-
-    for cuil in ids:
-        tel = tel_map.get(cuil, "")
-        name = name_map.get(cuil, "")
-        if not tel:
-            continue
-        try:
-            to_whatsapp = normalize_to_whatsapp_e164(tel)
-        except:
-            continue
-
-        pdf_id = find_pdf_for_archivo_and_period(cuil, period_label)
-        if not pdf_id:
-            continue
-
-        cur.execute(
-            """
-            INSERT OR IGNORE INTO send_queue
-            (job_id, to_whatsapp, archivo_norm, nombre, period_label, created_at)
-            VALUES (?, ?, ?, ?, ?, ?);
-            """,
-            (job_id, to_whatsapp, cuil, name, period_label, now),
         )
-        if cur.rowcount == 1:
-            total_enqueued += 1
+        if archivo_norm and archivo_norm in selected_set:
+            filtered_rows.append(r)
 
-    cur.execute("UPDATE send_jobs SET total_enqueued=? WHERE job_id=?", (total_enqueued, job_id))
-    conn.commit()
-    conn.close()
+    if not filtered_rows:
+        # No se encontró ninguna fila del Excel que matchee con los CUIL seleccionados
+        return redirect(f"/admin/panel?token={token}&msg=no_rows_for_ids")
 
-    # lanzar worker
+    # Encolamos solamente esas filas, con require_pdf=True (solo si existe PDF)
+    result = enqueue_job(period_lbl, filtered_rows, require_pdf=True)
+    job_id = result["job_id"]
     start_queue_worker_once()
 
-    return redirect(f"/admin/panel?token={token}&msg=send_ok&job={job_id}&enq={total_enqueued}")
+    # Redirigimos al panel con info del job
+    enq = result.get("enqueued", 0)
+    skipped = result.get("skipped", 0)
+    return redirect(
+        f"/admin/panel?token={token}&msg=send_ok&job={job_id}&enq={enq}&skipped={skipped}"
+    )
+
 
 #=============================
 @app.route("/admin/identity_verification/bulk", methods=["POST"])
@@ -3425,106 +3431,125 @@ def admin_identity_verification_bulk():
 @admin_required
 def admin_identity_verification_upload():
     """
-    Sube un Excel/CSV con identidades validadas y las inserta en identity_verification.
-    Columnas esperadas (nombre flexible):
-      - CUIL / archivo_norm
-      - DNI / dni
-      - WhatsApp / Telefono / Telefono_norm
+    Carga masiva de identidades verificadas desde CSV/Excel.
+    Espera columnas tipo: archivo_norm / CUIL, dni / DNI, to_whatsapp / Telefono...
+    Además, busca el nombre en el Excel de envíos y lo guarda en identity_verification.
     """
-    token = _get_admin_token_from_request()
     file = request.files.get("file")
-    if not file or not file.filename:
-        return redirect(f"/admin/panel?token={token or ''}")
+    if not file or file.filename == "":
+        return {"ok": False, "error": "Archivo no enviado"}, 400
 
-    filename = file.filename.lower()
+    filename = file.filename
+    ext = os.path.splitext(filename)[1].lower()
 
-    rows = []
+    import pandas as pd
+
     try:
-        if filename.endswith(".csv"):
-            # CSV (separador ; o ,)
-            data = file.read().decode("utf-8-sig", errors="ignore")
-            import csv
-            sample = data.splitlines()
-            sniffer = csv.Sniffer()
-            try:
-                dialect = sniffer.sniff("\n".join(sample[:5]))
-            except Exception:
-                dialect = csv.excel
-                dialect.delimiter = ";"
-            reader = csv.DictReader(sample, dialect=dialect)
-            rows = list(reader)
-        elif filename.endswith(".xlsx") or filename.endswith(".xls"):
-            # Excel con openpyxl
-            from openpyxl import load_workbook
-            import io
-            in_mem = io.BytesIO(file.read())
-            wb = load_workbook(in_mem, data_only=True)
-            ws = wb.active
-            headers = []
-            for i, row in enumerate(ws.iter_rows(values_only=True)):
-                if i == 0:
-                    headers = [str(c or "").strip() for c in row]
-                    continue
-                d = {}
-                for h, v in zip(headers, row):
-                    d[h] = v
-                rows.append(d)
+        if ext in (".xlsx", ".xls"):
+            df = pd.read_excel(file)
         else:
-            # extensión desconocida, no hacemos nada
-            return redirect(f"/admin/panel?token={token or ''}")
-    except Exception:
-        # ante error de lectura, volvemos al panel
-        return redirect(f"/admin/panel?token={token or ''}")
+            # CSV: autodetectar separador
+            df = pd.read_csv(file, sep=None, engine="python")
+    except Exception as e:
+        print("ERROR leyendo archivo de upload identidades:", e)
+        return {"ok": False, "error": "No se pudo leer el archivo"}, 400
 
-    inserted = 0
-    now = int(time.time())
+    # Normalizamos nombres de columnas a minúscula simple
+    df.columns = [str(c).strip().lower() for c in df.columns]
+
+    # Mapa CUIL -> nombre desde Excel de envíos
+    try:
+        envios_rows = read_envios_rows()
+    except Exception as e:
+        print("ERROR read_envios_rows en upload:", e)
+        envios_rows = []
+
+    cuil_to_name = {}
+    for r in envios_rows:
+        cuil_row = str(
+            r.get("Archivo_norm")
+            or r.get("archivo_norm")
+            or r.get("Archivo")
+            or r.get("archivo")
+            or r.get("CUIL")
+            or r.get("Cuil")
+            or ""
+        ).strip()
+        nombre_row = (
+            r.get("Nombre")
+            or r.get("Nombre y apellido")
+            or r.get("Apellido y nombre")
+            or r.get("Empleado")
+            or r.get("Persona")
+            or r.get("nombre")
+            or ""
+        )
+        if cuil_row and nombre_row and cuil_row not in cuil_to_name:
+            cuil_to_name[cuil_row] = str(nombre_row).strip()
 
     conn = get_db_connection()
     cur = conn.cursor()
 
-    for r in rows:
-        # Detectar columnas (varios nombres posibles)
-        archivo_norm = (
-            str(r.get("CUIL") or r.get("archivo_norm") or r.get("Archivo_norm") or "").strip()
-        )
-        dni = str(r.get("DNI") or r.get("dni") or "").strip()
-        telefono = str(
-            r.get("WhatsApp")
-            or r.get("Telefono")
-            or r.get("Telefono_norm")
+    inserted = 0
+    skipped = 0
+
+    for _, row in df.iterrows():
+        cuil = str(
+            row.get("archivo_norm")
+            or row.get("cuil")
+            or row.get("archivo")
+            or ""
+        ).strip()
+        dni = str(
+            row.get("dni")
+            or row.get("documento")
+            or ""
+        ).strip()
+        to_whatsapp = str(
+            row.get("to_whatsapp")
+            or row.get("whatsapp")
+            or row.get("telefono_norm")
+            or row.get("telefono")
             or ""
         ).strip()
 
-        if not archivo_norm or not dni or not telefono:
+        if not cuil or not dni or not to_whatsapp:
+            skipped += 1
             continue
 
         try:
-            to_whatsapp = normalize_to_whatsapp_e164(telefono)
+            to_whatsapp = normalize_to_whatsapp_e164(to_whatsapp)
         except Exception:
+            skipped += 1
             continue
 
-        # Usamos el mismo helper de identidad
-        try:
-            cur.execute(
-                """
-                INSERT INTO identity_verification (archivo_norm, dni, to_whatsapp, verified_at, source)
-                VALUES (?, ?, ?, ?, 'upload')
-                ON CONFLICT(archivo_norm)
-                DO UPDATE SET dni=excluded.dni,
-                              to_whatsapp=excluded.to_whatsapp,
-                              verified_at=excluded.verified_at,
-                              source=excluded.source;
-                """,
-                (archivo_norm, dni, to_whatsapp, now),
-            )
-            inserted += 1
-        except Exception:
-            pass
+        nombre = cuil_to_name.get(cuil, "")
+
+        # Si querés ser más estricto y NO insertar si el CUIL no existe en envíos:
+        if not nombre:
+            print(f"WARNING: CUIL {cuil} no encontrado en Excel de envíos, se omite.")
+            skipped += 1
+            continue
+
+        cur.execute(
+            """
+            INSERT OR REPLACE INTO identity_verification
+                (archivo_norm, dni, to_whatsapp, verified_at, source, nombre)
+            VALUES (?, ?, ?, ?, ?, ?);
+            """,
+            (cuil, dni, to_whatsapp, int(time.time()), "upload", nombre),
+        )
+        inserted += 1
 
     conn.commit()
     conn.close()
 
+    print(f"UPLOAD identity_verification: inserted={inserted}, skipped={skipped}")
+
+    # Volvemos al panel
+    token = _get_admin_token_from_request()
     return redirect(f"/admin/panel?token={token or ''}")
+
 
 @app.route("/admin/identity_template.csv", methods=["GET"])
 @admin_required
