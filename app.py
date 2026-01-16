@@ -3512,6 +3512,87 @@ def admin_identity_verification_bulk():
     conn.close()
     return redirect(f"/admin/panel?token={token or ''}")
 
+from flask import request
+import sqlite3
+import time
+
+@app.route("/admin/reset_period_data", methods=["POST"])
+@admin_required
+def admin_reset_period_data():
+    """
+    Limpia SOLO registros asociados a un período (sin tocar identity_verification).
+    Útil para deshacer pruebas (ej: SAC enviado como si fuera un período real).
+
+    Body:
+      - period: "12-2025" o "12/2025" o "2025-12" (lo que uses)
+      - confirm: "YES"
+    """
+    confirm = (request.form.get("confirm") or "").strip().upper()
+    if confirm != "YES":
+        return {"ok": False, "error": "Para limpiar, enviá confirm=YES"}, 400
+
+    period_raw = (request.form.get("period") or request.args.get("period") or "").strip()
+    if not period_raw:
+        return {"ok": False, "error": "Falta period"}, 400
+
+    # Variantes para matchear lo que tengas guardado en DB (mm/aaaa, mm-aaaa, yyyy-mm, etc.)
+    variants = set()
+    variants.add(period_raw)
+
+    # Si existe tu normalizador, lo usamos
+    try:
+        norm = normalize_period_label(period_raw)  # en tu app ya lo usás
+        if norm:
+            variants.add(norm)
+            variants.add(norm.replace("/", "-"))
+    except Exception:
+        pass
+
+    # Si entra con / o -, agregamos la otra forma
+    variants.add(period_raw.replace("/", "-"))
+    variants.add(period_raw.replace("-", "/"))
+
+    # También por si estás guardando yyyy-mm y te pasan mm-aaaa o viceversa,
+    # no inventamos conversiones (porque depende de tu formato), solo matcheamos variantes directas.
+    variants = [v for v in variants if v]
+
+    conn = get_db_connection()
+    cur = conn.cursor()
+
+    def delete_in(table: str, col: str):
+        placeholders = ",".join(["?"] * len(variants))
+        sql = f"DELETE FROM {table} WHERE {col} IN ({placeholders});"
+        cur.execute(sql, variants)
+        return cur.rowcount or 0
+
+    deleted = {}
+
+    # Cola y jobs
+    deleted["send_queue"] = delete_in("send_queue", "period_label")
+    deleted["send_jobs"] = delete_in("send_jobs", "period_label")
+
+    # Tracking de mensajes Twilio
+    deleted["message_status"] = delete_in("message_status", "period_label")
+
+    # Pendientes y respuestas del usuario
+    deleted["pending_views"] = delete_in("pending_views", "period_label")
+    deleted["view_confirmations"] = delete_in("view_confirmations", "period_label")
+
+    # Estado/vistas de recibos por período
+    deleted["recibo_estado"] = delete_in("recibo_estado", "period_label")
+    deleted["recibo_vistas"] = delete_in("recibo_vistas", "period_label")
+
+    conn.commit()
+    conn.close()
+
+    return {
+        "ok": True,
+        "period_input": period_raw,
+        "period_variants_matched": variants,
+        "deleted": deleted,
+    }, 200
+
+
 @app.route("/admin/identity_verification/upload", methods=["POST"])
 @admin_required
 def admin_identity_verification_upload():
@@ -5171,20 +5252,6 @@ def client_portal():
 
 
 #=================================
-
-
-def keep_alive():
-    url = "https://twilio-webhook-lddc.onrender.com/ping"
-    while True:
-        try:
-            print("KEEP-ALIVE: haciendo ping...")
-            requests.get(url, timeout=10)
-        except Exception as e:
-            print("KEEP-ALIVE error:", e)
-        time.sleep(600)
-
-t = threading.Thread(target=keep_alive, daemon=True)
-t.start()
 
 if __name__ == "__main__":
     # Para pruebas locales
