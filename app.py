@@ -440,34 +440,34 @@ def init_db():
 
 # === Migración liviana multiempresa (Drive por tenant) ===
 # Agrega columnas si la tabla ya existía
-for _sql in (
-    "ALTER TABLE tenants ADD COLUMN envios_file_id TEXT;",
-    "ALTER TABLE tenants ADD COLUMN recibos_root_id TEXT;",
-):
-    try:
-        cur.execute(_sql)
-    except Exception:
-        pass
+    for _sql in (
+        "ALTER TABLE tenants ADD COLUMN envios_file_id TEXT;",
+        "ALTER TABLE tenants ADD COLUMN recibos_root_id TEXT;",
+    ):
+        try:
+            cur.execute(_sql)
+        except Exception:
+            pass
 
-    cur.execute(
-        """
-        CREATE TABLE IF NOT EXISTS portal_users (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            tenant_id INTEGER NOT NULL,
-            email TEXT NOT NULL,
-            password_hash TEXT NOT NULL,
-            is_admin INTEGER NOT NULL DEFAULT 0,      -- admin del portal de ESA empresa
-            created_at INTEGER NOT NULL,
-            last_login_at INTEGER,
-            UNIQUE(tenant_id, email),
-            FOREIGN KEY (tenant_id) REFERENCES tenants(id)
-        );
-        """
-    )
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS portal_users (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                tenant_id INTEGER NOT NULL,
+                email TEXT NOT NULL,
+                password_hash TEXT NOT NULL,
+                is_admin INTEGER NOT NULL DEFAULT 0,      -- admin del portal de ESA empresa
+                created_at INTEGER NOT NULL,
+                last_login_at INTEGER,
+                UNIQUE(tenant_id, email),
+                FOREIGN KEY (tenant_id) REFERENCES tenants(id)
+            );
+            """
+        )
 
 
-    conn.commit()
-    conn.close()
+        conn.commit()
+        conn.close()
 
 def get_recibo_vistas(archivo_norm: str, period_label: str) -> int:
     """
