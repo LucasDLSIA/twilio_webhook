@@ -1618,79 +1618,43 @@ def list_periods_for_archivo(archivo_norm: str, tenant_slug: str | None = None) 
     y arma la lista de períodos (mm/aaaa) donde ese archivo existe.
     """
     service = build_drive_service()
-
     filename = f"{archivo_norm}.pdf"
 
-
-# Si tenemos tenant_slug y root configurado, listamos solo dentro de esa carpeta
-if tenant_slug:
-    cfg = get_tenant_drive_config(tenant_slug)
-    root_id = (cfg.get("recibos_root_id") or "").strip()
-    if root_id:
-        try:
-            # Listar carpetas de período directamente dentro de root
-            folders = service.files().list(
-                q=f"'{root_id}' in parents and mimeType = 'application/vnd.google-apps.folder' and trashed = false",
-                fields="files(id, name)",
-                pageSize=1000,
-            ).execute().get("files", [])
-            periods = set()
-            for fold in folders:
-                label = period_folder_to_label(fold.get("name",""))
-                if not label:
-                    continue
-                # Buscar si existe el PDF en esa carpeta
-                res = service.files().list(
-                    q=f"'{fold['id']}' in parents and name = '{filename}' and mimeType = 'application/pdf' and trashed = false",
-                    fields="files(id)",
-                    pageSize=1,
-                ).execute()
-                if res.get("files"):
-                    periods.add(label)
-            ordered = sorted(list(periods), key=period_sort_key, reverse=True)
-            return ordered
-        except Exception as e:
-            print("WARN scoped list_periods_for_archivo:", e)
-        # Si falla, cae al método global
-
-
-
-# Si tenemos tenant_slug y un recibos_root_id configurado, buscamos dentro de esa carpeta
-if tenant_slug:
-    cfg = get_tenant_drive_config(tenant_slug)
-    root_id = (cfg.get("recibos_root_id") or "").strip()
-    if root_id:
-        try:
-            normalized_period = normalize_period_for_folder(period_label)
-            # 1) Listar carpetas de período debajo del root
-            results_folders = service.files().list(
-                q=f"'{root_id}' in parents and mimeType = 'application/vnd.google-apps.folder' and trashed = false",
-                fields="files(id, name)",
-                pageSize=1000,
-            ).execute()
-            period_folders = results_folders.get("files", [])
-            for fold in period_folders:
-                folder_name = fold.get("name", "")
-                normalized_folder = folder_name.replace("/", "-")
-                label = period_folder_to_label(folder_name)
-                normalized_label = label.replace("/", "-") if label else ""
-                if normalized_folder != normalized_period and normalized_label != normalized_period:
-                    continue
-                # 2) Buscar el PDF dentro de esa carpeta de período
-                res_pdf = service.files().list(
-                    q=f"'{fold['id']}' in parents and name = '{filename}' and mimeType = 'application/pdf' and trashed = false",
+    # Si tenemos tenant_slug y root configurado, listamos solo dentro de esa carpeta
+    if tenant_slug:
+        cfg = get_tenant_drive_config(tenant_slug)
+        root_id = (cfg.get("recibos_root_id") or "").strip()
+        if root_id:
+            try:
+                folders = service.files().list(
+                    q=f"'{root_id}' in parents and mimeType = 'application/vnd.google-apps.folder' and trashed = false",
                     fields="files(id, name)",
-                    pageSize=10,
-                ).execute()
-                pdfs = res_pdf.get("files", [])
-                if pdfs:
-                    return pdfs[0].get("id")
-        except Exception as e:
-            print("WARN scoped find_pdf_for_archivo_and_period:", e)
-        # Si falla, caemos al método global (compatibilidad)
+                    pageSize=1000,
+                ).execute().get("files", [])
 
+                periods = set()
+                for fold in folders:
+                    label = period_folder_to_label(fold.get("name", ""))
+                    if not label:
+                        continue
 
-    # Buscamos todos los archivos con ese nombre
+                    res = service.files().list(
+                        q=f"'{fold['id']}' in parents and name = '{filename}' and mimeType = 'application/pdf' and trashed = false",
+                        fields="files(id)",
+                        pageSize=1,
+                    ).execute()
+
+                    if res.get("files"):
+                        periods.add(label)
+
+                ordered = sorted(list(periods), key=period_sort_key, reverse=True)
+                return ordered
+
+            except Exception as e:
+                print("WARN scoped list_periods_for_archivo:", e)
+                # Si falla, cae al método global
+
+    # ===== Método global (compatibilidad) =====
     results = service.files().list(
         q=f"name = '{filename}' and mimeType = 'application/pdf' and trashed = false",
         fields="files(id, name, parents)",
@@ -1698,7 +1662,6 @@ if tenant_slug:
     ).execute()
 
     files = results.get("files", [])
-
     periods = set()
 
     for f in files:
@@ -1706,27 +1669,18 @@ if tenant_slug:
         if not parents:
             continue
         parent_id = parents[0]
-        # Obtenemos el nombre de la carpeta padre, que debería ser 'mm-aaaa'
+
         folder = service.files().get(
             fileId=parent_id,
             fields="id, name, parents",
         ).execute()
+
         folder_name = folder.get("name", "")
         label = period_folder_to_label(folder_name)
         if label:
             periods.add(label)
 
-    # Ordenamos de más nuevo a más viejo
     ordered = sorted(list(periods), key=period_sort_key, reverse=True)
-
-    print("DEBUG list_periods_for_archivo")
-    print("  archivo_norm:", archivo_norm)
-    print("  filename buscado:", filename)
-    print("  cantidad de archivos encontrados:", len(files))
-    for f in files:
-        print("   - file:", f.get("id"), f.get("name"), "parents:", f.get("parents"))
-    print("  periods detectados:", periods)
-
     return ordered
 
 
