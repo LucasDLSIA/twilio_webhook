@@ -263,211 +263,181 @@ def get_db():
 
 def init_db():
     conn = get_db_connection()
-    cur = conn.cursor()
-    cur.execute("PRAGMA journal_mode=WAL;")
-    cur.execute("PRAGMA synchronous=NORMAL;")
-
-
-    cur.execute(
-    """
-    CREATE TABLE IF NOT EXISTS pending_views (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        to_whatsapp TEXT NOT NULL,
-        archivo_norm TEXT NOT NULL,
-        period_label TEXT NOT NULL,
-        created_at INTEGER NOT NULL,
-        UNIQUE(to_whatsapp, archivo_norm, period_label)
-    );
-    """
-)
-
-
-    cur.execute(
-        """
-        CREATE TABLE IF NOT EXISTS message_status (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            message_sid TEXT UNIQUE NOT NULL,
-            to_whatsapp TEXT,
-            archivo_norm TEXT,
-            period_label TEXT,
-            nombre TEXT,
-            kind TEXT,
-            created_at INTEGER,
-            last_status TEXT,
-            last_status_at INTEGER,
-            read_at INTEGER,
-            delivered_at INTEGER,
-            failed_at INTEGER,
-            error_code TEXT,
-            error_message TEXT
-        );
-        """
-    )
-
-    cur.execute(
-        """
-        CREATE TABLE IF NOT EXISTS view_confirmations (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            from_whatsapp TEXT NOT NULL,
-            archivo_norm TEXT,
-            period_label TEXT,
-            response TEXT,
-            created_at INTEGER NOT NULL
-        );
-        """
-    )
-
-    # 👇👈 AÑADIR ESTO
-    cur.execute(
-        """
-        CREATE TABLE IF NOT EXISTS recibo_estado (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            archivo_norm TEXT NOT NULL,
-            period_label TEXT NOT NULL,
-            estado TEXT NOT NULL,         -- 'DISPONIBLE', 'FIRMADO', 'OBSERVADO'
-            UNIQUE(archivo_norm, period_label)
-        );
-        """
-    )
-
-    # 👇👈 AÑADIR ESTO (contador de vistas extra)
-    cur.execute(
-        """
-        CREATE TABLE IF NOT EXISTS recibo_vistas (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            archivo_norm TEXT NOT NULL,
-            period_label TEXT NOT NULL,
-            vistas INTEGER NOT NULL DEFAULT 0,
-            UNIQUE(archivo_norm, period_label)
-        );
-        """
-    )
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS identity_verification (
-            archivo_norm TEXT PRIMARY KEY,   -- CUIL
-            dni TEXT NOT NULL,
-            to_whatsapp TEXT NOT NULL,       -- whatsapp:+54...
-            verified_at INTEGER NOT NULL,
-            source TEXT NOT NULL             -- 'manual' o 'chat' (o 'legacy')
-        );
-    """)
-
-
-
-
-
-    # ==========================
-    # Cola de envíos (batch/queue)
-    # ==========================
-    cur.execute(
-        """
-        CREATE TABLE IF NOT EXISTS send_jobs (
-            job_id TEXT PRIMARY KEY,
-            period_label TEXT NOT NULL,
-            created_at INTEGER NOT NULL,
-            started_at INTEGER,
-            finished_at INTEGER,
-            status TEXT NOT NULL DEFAULT 'PENDING', -- PENDING/RUNNING/DONE/STOPPED
-            total_enqueued INTEGER NOT NULL DEFAULT 0,
-            total_sent INTEGER NOT NULL DEFAULT 0,
-            total_failed INTEGER NOT NULL DEFAULT 0
-        );
-        """
-    )
-
-    cur.execute(
-        """
-        CREATE TABLE IF NOT EXISTS send_queue (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            job_id TEXT NOT NULL,
-            to_whatsapp TEXT NOT NULL,
-            archivo_norm TEXT NOT NULL,
-            nombre TEXT,
-            period_label TEXT NOT NULL,
-            status TEXT NOT NULL DEFAULT 'PENDING',  -- PENDING/SENT/FAILED
-            attempts INTEGER NOT NULL DEFAULT 0,
-            last_error TEXT,
-            created_at INTEGER NOT NULL,
-            sent_at INTEGER,
-            UNIQUE(job_id, to_whatsapp, archivo_norm, period_label)
-        );
-        """
-    )
-
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS identity_verification (
-            archivo_norm TEXT PRIMARY KEY,   -- CUIL
-            dni TEXT NOT NULL,
-            to_whatsapp TEXT NOT NULL,       -- whatsapp:+54...
-            verified_at INTEGER NOT NULL,
-            source TEXT NOT NULL,            -- 'manual' o 'chat' (o 'legacy')
-            nombre TEXT                      -- nombre tomado del Excel de envíos
-        );
-    """)
-
-    # Por si la tabla ya existía sin la columna 'nombre', la agregamos con ALTER TABLE
     try:
-        cur.execute("ALTER TABLE identity_verification ADD COLUMN nombre TEXT;")
-    except Exception:
-        # Si ya existe, va a tirar error y lo ignoramos
-        pass
+        cur = conn.cursor()
 
-        # Tabla de clientes (usuarios del portal)
-    cur.execute(
-        """
-        CREATE TABLE IF NOT EXISTS clients (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            slug TEXT UNIQUE NOT NULL,        -- identificador de empresa, ej: 'ORIBE'
-            name TEXT NOT NULL,               -- nombre legible: 'ORIBE SRL'
-            username TEXT UNIQUE NOT NULL,    -- login
-            password_hash TEXT NOT NULL       -- hash con werkzeug (no texto plano)
-        );
-        """
-    )
+        cur.execute("PRAGMA journal_mode=WAL;")
+        cur.execute("PRAGMA synchronous=NORMAL;")
 
-    cur.execute(
-        """
-        CREATE TABLE IF NOT EXISTS tenants (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            slug TEXT UNIQUE NOT NULL,        -- ej: 'oribe', 'cliente_x'
-            display_name TEXT NOT NULL,       -- nombre visible: 'ORIBE SRL'
-            created_at INTEGER NOT NULL,
-            active INTEGER NOT NULL DEFAULT 1
-        );
-        """
-    )
+        # ==========================
+        # Tablas base
+        # ==========================
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS pending_views (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                to_whatsapp TEXT NOT NULL,
+                archivo_norm TEXT NOT NULL,
+                period_label TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                UNIQUE(to_whatsapp, archivo_norm, period_label)
+            );
+        """)
 
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS message_status (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                message_sid TEXT UNIQUE NOT NULL,
+                to_whatsapp TEXT,
+                archivo_norm TEXT,
+                period_label TEXT,
+                nombre TEXT,
+                kind TEXT,
+                created_at INTEGER,
+                last_status TEXT,
+                last_status_at INTEGER,
+                read_at INTEGER,
+                delivered_at INTEGER,
+                failed_at INTEGER,
+                error_code TEXT,
+                error_message TEXT
+            );
+        """)
 
-# === Migración liviana multiempresa (Drive por tenant) ===
-# Agrega columnas si la tabla ya existía
-    for _sql in (
-        "ALTER TABLE tenants ADD COLUMN envios_file_id TEXT;",
-        "ALTER TABLE tenants ADD COLUMN recibos_root_id TEXT;",
-    ):
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS view_confirmations (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                from_whatsapp TEXT NOT NULL,
+                archivo_norm TEXT,
+                period_label TEXT,
+                response TEXT,
+                created_at INTEGER NOT NULL
+            );
+        """)
+
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS recibo_estado (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                archivo_norm TEXT NOT NULL,
+                period_label TEXT NOT NULL,
+                estado TEXT NOT NULL,
+                UNIQUE(archivo_norm, period_label)
+            );
+        """)
+
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS recibo_vistas (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                archivo_norm TEXT NOT NULL,
+                period_label TEXT NOT NULL,
+                vistas INTEGER NOT NULL DEFAULT 0,
+                UNIQUE(archivo_norm, period_label)
+            );
+        """)
+
+        # ✅ Dejo SOLO una definición (la más completa: incluye "nombre")
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS identity_verification (
+                archivo_norm TEXT PRIMARY KEY,   -- CUIL
+                dni TEXT NOT NULL,
+                to_whatsapp TEXT NOT NULL,       -- whatsapp:+54...
+                verified_at INTEGER NOT NULL,
+                source TEXT NOT NULL,            -- 'manual' o 'chat' (o 'legacy')
+                nombre TEXT                      -- nombre tomado del Excel de envíos
+            );
+        """)
+
+        # Por si la tabla ya existía sin la columna 'nombre'
         try:
-            cur.execute(_sql)
+            cur.execute("ALTER TABLE identity_verification ADD COLUMN nombre TEXT;")
         except Exception:
             pass
 
-        cur.execute(
-            """
+        # ==========================
+        # Cola de envíos (batch/queue)
+        # ==========================
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS send_jobs (
+                job_id TEXT PRIMARY KEY,
+                period_label TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                started_at INTEGER,
+                finished_at INTEGER,
+                status TEXT NOT NULL DEFAULT 'PENDING',
+                total_enqueued INTEGER NOT NULL DEFAULT 0,
+                total_sent INTEGER NOT NULL DEFAULT 0,
+                total_failed INTEGER NOT NULL DEFAULT 0
+            );
+        """)
+
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS send_queue (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                job_id TEXT NOT NULL,
+                to_whatsapp TEXT NOT NULL,
+                archivo_norm TEXT NOT NULL,
+                nombre TEXT,
+                period_label TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'PENDING',
+                attempts INTEGER NOT NULL DEFAULT 0,
+                last_error TEXT,
+                created_at INTEGER NOT NULL,
+                sent_at INTEGER,
+                UNIQUE(job_id, to_whatsapp, archivo_norm, period_label)
+            );
+        """)
+
+        # ==========================
+        # Portal / Tenants
+        # ==========================
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS clients (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                slug TEXT UNIQUE NOT NULL,
+                name TEXT NOT NULL,
+                username TEXT UNIQUE NOT NULL,
+                password_hash TEXT NOT NULL
+            );
+        """)
+
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS tenants (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                slug TEXT UNIQUE NOT NULL,
+                display_name TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                active INTEGER NOT NULL DEFAULT 1
+            );
+        """)
+
+        # Migración liviana multiempresa (Drive por tenant)
+        for _sql in (
+            "ALTER TABLE tenants ADD COLUMN envios_file_id TEXT;",
+            "ALTER TABLE tenants ADD COLUMN recibos_root_id TEXT;",
+        ):
+            try:
+                cur.execute(_sql)
+            except Exception:
+                pass
+
+        cur.execute("""
             CREATE TABLE IF NOT EXISTS portal_users (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 tenant_id INTEGER NOT NULL,
                 email TEXT NOT NULL,
                 password_hash TEXT NOT NULL,
-                is_admin INTEGER NOT NULL DEFAULT 0,      -- admin del portal de ESA empresa
+                is_admin INTEGER NOT NULL DEFAULT 0,
                 created_at INTEGER NOT NULL,
                 last_login_at INTEGER,
                 UNIQUE(tenant_id, email),
                 FOREIGN KEY (tenant_id) REFERENCES tenants(id)
             );
-            """
-        )
-
+        """)
 
         conn.commit()
+
+    finally:
         conn.close()
+
 
 def get_recibo_vistas(archivo_norm: str, period_label: str) -> int:
     """
