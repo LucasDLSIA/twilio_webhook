@@ -62,6 +62,7 @@ GOOGLE_SERVICE_ACCOUNT_FILE = (
 )
 DRIVE_RECIBOS_ROOT_ID = os.getenv("DRIVE_ROOT_FOLDER_ID")
 ENVIOS_FILE_ID = os.getenv("ENVIOS_FILE_ID")
+EMPRESAS_FILE_ID = os.getenv("EMPRESAS_FILE_ID")  # Excel maestro de empresas (slug, display_name, envios_file_id, recibos_root_id)
 
 TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID")
 TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
@@ -429,6 +430,18 @@ def init_db():
         );
         """
     )
+
+
+# === Migración liviana multiempresa (Drive por tenant) ===
+# Agrega columnas si la tabla ya existía
+for _sql in (
+    "ALTER TABLE tenants ADD COLUMN envios_file_id TEXT;",
+    "ALTER TABLE tenants ADD COLUMN recibos_root_id TEXT;",
+):
+    try:
+        cur.execute(_sql)
+    except Exception:
+        pass
 
     cur.execute(
         """
@@ -1343,14 +1356,14 @@ def build_drive_service():
     return build("drive", "v3", credentials=creds)
 
 
-def download_envios_excel() -> pd.DataFrame:
+def download_envios_excel(file_id: str | None = None) -> pd.DataFrame:
     """
-    Descarga envios.xlsx desde Drive (por ENVIOS_FILE_ID) y lo devuelve como DataFrame.
+    Descarga envios.xlsx desde Drive (por file_id o ENVIOS_FILE_ID) y lo devuelve como DataFrame.
     Columnas esperadas: nombre, telefono, archivo
     """
     service = build_drive_service()
 
-    request_drive = service.files().get_media(fileId=ENVIOS_FILE_ID)
+    request_drive = service.files().get_media(fileId=(file_id or ENVIOS_FILE_ID))
     fh = io.BytesIO()
     downloader = MediaIoBaseDownload(fh, request_drive)
 
@@ -1378,6 +1391,152 @@ def download_envios_excel() -> pd.DataFrame:
     df["archivo_norm"] = df["archivo_norm"].str.replace(".pdf", "", case=False)
 
     return df
+
+
+
+# ==========================
+#  Multiempresa: config Drive por tenant
+# ==========================
+
+# Cache simple en memoria para evitar bajar el Excel de envíos en cada request
+_ENVIOS_CACHE: dict[str, dict] = {}  # {tenant_slug: {"ts": epoch, "df": DataFrame}}
+_ENVIOS_CACHE_TTL = int(os.getenv("ENVIOS_CACHE_TTL", "300"))  # segundos
+
+def get_tenant_drive_config(tenant_slug: str) -> dict:
+    """
+    Devuelve config de Drive para un tenant desde SQLite (tenants.envios_file_id / tenants.recibos_root_id).
+    Si no existe en DB, devuelve {}.
+    """
+    if not tenant_slug:
+        return {}
+    try:
+        conn = get_db_connection()
+        conn.row_factory = sqlite3.Row
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT envios_file_id, recibos_root_id FROM tenants WHERE slug = ? LIMIT 1;",
+            (tenant_slug.strip().lower(),),
+        )
+        row = cur.fetchone()
+        conn.close()
+        return dict(row) if row else {}
+    except Exception as e:
+        print("WARN get_tenant_drive_config:", e)
+        return {}
+
+def download_empresas_excel() -> pd.DataFrame:
+    """
+    Descarga el Excel maestro de empresas desde Drive (EMPRESAS_FILE_ID).
+    Debe tener columnas (case-insensitive):
+      - slug (o empresa)
+      - display_name (o nombre)
+      - envios_file_id
+      - recibos_root_id
+    """
+    if not EMPRESAS_FILE_ID:
+        return pd.DataFrame()
+    service = build_drive_service()
+    request_drive = service.files().get_media(fileId=EMPRESAS_FILE_ID)
+    fh = io.BytesIO()
+    downloader = MediaIoBaseDownload(fh, request_drive)
+    done = False
+    while not done:
+        _, done = downloader.next_chunk()
+    fh.seek(0)
+    df = pd.read_excel(fh)
+    df.columns = [str(c).strip().lower() for c in df.columns]
+    return df
+
+def sync_tenants_from_empresas_excel() -> int:
+    """
+    Sincroniza tabla tenants a partir del Excel maestro de empresas.
+    Inserta/actualiza (slug, display_name, envios_file_id, recibos_root_id).
+    Devuelve cantidad de filas procesadas.
+    """
+    df = download_empresas_excel()
+    if df is None or df.empty:
+        return 0
+
+    def _col(*names):
+        for n in names:
+            if n in df.columns:
+                return n
+        return None
+
+    c_slug = _col("slug", "empresa", "tenant")
+    c_name = _col("display_name", "nombre", "name")
+    c_env  = _col("envios_file_id", "envios", "envios_id")
+    c_root = _col("recibos_root_id", "root_id", "carpeta_root_id")
+
+    if not c_slug:
+        print("WARN: Empresas.xlsx sin columna 'slug'/'empresa'.")
+        return 0
+
+    now = int(time.time())
+    conn = get_db_connection()
+    cur = conn.cursor()
+    processed = 0
+
+    for _, r in df.iterrows():
+        slug = str(r.get(c_slug, "")).strip().lower()
+        if not slug:
+            continue
+        display_name = str(r.get(c_name, slug)).strip() if c_name else slug
+        envios_id = str(r.get(c_env, "")).strip() if c_env else ""
+        root_id = str(r.get(c_root, "")).strip() if c_root else ""
+
+        cur.execute(
+            """
+            INSERT INTO tenants (slug, display_name, created_at, active, envios_file_id, recibos_root_id)
+            VALUES (?, ?, ?, 1, ?, ?)
+            ON CONFLICT(slug) DO UPDATE SET
+                display_name=excluded.display_name,
+                active=1,
+                envios_file_id=excluded.envios_file_id,
+                recibos_root_id=excluded.recibos_root_id;
+            """,
+            (slug, display_name, now, envios_id, root_id),
+        )
+        processed += 1
+
+    conn.commit()
+    conn.close()
+    return processed
+
+def get_envios_df_for_tenant(tenant_slug: str | None) -> pd.DataFrame:
+    """
+    Devuelve el DataFrame de envíos para un tenant.
+    - Si tenant_slug es None: usa ENVIOS_FILE_ID (compatibilidad).
+    - Si tenant_slug existe y tenants.envios_file_id está seteado: usa ese file_id.
+    - Si no está en DB, intenta refrescar tenants desde EMPRESAS_FILE_ID y reintenta.
+    Cachea el resultado por TTL.
+    """
+    if not tenant_slug:
+        return download_envios_excel()
+
+    tenant_slug = tenant_slug.strip().lower()
+    cached = _ENVIOS_CACHE.get(tenant_slug)
+    now = time.time()
+    if cached and (now - cached.get("ts", 0)) < _ENVIOS_CACHE_TTL:
+        return cached["df"]
+
+    cfg = get_tenant_drive_config(tenant_slug)
+    envios_id = (cfg.get("envios_file_id") or "").strip()
+
+    if not envios_id and EMPRESAS_FILE_ID:
+        # Intento de autocuración: sincronizo tenants desde el Excel maestro
+        try:
+            n = sync_tenants_from_empresas_excel()
+            print(f"INFO sync_tenants_from_empresas_excel: {n} filas")
+        except Exception as e:
+            print("WARN sync_tenants_from_empresas_excel:", e)
+        cfg = get_tenant_drive_config(tenant_slug)
+        envios_id = (cfg.get("envios_file_id") or "").strip()
+
+    df = download_envios_excel(file_id=envios_id or None)
+    _ENVIOS_CACHE[tenant_slug] = {"ts": now, "df": df}
+    return df
+
 
 
 def get_archivo_for_phone(telefono_norm: str, envios_df: pd.DataFrame) -> Optional[str]:
@@ -1453,7 +1612,7 @@ def normalize_period_label(p: str) -> str:
 
 
 
-def list_periods_for_archivo(archivo_norm: str) -> List[str]:
+def list_periods_for_archivo(archivo_norm: str, tenant_slug: str | None = None) -> List[str]:
     """
     Busca en Drive todos los PDFs cuyo nombre sea {archivo_norm}.pdf
     y arma la lista de períodos (mm/aaaa) donde ese archivo existe.
@@ -1461,6 +1620,75 @@ def list_periods_for_archivo(archivo_norm: str) -> List[str]:
     service = build_drive_service()
 
     filename = f"{archivo_norm}.pdf"
+
+
+# Si tenemos tenant_slug y root configurado, listamos solo dentro de esa carpeta
+if tenant_slug:
+    cfg = get_tenant_drive_config(tenant_slug)
+    root_id = (cfg.get("recibos_root_id") or "").strip()
+    if root_id:
+        try:
+            # Listar carpetas de período directamente dentro de root
+            folders = service.files().list(
+                q=f"'{root_id}' in parents and mimeType = 'application/vnd.google-apps.folder' and trashed = false",
+                fields="files(id, name)",
+                pageSize=1000,
+            ).execute().get("files", [])
+            periods = set()
+            for fold in folders:
+                label = period_folder_to_label(fold.get("name",""))
+                if not label:
+                    continue
+                # Buscar si existe el PDF en esa carpeta
+                res = service.files().list(
+                    q=f"'{fold['id']}' in parents and name = '{filename}' and mimeType = 'application/pdf' and trashed = false",
+                    fields="files(id)",
+                    pageSize=1,
+                ).execute()
+                if res.get("files"):
+                    periods.add(label)
+            ordered = sorted(list(periods), key=period_sort_key, reverse=True)
+            return ordered
+        except Exception as e:
+            print("WARN scoped list_periods_for_archivo:", e)
+        # Si falla, cae al método global
+
+
+
+# Si tenemos tenant_slug y un recibos_root_id configurado, buscamos dentro de esa carpeta
+if tenant_slug:
+    cfg = get_tenant_drive_config(tenant_slug)
+    root_id = (cfg.get("recibos_root_id") or "").strip()
+    if root_id:
+        try:
+            normalized_period = normalize_period_for_folder(period_label)
+            # 1) Listar carpetas de período debajo del root
+            results_folders = service.files().list(
+                q=f"'{root_id}' in parents and mimeType = 'application/vnd.google-apps.folder' and trashed = false",
+                fields="files(id, name)",
+                pageSize=1000,
+            ).execute()
+            period_folders = results_folders.get("files", [])
+            for fold in period_folders:
+                folder_name = fold.get("name", "")
+                normalized_folder = folder_name.replace("/", "-")
+                label = period_folder_to_label(folder_name)
+                normalized_label = label.replace("/", "-") if label else ""
+                if normalized_folder != normalized_period and normalized_label != normalized_period:
+                    continue
+                # 2) Buscar el PDF dentro de esa carpeta de período
+                res_pdf = service.files().list(
+                    q=f"'{fold['id']}' in parents and name = '{filename}' and mimeType = 'application/pdf' and trashed = false",
+                    fields="files(id, name)",
+                    pageSize=10,
+                ).execute()
+                pdfs = res_pdf.get("files", [])
+                if pdfs:
+                    return pdfs[0].get("id")
+        except Exception as e:
+            print("WARN scoped find_pdf_for_archivo_and_period:", e)
+        # Si falla, caemos al método global (compatibilidad)
+
 
     # Buscamos todos los archivos con ese nombre
     results = service.files().list(
@@ -1503,7 +1731,7 @@ def list_periods_for_archivo(archivo_norm: str) -> List[str]:
 
 
 
-def find_pdf_for_archivo_and_period(archivo_norm: str, period_label: str) -> Optional[str]:
+def find_pdf_for_archivo_and_period(archivo_norm: str, period_label: str, tenant_slug: str | None = None) -> Optional[str]:
     """
     Dado el CUIL (archivo_norm) y un período (puede venir como 'mm/aaaa' o 'mm-aaaa'),
     devuelve el fileId del PDF en Drive para ese período, o None si no existe.
@@ -1690,13 +1918,13 @@ def normalize_to_whatsapp_e164(s: str) -> str:
 import pandas as pd
 from io import BytesIO
 
-def read_envios_rows() -> list[dict]:
+def read_envios_rows(tenant_slug: str | None = None) -> list[dict]:
     """
     Lee el archivo de envíos desde Drive (mismo que usa download_envios_excel)
     y devuelve una lista de dicts con claves: 'CUIL', 'Telefono', 'Archivo', etc.
     """
     try:
-        df = download_envios_excel()
+        df = get_envios_df_for_tenant(tenant_slug)
         if df is None or df.empty:
             print("WARN: no se pudo leer el archivo de envíos (vacío o inexistente).")
             return []
@@ -1764,24 +1992,8 @@ def empresa_to_slug(empresa: str) -> str:
     return s
 
 def read_envios_rows_for_tenant(tenant_slug: str) -> list[dict]:
-    """
-    Devuelve solo las filas del Excel de envíos que pertenecen a ese tenant,
-    según la columna 'Empresa'.
-    """
-    all_rows = read_envios_rows()
-    if not tenant_slug:
-        return all_rows
-
-    tenant_slug = str(tenant_slug).strip().lower()
-    filtered = []
-
-    for r in all_rows:
-        empresa_raw = r.get("Empresa") or r.get("empresa") or ""
-        slug = empresa_to_slug(empresa_raw)
-        if slug == tenant_slug:
-            filtered.append(r)
-
-    return filtered
+    """Compatibilidad: devuelve el Excel de envíos del tenant."""
+    return read_envios_rows(tenant_slug=tenant_slug)
 
 
 def get_archivo_from_incoming(from_whatsapp: str) -> Optional[str]:
@@ -1790,6 +2002,56 @@ def get_archivo_from_incoming(from_whatsapp: str) -> Optional[str]:
     devuelve el archivo_norm (CUIL) si está autorizado (figura en el Excel).
     """
     return find_archivo_by_phone(from_whatsapp)
+
+
+def resolve_tenant_and_archivo_from_incoming(from_whatsapp: str) -> tuple[str | None, str | None]:
+    """
+    Intenta resolver (tenant_slug, archivo_norm) para un teléfono entrante.
+    Estrategia:
+      1) Si existe ENVIOS_FILE_ID global con todas las empresas, usa ese (tenant=None).
+      2) Si existe EMPRESAS_FILE_ID, intenta por cada tenant (con cache) hasta encontrar match.
+    """
+    # 1) intento global
+    try:
+        arc = find_archivo_by_phone(from_whatsapp)
+        if arc:
+            return (None, arc)
+    except Exception:
+        pass
+
+    # 2) multiempresa por tenants
+    try:
+        # Aseguramos que tenants estén cargados
+        if EMPRESAS_FILE_ID:
+            try:
+                sync_tenants_from_empresas_excel()
+            except Exception:
+                pass
+
+        conn = get_db_connection()
+        conn.row_factory = sqlite3.Row
+        cur = conn.cursor()
+        cur.execute("SELECT slug FROM tenants WHERE active = 1 ORDER BY display_name;")
+        slugs = [r["slug"] for r in cur.fetchall()]
+        conn.close()
+    except Exception as e:
+        print("WARN resolve_tenant_and_archivo_from_incoming list tenants:", e)
+        slugs = []
+
+    want = canonicalize_phone(from_whatsapp)
+    for slug in slugs:
+        try:
+            df = get_envios_df_for_tenant(slug)
+            filas = df[df["telefono_norm"] == want]
+            if not filas.empty:
+                arc = str(filas.iloc[0]["archivo_norm"]).strip()
+                return (slug, arc)
+        except Exception as e:
+            print(f"WARN envios tenant={slug}:", e)
+
+    return (None, None)
+
+
 
 import json
 import pandas as pd
@@ -2599,7 +2861,7 @@ def handle_show_periods_menu(telefono_whatsapp: str) -> Response:
             "Verificá que estés usando el número correcto o contactá con RRHH."
         )
 
-    periods = list_periods_for_archivo(archivo_norm)
+    periods = list_periods_for_archivo(archivo_norm, tenant_slug=tenant_slug)
 
     if not periods:
         return twiml_message(
@@ -2846,7 +3108,9 @@ def twilio_webhook():
     # 0) CHEQUEO GLOBAL DE NÚMERO AUTORIZADO
     # ------------------------------------------------------------------
     # Si el número no está en la base (Excel / mapping), rechazamos de una.
-    archivo_norm_incoming = get_archivo_from_incoming(from_whatsapp)
+    tenant_slug_incoming, archivo_norm_incoming = resolve_tenant_and_archivo_from_incoming(from_whatsapp)
+    if tenant_slug_incoming:
+        session["tenant_slug"] = tenant_slug_incoming
     if not archivo_norm_incoming:
         return build_twilio_response(
             "🤖 Ud. no está registrado/autorizado para utilizar este servicio."
@@ -2859,6 +3123,7 @@ def twilio_webhook():
     flow_state = session.get("flow_state", "IDLE")
     archivo_norm = session.get("archivo_norm")
     period_label = session.get("period_label")
+    tenant_slug = session.get("tenant_slug")
 
     # Helper para evitar recalcular si no tenemos contexto
     def ensure_context():
@@ -2903,7 +3168,7 @@ def twilio_webhook():
         # Aseguramos tener el pdf_id en sesión
         pdf_id = session.get("pdf_id")
         if not pdf_id:
-            pdf_id = find_pdf_for_archivo_and_period(archivo_norm, period_label)
+            pdf_id = find_pdf_for_archivo_and_period(archivo_norm, period_label, tenant_slug=tenant_slug)
             session["pdf_id"] = pdf_id
 
         if not pdf_id:
@@ -3092,7 +3357,7 @@ def twilio_webhook():
             pdf_id = session.get("pdf_id")
             if not pdf_id:
                 # por las dudas, volvemos a buscarlo
-                pdf_id = find_pdf_for_archivo_and_period(archivo_norm, period_label)
+                pdf_id = find_pdf_for_archivo_and_period(archivo_norm, period_label, tenant_slug=tenant_slug)
                 session["pdf_id"] = pdf_id
 
             if not pdf_id:
@@ -3144,7 +3409,7 @@ def twilio_webhook():
         period_label = norm_period_label(get_current_period_label())
 
         # 2.3) ¿TIENE RECIBO DEL ÚLTIMO PERÍODO?
-        pdf_id = find_pdf_for_archivo_and_period(archivo_norm, period_label)
+        pdf_id = find_pdf_for_archivo_and_period(archivo_norm, period_label, tenant_slug=tenant_slug)
         if not pdf_id:
             msg = (
                 "🤖 Ud. no posee recibo disponible en este período.\n"
@@ -3235,7 +3500,7 @@ def twilio_webhook():
         period_label = norm_period_label(get_current_period_label())
 
         # 2.3) ¿TIENE RECIBO DEL ÚLTIMO PERÍODO?
-        pdf_id = find_pdf_for_archivo_and_period(archivo_norm, period_label)
+        pdf_id = find_pdf_for_archivo_and_period(archivo_norm, period_label, tenant_slug=tenant_slug)
         if not pdf_id:
             msg = (
                 "🤖 Ud. no posee recibo disponible en este período.\n"
@@ -4623,7 +4888,7 @@ def admin_panel():
     html.append("<div class='checkbox-row' style='justify-content: space-between; margin-top: 10px;'>")
     html.append("<span class='small'>Seleccioná con el check de la izquierda y aplicá acciones masivas.</span>")
     # Botón borrar
-    html.append("<button type='submit' class='btn-danger' name='bulk_action' value='delete' onclick='return confirm(\"¿Eliminar identidades seleccionadas?\");'>🗑️ Eliminar seleccionados</button>")
+    html.append("<button type='submit' class='btn-danger' name='bulk_action' value='delete' onclick=\'return confirm(&quot;¿Eliminar identidades seleccionadas?&quot;);\'>🗑️ Eliminar seleccionados</button>")
     html.append("</div>")
 
     # Botón enviar + input período
@@ -4898,105 +5163,189 @@ def client_login_required(fn):
         return fn(*args, **kwargs)
     return wrapper
 
+
+@app.route("/", methods=["GET"])
+def home():
+    """Página de inicio: elegir empresa y entrar al portal."""
+    # Intentamos sincronizar desde Excel maestro si existe
+    if EMPRESAS_FILE_ID:
+        try:
+            sync_tenants_from_empresas_excel()
+        except Exception:
+            pass
+
+    try:
+        conn = get_db_connection()
+        conn.row_factory = sqlite3.Row
+        cur = conn.cursor()
+        cur.execute("SELECT slug, display_name FROM tenants WHERE active = 1 ORDER BY display_name;")
+        tenants = cur.fetchall()
+        conn.close()
+    except Exception:
+        tenants = []
+
+    html = []
+    html.append("<!doctype html><html lang='es'><head><meta charset='utf-8'>")
+    html.append("<title>Portal de recibos - Inicio</title>")
+    html.append("""
+    <style>
+      body{
+        margin:0;
+        font-family:system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
+        background: radial-gradient(circle at top, #1f2937 0, #020617 55%, #020617 100%);
+        color:#e5e7eb;
+      }
+      .wrap{max-width:900px;margin:0 auto;padding:28px 16px 40px;}
+      h1{font-size:24px;margin:0 0 6px 0;}
+      .sub{color:#9ca3af;font-size:12px;margin-bottom:18px;}
+      .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:12px;}
+      .card{
+        display:block;
+        padding:14px 16px;
+        border-radius:14px;
+        border:1px solid #1f2937;
+        background: radial-gradient(circle at top left, #111827 0, #020617 55%);
+        text-decoration:none;
+        color:#e5e7eb;
+      }
+      .card:hover{outline:1px solid rgba(34,197,94,0.5);}
+      .name{font-weight:600;margin-bottom:4px;}
+      .slug{font-family:ui-monospace,Menlo,Monaco,Consolas,"Liberation Mono","Courier New",monospace;font-size:11px;color:#9ca3af;}
+      .pill{display:inline-block;margin-top:10px;padding:6px 10px;border-radius:999px;background:rgba(34,197,94,0.15);color:#22c55e;font-size:12px;}
+    </style>
+    """)
+    html.append("</head><body><div class='wrap'>")
+    html.append('<h1>Portal de recibos</h1>')
+    html.append("<div class='sub'>Elegí la empresa para ingresar.</div>")
+    html.append("<div class='grid'>")
+    if tenants:
+        for t in tenants:
+            slug = esc_html(t["slug"])
+            name = esc_html(t["display_name"])
+            html.append(f"<a class='card' href='/cliente/login?tenant={slug}'>")
+            html.append(f"<div class='name'>{name}</div>")
+            html.append(f"<div class='slug'>{slug}</div>")
+            html.append("<div class='pill'>Ingresar</div>")
+            html.append("</a>")
+    else:
+        html.append("<div class='sub'>No hay empresas cargadas. Configurá EMPRESAS_FILE_ID o cargá tenants en la DB.</div>")
+    html.append("</div></div></body></html>")
+    return Response("".join(html), mimetype="text/html")
+
 @app.route("/cliente/login", methods=["GET", "POST"])
 def client_login():
     """
     Login simple para el portal del cliente.
     """
     error = ""
-    if request.method == "POST":
-        username = (request.form.get("username") or "").strip()
-        password = (request.form.get("password") or "").strip()
+    tenant_slug = (request.args.get("tenant") or "").strip().lower()
+    tenant_name = ""
+    prefill_username = tenant_slug or ""
+    if tenant_slug:
+        try:
+            conn = get_db_connection()
+            conn.row_factory = sqlite3.Row
+            cur = conn.cursor()
+            cur.execute("SELECT display_name FROM tenants WHERE slug = ? LIMIT 1;", (tenant_slug,))
+            row = cur.fetchone()
+            conn.close()
+            tenant_name = row["display_name"] if row else ""
+        except Exception:
+            tenant_name = ""
 
-        user = get_client_by_username(username)
-        if not user or not check_password_hash(user["password_hash"], password):
-            error = "Usuario o contraseña incorrectos."
-        else:
-            # login OK
-            session["client_id"] = user["id"]
-            session["client_username"] = user["username"]
-            return redirect(url_for("client_portal"))
+        if request.method == "POST":
+            username = (request.form.get("username") or "").strip()
+            password = (request.form.get("password") or "").strip()
 
-    # HTML minimalista (después lo tuneamos si querés)
-    html = []
-    html.append("<!doctype html><html lang='es'><head><meta charset='utf-8'>")
-    html.append("<title>Login cliente - Recibos</title>")
-    html.append("""
-    <style>
-      body {
-        margin: 0;
-        font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-        background: radial-gradient(circle at top, #1f2937 0, #020617 55%, #020617 100%);
-        color: #e5e7eb;
-        display:flex;
-        align-items:center;
-        justify-content:center;
-        height:100vh;
-      }
-      .card {
-        background:#020617;
-        border-radius:16px;
-        border:1px solid #1f2937;
-        padding:24px 28px;
-        width:280px;
-      }
-      h1 {
-        font-size:18px;
-        margin-top:0;
-        margin-bottom:12px;
-      }
-      label {
-        font-size:12px;
-        color:#9ca3af;
-        display:block;
-        margin-top:8px;
-      }
-      input[type='text'], input[type='password'] {
-        margin-top:3px;
-        width:100%;
-        padding:6px 8px;
-        border-radius:8px;
-        border:1px solid #374151;
-        background:rgba(15,23,42,0.9);
-        color:#e5e7eb;
-        font-size:13px;
-      }
-      input:focus {
-        outline:1px solid #22c55e;
-        outline-offset:1px;
-      }
-      button {
-        margin-top:14px;
-        width:100%;
-        padding:8px 12px;
-        border-radius:999px;
-        border:none;
-        cursor:pointer;
-        font-size:13px;
-        font-weight:500;
-        background:radial-gradient(circle at top left,#22c55e 0,#16a34a 60%);
-        color:#022c22;
-      }
-      .error {
-        margin-top:10px;
-        font-size:12px;
-        color:#f97373;
-      }
-    </style>
-    """)
-    html.append("</head><body>")
-    html.append("<div class='card'>")
-    html.append("<h1>Portal de recibos</h1>")
-    html.append("<form method='post'>")
-    html.append("<label>Usuario<br><input type='text' name='username' autocomplete='username'></label>")
-    html.append("<label>Contraseña<br><input type='password' name='password' autocomplete='current-password'></label>")
-    html.append("<button type='submit'>Ingresar</button>")
-    html.append("</form>")
-    if error:
-        html.append(f"<div class='error'>{esc_html(error)}</div>")
-    html.append("</div>")
-    html.append("</body></html>")
-    return Response("".join(html), mimetype="text/html")
+            user = get_client_by_username(username)
+            if not user or not check_password_hash(user["password_hash"], password):
+                error = "Usuario o contraseña incorrectos."
+            else:
+                # login OK
+                session["client_id"] = user["id"]
+                session["client_username"] = user["username"]
+                return redirect(url_for("client_portal"))
+
+        # HTML minimalista (después lo tuneamos si querés)
+        html = []
+        html.append("<!doctype html><html lang='es'><head><meta charset='utf-8'>")
+        html.append("<title>Login cliente - Recibos</title>")
+        html.append("""
+        <style>
+          body {
+            margin: 0;
+            font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+            background: radial-gradient(circle at top, #1f2937 0, #020617 55%, #020617 100%);
+            color: #e5e7eb;
+            display:flex;
+            align-items:center;
+            justify-content:center;
+            height:100vh;
+          }
+          .card {
+            background:#020617;
+            border-radius:16px;
+            border:1px solid #1f2937;
+            padding:24px 28px;
+            width:280px;
+          }
+          h1 {
+            font-size:18px;
+            margin-top:0;
+            margin-bottom:12px;
+          }
+          label {
+            font-size:12px;
+            color:#9ca3af;
+            display:block;
+            margin-top:8px;
+          }
+          input[type='text'], input[type='password'] {
+            margin-top:3px;
+            width:100%;
+            padding:6px 8px;
+            border-radius:8px;
+            border:1px solid #374151;
+            background:rgba(15,23,42,0.9);
+            color:#e5e7eb;
+            font-size:13px;
+          }
+          input:focus {
+            outline:1px solid #22c55e;
+            outline-offset:1px;
+          }
+          button {
+            margin-top:14px;
+            width:100%;
+            padding:8px 12px;
+            border-radius:999px;
+            border:none;
+            cursor:pointer;
+            font-size:13px;
+            font-weight:500;
+            background:radial-gradient(circle at top left,#22c55e 0,#16a34a 60%);
+            color:#022c22;
+          }
+          .error {
+            margin-top:10px;
+            font-size:12px;
+            color:#f97373;
+          }
+        </style>
+        """)
+        html.append("</head><body>")
+        html.append("<div class='card'>")
+        html.append("<h1>Portal de recibos</h1>")
+        html.append("<form method='post'>")
+        html.append(f"<label>Usuario<br><input type='text' name='username' autocomplete='username' value='{esc_html(prefill_username)}'></label>")
+        html.append("<label>Contraseña<br><input type='password' name='password' autocomplete='current-password'></label>")
+        html.append("<button type='submit'>Ingresar</button>")
+        html.append("</form>")
+        if error:
+            html.append(f"<div class='error'>{esc_html(error)}</div>")
+        html.append("</div>")
+        html.append("</body></html>")
+        return Response("".join(html), mimetype="text/html")
 
 @app.route("/cliente/logout", methods=["POST"])
 @client_login_required
@@ -5005,27 +5354,12 @@ def client_logout():
     return redirect(url_for("client_login"))
 
 def get_envios_for_client_slug(slug: str) -> list[dict]:
-    """
-    Devuelve sólo las filas del Excel de envíos que correspondan
-    a la empresa cuyo slug coincida con la columna 'Empresa' (o similar).
-    """
+    """Devuelve las filas del Excel de envíos específico del tenant."""
     try:
-        rows = read_envios_rows()
+        return read_envios_rows(tenant_slug=slug)
     except Exception:
         return []
 
-    filtered = []
-    for r in rows:
-        empresa = str(
-            r.get("Empresa")
-            or r.get("empresa")
-            or r.get("Cliente")
-            or r.get("cliente")
-            or ""
-        ).strip()
-        if empresa == slug:
-            filtered.append(r)
-    return filtered
 
 @app.route("/cliente", methods=["GET"])
 @client_login_required
