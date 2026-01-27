@@ -2246,10 +2246,12 @@ def admin_verify_person():
         return redirect(
             f"/admin/panel?token={token or ''}&msg=verify_error&detail=CUIL%20y%20DNI%20son%20requeridos"
         )
+    tenant = (request.args.get("tenant") or "").strip().lower()
 
     # Leemos Excel de envíos
     try:
-        envios_rows = read_envios_rows()
+        envios_rows = read_envios_rows(tenant_slug=tenant)
+
     except Exception as e:
         print("ERROR read_envios_rows en verify_person:", e)
         envios_rows = []
@@ -3897,13 +3899,14 @@ def admin_identity_verification_upload():
 
     # Normalizar nombres de columnas a minúscula
     df.columns = [str(c).strip().lower() for c in df.columns]
+    tenant = (request.args.get("tenant") or "").strip().lower()
 
     # ============================
     # Construimos mapa desde envíos
     #   CUIL -> {nombre, to_whatsapp}
     # ============================
     try:
-        envios_rows = read_envios_rows()
+       envios_rows = read_envios_rows(tenant_slug=tenant)
     except Exception as e:
         print("ERROR read_envios_rows en upload:", e)
         envios_rows = []
@@ -4287,13 +4290,14 @@ def admin_panel():
     last_job_from_query = request.args.get("job")
 
     # ... resto de lo que ya tenés (envios_rows, jobs, identity_rows, etc.)
+    tenant = (request.args.get("tenant") or "").strip().lower()
 
 
     # =========================
     # Datos base: Excel de envíos
     # =========================
     try:
-        envios_rows = read_envios_rows()
+        envios_rows = read_envios_rows(tenant_slug=tenant)
     except Exception:
         envios_rows = []
     envios_count = len(envios_rows)
@@ -5078,10 +5082,6 @@ def admin_panel():
 
 #=============================
 
-@app.route("/ping")
-def ping():
-    return "pong", 200
-
 import threading
 import time
 import requests
@@ -5160,74 +5160,35 @@ def client_login_required(fn):
         return fn(*args, **kwargs)
     return wrapper
 
-
 @app.route("/", methods=["GET"])
-def home():
-    """Página de inicio: elegir empresa y entrar al portal."""
-    # Intentamos sincronizar desde Excel maestro si existe
-    if EMPRESAS_FILE_ID:
-        try:
-            sync_tenants_from_empresas_excel()
-        except Exception:
-            pass
+def root():
+    token = _get_admin_token_from_request()
+    if token:
+        return redirect(f"/admin?token={token}")
+    return redirect("/admin")
 
-    try:
-        conn = get_db_connection()
-        conn.row_factory = sqlite3.Row
-        cur = conn.cursor()
-        cur.execute("SELECT slug, display_name FROM tenants WHERE active = 1 ORDER BY display_name;")
-        tenants = cur.fetchall()
-        conn.close()
-    except Exception:
-        tenants = []
+
+@app.route("/admin", methods=["GET"])
+@admin_required
+def admin_home():
+    token = _get_admin_token_from_request()
+    sync_tenants_from_empresas_excel()
+
+    conn = get_db_connection()
+    conn.row_factory = sqlite3.Row
+    cur = conn.cursor()
+    cur.execute("SELECT slug, display_name FROM tenants WHERE active = 1 ORDER BY display_name;")
+    tenants = cur.fetchall()
+    conn.close()
 
     html = []
-    html.append("<!doctype html><html lang='es'><head><meta charset='utf-8'>")
-    html.append("<title>Portal de recibos - Inicio</title>")
-    html.append("""
-    <style>
-      body{
-        margin:0;
-        font-family:system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
-        background: radial-gradient(circle at top, #1f2937 0, #020617 55%, #020617 100%);
-        color:#e5e7eb;
-      }
-      .wrap{max-width:900px;margin:0 auto;padding:28px 16px 40px;}
-      h1{font-size:24px;margin:0 0 6px 0;}
-      .sub{color:#9ca3af;font-size:12px;margin-bottom:18px;}
-      .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:12px;}
-      .card{
-        display:block;
-        padding:14px 16px;
-        border-radius:14px;
-        border:1px solid #1f2937;
-        background: radial-gradient(circle at top left, #111827 0, #020617 55%);
-        text-decoration:none;
-        color:#e5e7eb;
-      }
-      .card:hover{outline:1px solid rgba(34,197,94,0.5);}
-      .name{font-weight:600;margin-bottom:4px;}
-      .slug{font-family:ui-monospace,Menlo,Monaco,Consolas,"Liberation Mono","Courier New",monospace;font-size:11px;color:#9ca3af;}
-      .pill{display:inline-block;margin-top:10px;padding:6px 10px;border-radius:999px;background:rgba(34,197,94,0.15);color:#22c55e;font-size:12px;}
-    </style>
-    """)
-    html.append("</head><body><div class='wrap'>")
-    html.append('<h1>Portal de recibos</h1>')
-    html.append("<div class='sub'>Elegí la empresa para ingresar.</div>")
-    html.append("<div class='grid'>")
-    if tenants:
-        for t in tenants:
-            slug = esc_html(t["slug"])
-            name = esc_html(t["display_name"])
-            html.append(f"<a class='card' href='/cliente/login?tenant={slug}'>")
-            html.append(f"<div class='name'>{name}</div>")
-            html.append(f"<div class='slug'>{slug}</div>")
-            html.append("<div class='pill'>Ingresar</div>")
-            html.append("</a>")
-    else:
-        html.append("<div class='sub'>No hay empresas cargadas. Configurá EMPRESAS_FILE_ID o cargá tenants en la DB.</div>")
-    html.append("</div></div></body></html>")
+    html.append("<h2>Panel Admin</h2>")
+    html.append("<p>Elegí la empresa:</p><ul>")
+    for t in tenants:
+        html.append(f"<li><a href='/admin/panel?tenant={t['slug']}&token={token}'>{t['display_name']}</a></li>")
+    html.append("</ul>")
     return Response("".join(html), mimetype="text/html")
+
 
 @app.route("/cliente/login", methods=["GET", "POST"])
 def client_login():
