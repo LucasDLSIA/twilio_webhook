@@ -255,6 +255,12 @@ def find_whatsapp_by_cuil_from_envios(archivo_norm: str) -> str | None:
     return None
 
 
+
+def get_db():
+    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    return conn
+
 def init_db():
     conn = get_db_connection()
     cur = conn.cursor()
