@@ -439,6 +439,7 @@ def init_db():
         conn.close()
 
 
+
 def get_recibo_vistas(archivo_norm: str, period_label: str) -> int:
     """
     Devuelve cuántas visualizaciones adicionales (post-firma) tiene registradas
@@ -1368,6 +1369,21 @@ def download_envios_excel(file_id: str | None = None) -> pd.DataFrame:
 
     return df
 
+def _norm_slug(s: str) -> str:
+    s = (s or "").strip().lower()
+    # simple slug
+    out = []
+    prev_dash = False
+    for ch in s:
+        if ch.isalnum():
+            out.append(ch)
+            prev_dash = False
+        else:
+            if not prev_dash:
+                out.append("-")
+                prev_dash = True
+    slug = "".join(out).strip("-")
+    return slug
 
 
 # ==========================
@@ -1438,11 +1454,26 @@ def sync_tenants_from_empresas_excel() -> int:
             if n in df.columns:
                 return n
         return None
+    def _slugify(s: str) -> str:
+        s = (s or "").strip().lower()
+        out = []
+        dash = False
+        for ch in s:
+            if ch.isalnum():
+                out.append(ch)
+                dash = False
+            else:
+                if not dash:
+                    out.append("-")
+                    dash = True
+        return "".join(out).strip("-")
+
 
     c_slug = _col("slug", "empresa", "tenant")
     c_name = _col("display_name", "nombre", "name")
     c_env  = _col("envios_file_id", "envios", "envios_id")
-    c_root = _col("recibos_root_id", "root_id", "carpeta_root_id")
+    c_root = _col("recibos_root_id", "drive_root_id", "root_id", "carpeta_root_id")
+
 
     if not c_slug:
         print("WARN: Empresas.xlsx sin columna 'slug'/'empresa'.")
@@ -1454,7 +1485,9 @@ def sync_tenants_from_empresas_excel() -> int:
     processed = 0
 
     for _, r in df.iterrows():
-        slug = str(r.get(c_slug, "")).strip().lower()
+        raw_slug = str(r.get(c_slug, "")).strip()
+        slug = _slugify(raw_slug)  # convierte "SIA SUELDOS" -> "sia-sueldos"
+
         if not slug:
             continue
         display_name = str(r.get(c_name, slug)).strip() if c_name else slug
@@ -2163,6 +2196,40 @@ def empty_twiml():
                     mimetype="text/xml")
 
 import urllib.parse
+
+@app.route("/")
+def home():
+    # Admin directo: selector de empresas
+    token = _get_admin_token_from_request()
+
+    if not admin_required():
+        return "Unauthorized (admin token requerido)", 401
+
+    # sincroniza empresas desde el Excel maestro
+    sync_tenants_from_empresas_excel()
+
+    conn = get_db_connection()
+    conn.row_factory = sqlite3.Row
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT slug, display_name FROM tenants WHERE active = 1 ORDER BY display_name;"
+    )
+    tenants = cur.fetchall()
+    conn.close()
+
+    html = []
+    html.append("<h2>Panel Admin</h2>")
+    html.append("<p>Elegí la empresa:</p>")
+    html.append("<ul>")
+    for t in tenants:
+        html.append(
+            f"<li><a href='/admin/panel?tenant={t['slug']}&token={token}'>"
+            f"{t['display_name']}</a></li>"
+        )
+    html.append("</ul>")
+
+    return Response("".join(html), mimetype="text/html")
+
 
 @app.route("/admin/verify_person", methods=["POST"])
 @admin_required
