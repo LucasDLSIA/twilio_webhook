@@ -23,7 +23,10 @@ EMPRESAS_FILE_ID = os.environ.get("EMPRESAS_FILE_ID", "").strip()
 # Service Account JSON: podés guardarlo como string en ENV (recomendado)
 # o como archivo (si tu build lo copia). Acá soportamos ambas.
 GOOGLE_SA_JSON = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON", "").strip()
-GOOGLE_SA_FILE = os.environ.get("GOOGLE_SERVICE_ACCOUNT_FILE", "").strip()
+GOOGLE_SA_FILE = (
+    os.environ.get("GOOGLE_SERVICE_ACCOUNT_FILE", "").strip()
+    or os.environ.get("GOOGLE_APPLICATION_CREDENTIALS", "").strip()
+)
 
 # Cache
 _EMP_CACHE = {"ts": 0, "rows": []}
