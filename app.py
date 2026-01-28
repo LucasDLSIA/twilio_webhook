@@ -40,8 +40,7 @@ TWILIO_MESSAGING_SERVICE_SID = os.environ.get("TWILIO_MESSAGING_SERVICE_SID", ""
 TWILIO_TEMPLATE_SID = os.environ.get("TWILIO_TEMPLATE_SID", "").strip()            # template con botón VIEW_NOW
 TWILIO_SIGN_TEMPLATE_SID = os.environ.get("TWILIO_SIGN_TEMPLATE_SID", "").strip()  # (opcional) template con botones SIGN_OK / SIGN_OBS
 
-# Persistencia (Render Disk)
-DB_PATH = os.environ.get("DB_PATH", "/data/app.db").strip()
+
 
 # Cache
 _EMP_CACHE = {"ts": 0.0, "rows": []}
@@ -433,25 +432,18 @@ def send_whatsapp_template(to_whatsapp: str, content_vars: Optional[dict] = None
 # =========================
 # DB: pending view + estado firma
 # =========================
+DB_PATH = os.environ.get("DB_PATH", "/data/app.db")
+
 def get_db_connection():
-    return sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+    return conn
+
 
 def init_db():
     conn = get_db_connection()
     cur = conn.cursor()
 
-    # 1) Crear tablas si no existen
-    cur.execute("""
-      CREATE TABLE IF NOT EXISTS pending_views (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        to_whatsapp TEXT NOT NULL,
-        tenant TEXT NOT NULL,
-        cuil TEXT NOT NULL,
-        period TEXT NOT NULL,
-        created_at INTEGER NOT NULL
-      );
-    """)
-
+    # --- asegurar tablas base (siempre) ---
     cur.execute("""
       CREATE TABLE IF NOT EXISTS recibo_estado (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -464,21 +456,59 @@ def init_db():
       );
     """)
 
-    # 2) Migración liviana (si pending_views ya existía con columnas viejas)
-    #    Intentamos agregar columnas; si ya existen, ignoramos.
-    for sql in (
-        "ALTER TABLE pending_views ADD COLUMN tenant TEXT;",
-        "ALTER TABLE pending_views ADD COLUMN cuil TEXT;",
-        "ALTER TABLE pending_views ADD COLUMN period TEXT;",
-        "ALTER TABLE pending_views ADD COLUMN created_at INTEGER;",
-    ):
-        try:
-            cur.execute(sql)
-        except Exception:
-            pass
+    # --- Migración "bien hecha" de pending_views ---
+    # Si existe una pending_views vieja (con archivo_norm NOT NULL u otras columnas),
+    # la renombramos a pending_views_legacy y creamos la nueva con tenant/cuil/period.
+    try:
+        # chequeo si existe pending_views
+        cur.execute("""
+          SELECT name FROM sqlite_master
+          WHERE type='table' AND name='pending_views';
+        """)
+        exists = cur.fetchone() is not None
 
-    # 3) (Opcional) si querés, garantizamos UNIQUE por último pending por tenant+cuil+period
-    # SQLite no permite ADD CONSTRAINT fácil; lo dejamos así por ahora.
+        if exists:
+            # detecto columnas actuales
+            cur.execute("PRAGMA table_info(pending_views);")
+            cols = [r[1] for r in cur.fetchall()]  # r[1] = name
+
+            # Si NO es el esquema nuevo esperado, la renombramos
+            expected = {"to_whatsapp", "tenant", "cuil", "period", "created_at"}
+            if not expected.issubset(set(cols)) or "archivo_norm" in cols:
+                # si ya existe legacy, evitamos choque de nombre
+                cur.execute("""
+                  SELECT name FROM sqlite_master
+                  WHERE type='table' AND name='pending_views_legacy';
+                """)
+                legacy_exists = cur.fetchone() is not None
+
+                if legacy_exists:
+                    # si ya hay legacy, no renombro (para no fallar)
+                    # en ese caso, borro la pending_views vieja para recrearla limpia
+                    cur.execute("DROP TABLE IF EXISTS pending_views;")
+                else:
+                    cur.execute("ALTER TABLE pending_views RENAME TO pending_views_legacy;")
+    except Exception as e:
+        print("WARN migrate pending_views:", e)
+
+    # --- Crear tabla nueva (si no existe) ---
+    cur.execute("""
+      CREATE TABLE IF NOT EXISTS pending_views (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        to_whatsapp TEXT NOT NULL,
+        tenant TEXT NOT NULL,
+        cuil TEXT NOT NULL,
+        period TEXT NOT NULL,
+        created_at INTEGER NOT NULL
+      );
+    """)
+
+    # índices útiles (rápido para lookup por whatsapp)
+    try:
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_pending_views_to ON pending_views(to_whatsapp);")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_pending_views_to_created ON pending_views(to_whatsapp, created_at);")
+    except Exception:
+        pass
 
     conn.commit()
     conn.close()
