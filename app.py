@@ -289,6 +289,70 @@ def admin_home():
 
     return Response("".join(html), mimetype="text/html")
 
+@app.get("/admin/send_test")
+def admin_send_test():
+    auth = require_admin()
+    if auth:
+        return auth
+
+    token = request.args.get("token", "")
+    tenant = (request.args.get("tenant") or "").strip().lower()
+    cuil = (request.args.get("cuil") or "").strip()
+    period = (request.args.get("period") or "").strip()
+
+    t = get_tenant(tenant)
+    if not t:
+        return Response("Tenant inválido", status=400)
+
+    html = []
+    html.append("<h2>Envío de prueba (1 persona)</h2>")
+    html.append(f"<p><b>Empresa:</b> {esc(t['display_name'])}</p>")
+    html.append(f"<p><a href='/admin/panel?tenant={tenant}&token={token}'>← volver</a></p>")
+
+    # Form
+    html.append(f"""
+    <form method="get">
+      <input type="hidden" name="tenant" value="{esc(tenant)}">
+      <input type="hidden" name="token" value="{esc(token)}">
+
+      <label>CUIL<br>
+        <input type="text" name="cuil" value="{esc(cuil)}" required>
+      </label><br><br>
+
+      <label>Período (mm/aaaa)<br>
+        <input type="text" name="period" value="{esc(period)}" required>
+      </label><br><br>
+
+      <button type="submit">Enviar prueba</button>
+    </form>
+    """)
+
+    # Ejecutar si hay datos
+    if cuil and period:
+        html.append("<hr>")
+        html.append("<h3>Resultado</h3>")
+
+        envios = load_envios_rows(tenant)
+        phone = find_phone_by_cuil(envios, cuil)
+
+        if not phone:
+            html.append("<p style='color:red'>No se encontró WhatsApp para ese CUIL.</p>")
+        else:
+            periods = list_periods_for_cuil(tenant, cuil)
+            if period not in periods:
+                html.append("<p style='color:red'>No se encontró el PDF para ese período.</p>")
+            else:
+                html.append("<p>✔ Persona encontrada</p>")
+                html.append(f"<p>📞 WhatsApp: {esc(phone)}</p>")
+                html.append(f"<p>📄 PDF disponible para {esc(period)}</p>")
+                html.append("<p style='color:green'>👉 ACÁ VA EL ENVÍO REAL (Twilio)</p>")
+
+                # 🔥 ACÁ después conectamos Twilio
+                # send_whatsapp_pdf(phone, pdf_url, nombre, period)
+
+    return Response("".join(html), mimetype="text/html")
+
+
 @app.get("/admin/panel")
 def admin_panel():
     auth = require_admin()
