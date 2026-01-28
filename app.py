@@ -443,24 +443,10 @@ def init_db():
     conn = get_db_connection()
     cur = conn.cursor()
 
-    # --- asegurar tablas base (siempre) ---
-    cur.execute("""
-      CREATE TABLE IF NOT EXISTS recibo_estado (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        tenant TEXT NOT NULL,
-        cuil TEXT NOT NULL,
-        period TEXT NOT NULL,
-        estado TEXT NOT NULL,
-        updated_at INTEGER NOT NULL,
-        UNIQUE(tenant, cuil, period)
-      );
-    """)
-
-    # --- Migración "bien hecha" de pending_views ---
-    # Si existe una pending_views vieja (con archivo_norm NOT NULL u otras columnas),
-    # la renombramos a pending_views_legacy y creamos la nueva con tenant/cuil/period.
+    # =========================================================
+    # MIGRACIÓN "BIEN HECHA" - pending_views
+    # =========================================================
     try:
-        # chequeo si existe pending_views
         cur.execute("""
           SELECT name FROM sqlite_master
           WHERE type='table' AND name='pending_views';
@@ -468,14 +454,14 @@ def init_db():
         exists = cur.fetchone() is not None
 
         if exists:
-            # detecto columnas actuales
             cur.execute("PRAGMA table_info(pending_views);")
-            cols = [r[1] for r in cur.fetchall()]  # r[1] = name
+            cols = [r[1] for r in cur.fetchall()]  # column names
 
-            # Si NO es el esquema nuevo esperado, la renombramos
+            # Esquema nuevo esperado
             expected = {"to_whatsapp", "tenant", "cuil", "period", "created_at"}
-            if not expected.issubset(set(cols)) or "archivo_norm" in cols:
-                # si ya existe legacy, evitamos choque de nombre
+
+            # Si no coincide (o si tiene columna legacy 'archivo_norm'), renombramos
+            if (not expected.issubset(set(cols))) or ("archivo_norm" in cols):
                 cur.execute("""
                   SELECT name FROM sqlite_master
                   WHERE type='table' AND name='pending_views_legacy';
@@ -483,15 +469,46 @@ def init_db():
                 legacy_exists = cur.fetchone() is not None
 
                 if legacy_exists:
-                    # si ya hay legacy, no renombro (para no fallar)
-                    # en ese caso, borro la pending_views vieja para recrearla limpia
+                    # si ya existe legacy, dropeamos la vieja para recrear limpia
                     cur.execute("DROP TABLE IF EXISTS pending_views;")
                 else:
                     cur.execute("ALTER TABLE pending_views RENAME TO pending_views_legacy;")
     except Exception as e:
         print("WARN migrate pending_views:", e)
 
-    # --- Crear tabla nueva (si no existe) ---
+    # =========================================================
+    # MIGRACIÓN "BIEN HECHA" - recibo_estado
+    # =========================================================
+    try:
+        cur.execute("""
+          SELECT name FROM sqlite_master
+          WHERE type='table' AND name='recibo_estado';
+        """)
+        exists = cur.fetchone() is not None
+
+        if exists:
+            cur.execute("PRAGMA table_info(recibo_estado);")
+            cols = [r[1] for r in cur.fetchall()]
+
+            expected = {"tenant", "cuil", "period", "estado", "updated_at"}
+
+            if not expected.issubset(set(cols)):
+                cur.execute("""
+                  SELECT name FROM sqlite_master
+                  WHERE type='table' AND name='recibo_estado_legacy';
+                """)
+                legacy_exists = cur.fetchone() is not None
+
+                if legacy_exists:
+                    cur.execute("DROP TABLE IF EXISTS recibo_estado;")
+                else:
+                    cur.execute("ALTER TABLE recibo_estado RENAME TO recibo_estado_legacy;")
+    except Exception as e:
+        print("WARN migrate recibo_estado:", e)
+
+    # =========================================================
+    # TABLAS NUEVAS (o recreadas)
+    # =========================================================
     cur.execute("""
       CREATE TABLE IF NOT EXISTS pending_views (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -503,17 +520,38 @@ def init_db():
       );
     """)
 
-    # índices útiles (rápido para lookup por whatsapp)
+    cur.execute("""
+      CREATE TABLE IF NOT EXISTS recibo_estado (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        tenant TEXT NOT NULL,
+        cuil TEXT NOT NULL,
+        period TEXT NOT NULL,
+        estado TEXT NOT NULL,         -- DISPONIBLE | FIRMADO | OBSERVADO | NO_NEED
+        updated_at INTEGER NOT NULL,
+        UNIQUE(tenant, cuil, period)
+      );
+    """)
+
+    # =========================================================
+    # ÍNDICES útiles
+    # =========================================================
     try:
+        # pending_views: buscar rápido por whatsapp y por reciente
         cur.execute("CREATE INDEX IF NOT EXISTS idx_pending_views_to ON pending_views(to_whatsapp);")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_pending_views_to_created ON pending_views(to_whatsapp, created_at);")
-    except Exception:
-        pass
+
+        # recibo_estado: buscar estado por tenant+cuil+period
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_recibo_estado_key ON recibo_estado(tenant, cuil, period);")
+    except Exception as e:
+        print("WARN creating indexes:", e)
 
     conn.commit()
     conn.close()
 
+
+# llamar al iniciar
 init_db()
+
 
 def add_pending_view(to_whatsapp: str, tenant: str, cuil: str, period: str):
     conn = get_db_connection()
