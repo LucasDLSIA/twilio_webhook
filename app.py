@@ -250,25 +250,25 @@ def list_periods_for_cuil(tenant_slug: str, cuil: str) -> List[str]:
 
     periods = sorted(set(periods), key=key, reverse=True)
     return periods
-
 def norm_digits(s: str) -> str:
     return re.sub(r"\D", "", str(s or ""))
 
 def norm_cuil(s: str) -> str:
-    d = norm_digits(s)
-    # CUIL suele tener 11 dígitos. Si viene con basura, igual devolvemos dígitos.
-    return d
+    return norm_digits(s)
+
+def strip_pdf(name: str) -> str:
+    s = str(name or "").strip()
+    if s.lower().endswith(".pdf"):
+        s = s[:-4]
+    return s.strip()
 
 def norm_whatsapp(s: str) -> str:
     d = norm_digits(s)
     if not d:
         return ""
-    # Si ya viene con 54..., lo respetamos.
     if d.startswith("54"):
         return "whatsapp:+" + d
-    # Si viene tipo 11xxxxxxxx (ARG), le agregamos 54
     return "whatsapp:+54" + d
-
 
 # =========================
 # Routes
@@ -307,6 +307,27 @@ def admin_home():
         html.append("</ul>")
 
     return Response("".join(html), mimetype="text/html")
+
+def find_person_by_cuil(envios_rows: List[dict], cuil: str) -> Optional[dict]:
+    target = norm_cuil(cuil)
+    if not target:
+        return None
+
+    for r in envios_rows:
+        archivo = strip_pdf(r.get("archivo") or r.get("Archivo") or "")
+        if norm_cuil(archivo) == target:
+            nombre = str(r.get("nombre") or r.get("Nombre") or "").strip()
+            tel = str(r.get("telefono") or r.get("teléfono") or r.get("Telefono") or "").strip()
+            dni = str(r.get("dni") or r.get("DNI") or "").strip()
+            return {
+                "cuil": archivo,
+                "nombre": nombre,
+                "telefono_raw": tel,
+                "to_whatsapp": norm_whatsapp(tel),
+                "dni": dni,
+            }
+    return None
+
 
 @app.get("/admin/send_test")
 def admin_send_test():
@@ -353,6 +374,14 @@ def admin_send_test():
 
         envios = load_envios_rows(tenant)
         phone = find_phone_by_cuil(envios, cuil)
+        person = find_person_by_cuil(envios, cuil)
+        if not person or not person.get("to_whatsapp"):
+            html.append("<p style='color:red'>No se encontró WhatsApp para ese CUIL en el Excel de envíos.</p>")
+        else:
+            phone = person["to_whatsapp"]
+            html.append("<p>✔ Persona encontrada</p>")
+            html.append(f"<p>👤 Nombre: {esc(person.get('nombre',''))}</p>")
+            html.append(f"<p>📞 WhatsApp: {esc(phone)}</p>")
 
         if not phone:
             html.append("<p style='color:red'>No se encontró WhatsApp para ese CUIL.</p>")
