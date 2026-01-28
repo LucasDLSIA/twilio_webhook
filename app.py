@@ -477,6 +477,21 @@ def twilio_status():
 
     return "OK"
 
+def pdf_exists_for(tenant: str, cuil: str, period: str) -> bool:
+    """
+    Devuelve True si existe el PDF del recibo para ese tenant / cuil / período.
+    """
+    try:
+        file = find_pdf_in_drive(
+            tenant=tenant,
+            cuil=cuil,
+            period=period
+        )
+        return file is not None
+    except Exception as e:
+        print("PDF CHECK ERROR:", tenant, cuil, period, e)
+        return False
+
 
 # =========================
 # DB: pending view + estado firma
@@ -748,13 +763,42 @@ def admin_panel():
     html.append("<button type='submit'>Enviar plantilla a toda la empresa</button>")
     html.append("</form>")
 
+    html.append("<hr>")
     html.append("<h3>Reportes</h3>")
-    html.append(f"""
-    <ul>
-    <li><a href="/admin/report_estado.csv?tenant={esc(tenant)}">📊 Estado de recibos (CSV)</a></li>
-    <li><a href="/admin/report_envios.csv?tenant={esc(tenant)}">📄 Envíos realizados (CSV)</a></li>
-    </ul>
-    """)
+
+    html.append("""
+    <form method="get" action="/admin/report_recibos.xlsx" style="margin-bottom:12px;">
+    <input type="hidden" name="tenant" value="{tenant}">
+    <input type="hidden" name="token" value="{token}">
+    
+    <label>
+        Período (opcional):
+        <input type="text" name="period" placeholder="01/2026">
+    </label>
+
+    <button type="submit">📄 Descargar reporte de recibos</button>
+    </form>
+    """.format(
+        tenant=esc(tenant),
+        token=esc(token)
+    ))
+
+    html.append("""
+    <form method="get" action="/admin/report_envios.csv">
+    <input type="hidden" name="tenant" value="{tenant}">
+    <input type="hidden" name="token" value="{token}">
+    
+    <label>
+        Período (opcional):
+        <input type="text" name="period" placeholder="01/2026">
+    </label>
+
+    <button type="submit">📄 Envíos realizados (CSV)</button>
+    </form>
+    """.format(
+        tenant=esc(tenant),
+        token=esc(token)
+    ))
 
 
     # ---------- Reset ----------
