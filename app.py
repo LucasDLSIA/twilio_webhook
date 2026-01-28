@@ -588,6 +588,19 @@ def consume_pending_view(pending_id: int):
     conn.commit()
     conn.close()
 
+def get_recibo_estado(tenant, cuil, period):
+    conn = get_db_connection()
+    conn.row_factory = sqlite3.Row
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT estado FROM recibo_estado WHERE tenant=? AND cuil=? AND period=? LIMIT 1;",
+        (tenant, cuil, period)
+    )
+    row = cur.fetchone()
+    conn.close()
+    return row["estado"] if row else None
+
+
 def set_recibo_estado(tenant: str, cuil: str, period: str, estado: str):
     conn = get_db_connection()
     cur = conn.cursor()
@@ -822,6 +835,11 @@ def twilio_inbound():
     tenant = pending["tenant"]
     cuil = pending["cuil"]
     period = pending["period"]
+    estado = get_recibo_estado(tenant, cuil, period)
+    if estado in ("FIRMADO", "OBSERVADO"):
+        msg = "✅ Este recibo ya fue firmado." if estado == "FIRMADO" else "📝 Este recibo quedó como observado."
+        return Response(f"<Response><Message>{msg}</Message></Response>", mimetype="application/xml", status=200)
+
 
     # 1) VIEW_NOW -> enviar PDF del periodo del pending view
     if button == "VIEW_NOW" or body == "VIEW_NOW":
@@ -848,6 +866,7 @@ def twilio_inbound():
             # (opcional) mandar plantilla de firma/observa DESPUÉS del PDF
             if TWILIO_SIGN_TEMPLATE_SID:
                 try:
+                    time.sleep(2)  # fuerza orden: primero PDF, luego firma
                     sid_sign = send_whatsapp_template(
                         from_whatsapp,
                         content_vars={"1": period},
@@ -856,6 +875,7 @@ def twilio_inbound():
                     print("SENT SIGN TEMPLATE SID:", sid_sign)
                 except Exception as e:
                     print("WARN sending sign template:", e)
+
 
         except Exception as e:
             print("ERROR sending PDF:", e)
@@ -869,15 +889,24 @@ def twilio_inbound():
         consume_pending_view(pending["id"])
         return Response("OK", status=200)
 
-    # 3) Firma / Observa (cuando tengas tu segunda plantilla con payloads)
     if button in ("SIGN_OK", "SIGN_OBS") or body in ("SIGN_OK", "SIGN_OBS"):
         if button == "SIGN_OK" or body == "SIGN_OK":
             set_recibo_estado(tenant, cuil, period, "FIRMADO")
+            consume_pending_view(pending["id"])
+            return Response(
+                "<Response><Message>✅ Recibo firmado. ¡Gracias!</Message></Response>",
+                mimetype="application/xml",
+                status=200
+            )
         else:
             set_recibo_estado(tenant, cuil, period, "OBSERVADO")
+            consume_pending_view(pending["id"])
+            return Response(
+                "<Response><Message>📝 Recibo observado. Vamos a revisarlo y te contactamos.</Message></Response>",
+                mimetype="application/xml",
+                status=200
+            )
 
-        consume_pending_view(pending["id"])
-        return Response("OK", status=200)
 
     return Response("OK", status=200)
 
