@@ -895,6 +895,49 @@ def get_estado_report(tenant: str, period: str | None = None):
     conn.close()
     return [dict(r) for r in rows]
 
+@app.get("/admin/report_recibos.xlsx")
+@admin_required
+def admin_report_recibos_xlsx():
+    tenant = (request.args.get("tenant") or "").strip().lower()
+    period = (request.args.get("period") or "").strip()
+
+    if not tenant:
+        return Response("Falta tenant", status=400)
+
+    conn = get_db_connection()
+    cur = conn.cursor()
+
+    if period:
+        cur.execute("""
+            SELECT tenant, cuil, period, estado, updated_at
+            FROM recibo_estado
+            WHERE tenant = ? AND period = ?
+            ORDER BY cuil
+        """, (tenant, period))
+    else:
+        cur.execute("""
+            SELECT tenant, cuil, period, estado, updated_at
+            FROM recibo_estado
+            WHERE tenant = ?
+            ORDER BY period, cuil
+        """, (tenant,))
+
+    rows = cur.fetchall()
+    conn.close()
+
+    df = pd.DataFrame(rows, columns=["tenant", "cuil", "period", "estado", "updated_at"])
+    out = io.BytesIO()
+    df.to_excel(out, index=False)
+    out.seek(0)
+
+    filename = f"reporte_recibos_{tenant}.xlsx" if not period else f"reporte_recibos_{tenant}_{period.replace('/','-')}.xlsx"
+    return Response(
+        out.getvalue(),
+        mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": f"attachment; filename={filename}"}
+    )
+
+
 @app.get("/admin/report_estado.csv")
 def admin_report_estado():
     auth = require_admin()
@@ -956,6 +999,41 @@ def admin_report_envios():
             "Content-Disposition": f"attachment; filename=envios_{tenant}.csv"
         }
     )
+
+def find_pdf_file_id(tenant: str, cuil: str, period: str) -> str | None:
+    """
+    Devuelve fileId del PDF en Drive o None si no existe.
+    IMPORTANTE: esto tiene que coincidir con la lógica real de /media/pdf.
+    """
+    t = get_tenant(tenant)
+    if not t:
+        return None
+
+    root_id = (t.get("recibos_root_id") or "").strip()
+    if not root_id:
+        return None
+
+    # Normalizaciones
+    cuil = strip_pdf(cuil).strip()
+    period = period.strip()  # "01/2026"
+
+    service = drive_service()
+
+    # OJO: acá depende de cómo estén guardados tus PDFs.
+    # Si los guardás por nombre exacto "20-xxxx.pdf" dentro de una carpeta del periodo,
+    # tenés que buscar primero la carpeta del periodo y luego el archivo.
+    #
+    # Te dejo una búsqueda simple por nombre en el root (si vos no usás subcarpetas por periodo):
+    filename = f"{cuil}.pdf"
+
+    q = (
+        f"'{root_id}' in parents and trashed=false "
+        f"and name='{filename}'"
+    )
+
+    res = service.files().list(q=q, fields="files(id,name)", pageSize=1).execute()
+    files = res.get("files", [])
+    return files[0]["id"] if files else None
 
 
 @app.post("/twilio/webhook")
@@ -1069,7 +1147,7 @@ def admin_send_template_queue_start():
         if not tel_raw or not arch_raw:
             continue
 
-        # normalizar whatsapp
+        # Normalizar WhatsApp
         tel_digits = "".join(ch for ch in tel_raw if ch.isdigit())
         if not tel_digits:
             continue
@@ -1077,23 +1155,25 @@ def admin_send_template_queue_start():
             tel_digits = "54" + tel_digits
         to_whatsapp = f"whatsapp:+{tel_digits}"
 
-        # cuil desde "archivo"
+        # CUIL desde archivo
         cuil = arch_raw.replace(".pdf", "").strip()
         try:
             cuil = strip_pdf(cuil)
         except Exception:
-            pass
+            continue
 
-        # si require_pdf, chequeo
-        if require_pdf:
-            try:
-                ok = pdf_exists_for_tenant_period_cuil(tenant, cuil, period)
-            except Exception:
-                ok = False
-            if not ok:
-                skipped_no_pdf += 1
-                continue
+        # 🔒 PASO CRÍTICO: verificar que exista PDF
+        try:
+            pdf_file_id = find_pdf_file_id(tenant, cuil, period)
+        except Exception:
+            pdf_file_id = None
 
+        if not pdf_file_id:
+            skipped_no_pdf += 1
+            print("SKIP (no pdf):", tenant, cuil, period)
+            continue   # ⛔ NO MANDA PLANTILLA
+
+        # ✅ Recién ahora mandamos VIEW_NOW
         try:
             sid = send_whatsapp_template(
                 to_whatsapp,
@@ -1101,13 +1181,14 @@ def admin_send_template_queue_start():
                 template_sid=TWILIO_TEMPLATE_SID,
             )
             sent += 1
-            print("SENT TEMPLATE", sid, tenant, cuil, period, to_whatsapp)
+            print("SENT VIEW_NOW", sid, tenant, cuil, period)
 
             add_pending_view(to_whatsapp, tenant, cuil, period)
 
         except Exception as e:
             failed += 1
             print("ERROR send template:", tenant, cuil, to_whatsapp, e)
+
 
     return redirect(
         f"/admin/panel?tenant={tenant}&token={token}&msg=mass_send_ok"
