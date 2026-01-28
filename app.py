@@ -382,16 +382,23 @@ def _twilio_client() -> Client:
         raise RuntimeError("Faltan TWILIO_ACCOUNT_SID / TWILIO_AUTH_TOKEN en ENV")
     return Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
 
-def send_whatsapp_pdf(to_whatsapp: str, media_url: str, body: str) -> str:
+STATUS_CALLBACK_URL = os.environ.get("STATUS_CALLBACK_URL", "").strip()
+
+def send_whatsapp_pdf(to_whatsapp: str, media_url: str, body: str, status_callback: str | None = None) -> str:
     if not (TWILIO_WHATSAPP_FROM or TWILIO_MESSAGING_SERVICE_SID):
         raise RuntimeError("Falta TWILIO_WHATSAPP_FROM o TWILIO_MESSAGING_SERVICE_SID en ENV")
 
     client = _twilio_client()
+
     payload = {
         "to": to_whatsapp,
         "body": body or " ",
         "media_url": [media_url],
     }
+
+    if status_callback:
+        payload["status_callback"] = status_callback
+
     if TWILIO_MESSAGING_SERVICE_SID:
         payload["messaging_service_sid"] = TWILIO_MESSAGING_SERVICE_SID
     else:
@@ -399,6 +406,18 @@ def send_whatsapp_pdf(to_whatsapp: str, media_url: str, body: str) -> str:
 
     msg = client.messages.create(**payload)
     return msg.sid
+
+def save_pdf_sid(tenant: str, cuil: str, period: str, to_whatsapp: str, sid: str):
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute("""
+        INSERT OR IGNORE INTO sent_pdfs
+        (tenant, cuil, period, to_whatsapp, message_sid, created_at)
+        VALUES (?, ?, ?, ?, ?, ?)
+    """, (tenant, cuil, period, to_whatsapp, sid, int(time.time())))
+    conn.commit()
+    conn.close()
+
 
 def send_whatsapp_template(to_whatsapp: str, content_vars: Optional[dict] = None, template_sid: Optional[str] = None) -> str:
     """
@@ -429,6 +448,47 @@ def send_whatsapp_template(to_whatsapp: str, content_vars: Optional[dict] = None
     msg = client.messages.create(**payload)
     return msg.sid
 
+@app.post("/twilio/status")
+def twilio_status():
+    sid = (request.form.get("MessageSid") or "").strip()
+    status = (request.form.get("MessageStatus") or "").strip()
+
+    print("STATUS:", sid, status)
+
+    if status != "delivered":
+        return "OK"
+
+    info = get_pdf_by_sid(sid)
+    if not info:
+        return "OK"
+
+    # si ya mandamos firma para ese PDF, no repetir
+    if info.get("sign_sent_at"):
+        return "OK"
+
+    if not TWILIO_SIGN_TEMPLATE_SID:
+        return "OK"
+
+    try:
+        send_whatsapp_template(
+            info["to_whatsapp"],
+            template_sid=TWILIO_SIGN_TEMPLATE_SID,
+            content_vars={"1": info["period"]},
+        )
+        print("SIGN TEMPLATE SENT AFTER PDF DELIVERED")
+
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute("UPDATE sent_pdfs SET sign_sent_at=? WHERE message_sid=?;", (int(time.time()), sid))
+        conn.commit()
+        conn.close()
+
+    except Exception as e:
+        print("WARN sending sign template in status callback:", e)
+
+    return "OK"
+
+
 # =========================
 # DB: pending view + estado firma
 # =========================
@@ -443,43 +503,6 @@ def init_db():
     conn = get_db_connection()
     cur = conn.cursor()
 
-    # --- Migración "bien hecha" pending_views ---
-    try:
-        cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='pending_views';")
-        exists = cur.fetchone() is not None
-        if exists:
-            cur.execute("PRAGMA table_info(pending_views);")
-            cols = [r[1] for r in cur.fetchall()]
-            expected = {"to_whatsapp", "tenant", "cuil", "period", "created_at"}
-            if (not expected.issubset(set(cols))) or ("archivo_norm" in cols):
-                cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='pending_views_legacy';")
-                legacy_exists = cur.fetchone() is not None
-                if legacy_exists:
-                    cur.execute("DROP TABLE IF EXISTS pending_views;")
-                else:
-                    cur.execute("ALTER TABLE pending_views RENAME TO pending_views_legacy;")
-    except Exception as e:
-        print("WARN migrate pending_views:", e)
-
-    # --- Migración "bien hecha" recibo_estado ---
-    try:
-        cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='recibo_estado';")
-        exists = cur.fetchone() is not None
-        if exists:
-            cur.execute("PRAGMA table_info(recibo_estado);")
-            cols = [r[1] for r in cur.fetchall()]
-            expected = {"tenant", "cuil", "period", "estado", "updated_at"}
-            if not expected.issubset(set(cols)):
-                cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='recibo_estado_legacy';")
-                legacy_exists = cur.fetchone() is not None
-                if legacy_exists:
-                    cur.execute("DROP TABLE IF EXISTS recibo_estado;")
-                else:
-                    cur.execute("ALTER TABLE recibo_estado RENAME TO recibo_estado_legacy;")
-    except Exception as e:
-        print("WARN migrate recibo_estado:", e)
-
-    # --- Tablas correctas ---
     cur.execute("""
       CREATE TABLE IF NOT EXISTS pending_views (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -503,19 +526,59 @@ def init_db():
       );
     """)
 
-    # índices
+    cur.execute("""
+      CREATE TABLE IF NOT EXISTS sent_pdfs (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        tenant TEXT NOT NULL,
+        cuil TEXT NOT NULL,
+        period TEXT NOT NULL,
+        to_whatsapp TEXT NOT NULL,
+        message_sid TEXT NOT NULL UNIQUE,
+        created_at INTEGER NOT NULL,
+        sign_sent_at INTEGER
+      );
+    """)
+
+    # Si la tabla existía sin sign_sent_at, la agregamos
     try:
-        cur.execute("CREATE INDEX IF NOT EXISTS idx_pending_views_to ON pending_views(to_whatsapp);")
-        cur.execute("CREATE INDEX IF NOT EXISTS idx_pending_views_to_created ON pending_views(to_whatsapp, created_at);")
-        cur.execute("CREATE INDEX IF NOT EXISTS idx_recibo_estado_key ON recibo_estado(tenant, cuil, period);")
-    except Exception as e:
-        print("WARN indexes:", e)
+        cur.execute("ALTER TABLE sent_pdfs ADD COLUMN sign_sent_at INTEGER;")
+    except Exception:
+        pass
+
+    # índices útiles
+    try:
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_pending_to_created ON pending_views(to_whatsapp, created_at);")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_estado_key ON recibo_estado(tenant, cuil, period);")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_sentpdfs_sid ON sent_pdfs(message_sid);")
+    except Exception:
+        pass
 
     conn.commit()
     conn.close()
 
+
 init_db()
 
+def save_pdf_sid(tenant, cuil, period, sid):
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute("""
+        INSERT OR IGNORE INTO sent_pdfs
+        (tenant, cuil, period, to_whatsapp, message_sid, created_at)
+        VALUES (?, ?, ?, ?, ?, ?)
+    """, (tenant, cuil, period, get_whatsapp_for_cuil(tenant, cuil), sid, int(time.time())))
+    conn.commit()
+    conn.close()
+
+
+def get_pdf_by_sid(sid):
+    conn = get_db_connection()
+    conn.row_factory = sqlite3.Row
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM sent_pdfs WHERE message_sid = ?", (sid,))
+    row = cur.fetchone()
+    conn.close()
+    return dict(row) if row else None
 
 
 from functools import wraps
@@ -729,7 +792,7 @@ def admin_panel():
       <form method="get" action="/admin/periodos">
         <input type="hidden" name="token" value="{esc(token)}">
         <input type="hidden" name="tenant" value="{esc(tenant)}">
-        <input type="text" name="cuil" placeholder="20-xxxxxxxx-x" required>
+        <input type="text" name="cuil" placeholder="xx-xxxxxxxx-x" required>
         <button type="submit">Buscar</button>
       </form>
     """)
@@ -1051,25 +1114,27 @@ def twilio_inbound():
         )
 
         try:
-            sid_pdf = send_whatsapp_pdf(from_whatsapp, pdf_url, body=f"Acá tenés tu recibo {period}.")
+            sid_pdf = send_whatsapp_pdf(
+                from_whatsapp,
+                pdf_url,
+                body=f"Acá tenés tu recibo {period}.",
+                status_callback=STATUS_CALLBACK_URL,   # <-- CLAVE
+            )
             print("SENT PDF SID:", sid_pdf)
 
             set_recibo_estado(tenant, cuil, period, "DISPONIBLE")
 
-            # ✅ FORZAMOS ORDEN: PDF primero, firma después
-            if TWILIO_SIGN_TEMPLATE_SID:
-                time.sleep(2)
-                sid_sign = send_whatsapp_template(
-                    from_whatsapp,
-                    content_vars={"1": period},
-                    template_sid=TWILIO_SIGN_TEMPLATE_SID,
-                )
-                print("SENT SIGN TEMPLATE SID:", sid_sign)
+            # Guardamos SID para que /twilio/status sepa que este delivered era un PDF
+            save_pdf_sid(tenant, cuil, period, from_whatsapp, sid_pdf)
+
+            # NO mandes la plantilla de firma acá
+            # Se manda en /twilio/status cuando delivered
 
         except Exception as e:
             print("ERROR sending PDF:", e)
 
         return Response("OK", status=200)
+
 
     # 2) NO_NEED
     if button == "NO_NEED" or body == "NO_NEED":
