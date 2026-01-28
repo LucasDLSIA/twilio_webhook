@@ -443,62 +443,35 @@ def init_db():
     conn = get_db_connection()
     cur = conn.cursor()
 
-    # =========================================================
-    # MIGRACIÓN "BIEN HECHA" - pending_views
-    # =========================================================
+    # --- Migración "bien hecha" pending_views ---
     try:
-        cur.execute("""
-          SELECT name FROM sqlite_master
-          WHERE type='table' AND name='pending_views';
-        """)
+        cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='pending_views';")
         exists = cur.fetchone() is not None
-
         if exists:
             cur.execute("PRAGMA table_info(pending_views);")
-            cols = [r[1] for r in cur.fetchall()]  # column names
-
-            # Esquema nuevo esperado
+            cols = [r[1] for r in cur.fetchall()]
             expected = {"to_whatsapp", "tenant", "cuil", "period", "created_at"}
-
-            # Si no coincide (o si tiene columna legacy 'archivo_norm'), renombramos
             if (not expected.issubset(set(cols))) or ("archivo_norm" in cols):
-                cur.execute("""
-                  SELECT name FROM sqlite_master
-                  WHERE type='table' AND name='pending_views_legacy';
-                """)
+                cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='pending_views_legacy';")
                 legacy_exists = cur.fetchone() is not None
-
                 if legacy_exists:
-                    # si ya existe legacy, dropeamos la vieja para recrear limpia
                     cur.execute("DROP TABLE IF EXISTS pending_views;")
                 else:
                     cur.execute("ALTER TABLE pending_views RENAME TO pending_views_legacy;")
     except Exception as e:
         print("WARN migrate pending_views:", e)
 
-    # =========================================================
-    # MIGRACIÓN "BIEN HECHA" - recibo_estado
-    # =========================================================
+    # --- Migración "bien hecha" recibo_estado ---
     try:
-        cur.execute("""
-          SELECT name FROM sqlite_master
-          WHERE type='table' AND name='recibo_estado';
-        """)
+        cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='recibo_estado';")
         exists = cur.fetchone() is not None
-
         if exists:
             cur.execute("PRAGMA table_info(recibo_estado);")
             cols = [r[1] for r in cur.fetchall()]
-
             expected = {"tenant", "cuil", "period", "estado", "updated_at"}
-
             if not expected.issubset(set(cols)):
-                cur.execute("""
-                  SELECT name FROM sqlite_master
-                  WHERE type='table' AND name='recibo_estado_legacy';
-                """)
+                cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='recibo_estado_legacy';")
                 legacy_exists = cur.fetchone() is not None
-
                 if legacy_exists:
                     cur.execute("DROP TABLE IF EXISTS recibo_estado;")
                 else:
@@ -506,9 +479,7 @@ def init_db():
     except Exception as e:
         print("WARN migrate recibo_estado:", e)
 
-    # =========================================================
-    # TABLAS NUEVAS (o recreadas)
-    # =========================================================
+    # --- Tablas correctas ---
     cur.execute("""
       CREATE TABLE IF NOT EXISTS pending_views (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -532,51 +503,62 @@ def init_db():
       );
     """)
 
-    # =========================================================
-    # ÍNDICES útiles
-    # =========================================================
+    # índices
     try:
-        # pending_views: buscar rápido por whatsapp y por reciente
         cur.execute("CREATE INDEX IF NOT EXISTS idx_pending_views_to ON pending_views(to_whatsapp);")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_pending_views_to_created ON pending_views(to_whatsapp, created_at);")
-
-        # recibo_estado: buscar estado por tenant+cuil+period
         cur.execute("CREATE INDEX IF NOT EXISTS idx_recibo_estado_key ON recibo_estado(tenant, cuil, period);")
     except Exception as e:
-        print("WARN creating indexes:", e)
+        print("WARN indexes:", e)
 
     conn.commit()
     conn.close()
 
-
-# llamar al iniciar
 init_db()
 
+
+
+from functools import wraps
+from flask import request, Response
+
+ADMIN_TOKEN = os.environ.get("ADMIN_TOKEN", "").strip()
+
+def _get_admin_token_from_request() -> str:
+    return (request.args.get("token") or request.form.get("token") or "").strip()
+
+def admin_required(fn):
+    @wraps(fn)
+    def wrapper(*args, **kwargs):
+        tok = _get_admin_token_from_request()
+        if not ADMIN_TOKEN or tok != ADMIN_TOKEN:
+            return Response("Unauthorized", status=401)
+        return fn(*args, **kwargs)
+    return wrapper
+
+
+import sqlite3, time
 
 def add_pending_view(to_whatsapp: str, tenant: str, cuil: str, period: str):
     conn = get_db_connection()
     cur = conn.cursor()
-    cur.execute(
-        "INSERT INTO pending_views (to_whatsapp, tenant, cuil, period, created_at) VALUES (?, ?, ?, ?, ?)",
-        (to_whatsapp, tenant, cuil, period, int(time.time())),
-    )
+    cur.execute("""
+      INSERT INTO pending_views (to_whatsapp, tenant, cuil, period, created_at)
+      VALUES (?, ?, ?, ?, ?);
+    """, (to_whatsapp, tenant, cuil, period, int(time.time())))
     conn.commit()
     conn.close()
 
-def get_latest_pending_view(from_whatsapp: str) -> Optional[dict]:
+def get_latest_pending_view(from_whatsapp: str):
     conn = get_db_connection()
     conn.row_factory = sqlite3.Row
     cur = conn.cursor()
-    cur.execute(
-        """
-        SELECT id, tenant, cuil, period
-        FROM pending_views
-        WHERE to_whatsapp = ?
-        ORDER BY created_at DESC
-        LIMIT 1
-        """,
-        (from_whatsapp,),
-    )
+    cur.execute("""
+      SELECT id, to_whatsapp, tenant, cuil, period, created_at
+      FROM pending_views
+      WHERE to_whatsapp = ?
+      ORDER BY created_at DESC
+      LIMIT 1;
+    """, (from_whatsapp,))
     row = cur.fetchone()
     conn.close()
     return dict(row) if row else None
@@ -584,38 +566,52 @@ def get_latest_pending_view(from_whatsapp: str) -> Optional[dict]:
 def consume_pending_view(pending_id: int):
     conn = get_db_connection()
     cur = conn.cursor()
-    cur.execute("DELETE FROM pending_views WHERE id = ?", (int(pending_id),))
+    cur.execute("DELETE FROM pending_views WHERE id=?;", (pending_id,))
     conn.commit()
     conn.close()
-
-def get_recibo_estado(tenant, cuil, period):
-    conn = get_db_connection()
-    conn.row_factory = sqlite3.Row
-    cur = conn.cursor()
-    cur.execute(
-        "SELECT estado FROM recibo_estado WHERE tenant=? AND cuil=? AND period=? LIMIT 1;",
-        (tenant, cuil, period)
-    )
-    row = cur.fetchone()
-    conn.close()
-    return row["estado"] if row else None
-
 
 def set_recibo_estado(tenant: str, cuil: str, period: str, estado: str):
     conn = get_db_connection()
     cur = conn.cursor()
-    cur.execute(
-        """
-        INSERT INTO recibo_estado (tenant, cuil, period, estado, updated_at)
-        VALUES (?, ?, ?, ?, ?)
-        ON CONFLICT(tenant, cuil, period) DO UPDATE SET
-          estado=excluded.estado,
-          updated_at=excluded.updated_at
-        """,
-        (tenant, cuil, period, estado, int(time.time())),
-    )
+    now = int(time.time())
+    cur.execute("""
+      INSERT INTO recibo_estado (tenant, cuil, period, estado, updated_at)
+      VALUES (?, ?, ?, ?, ?)
+      ON CONFLICT(tenant, cuil, period) DO UPDATE SET
+        estado=excluded.estado,
+        updated_at=excluded.updated_at;
+    """, (tenant, cuil, period, estado, now))
     conn.commit()
     conn.close()
+
+def get_recibo_estado(tenant: str, cuil: str, period: str):
+    conn = get_db_connection()
+    conn.row_factory = sqlite3.Row
+    cur = conn.cursor()
+    cur.execute("""
+      SELECT estado FROM recibo_estado
+      WHERE tenant=? AND cuil=? AND period=?
+      LIMIT 1;
+    """, (tenant, cuil, period))
+    row = cur.fetchone()
+    conn.close()
+    return row["estado"] if row else None
+
+import requests
+
+def pdf_exists_for_tenant_period_cuil(tenant, cuil, period):
+    url = f"{os.environ.get('PUBLIC_BASE_URL','').rstrip('/')}/media/pdf"
+    if not url.startswith("http"):
+        # fallback: no podemos verificar
+        return True
+    r = requests.get(url, params={
+        "tenant": tenant,
+        "cuil": cuil,
+        "period": period,
+        "token": ADMIN_TOKEN
+    }, timeout=12)
+    return r.status_code == 200
+
 
 # =========================
 # Routes
@@ -664,23 +660,57 @@ def admin_panel():
     if auth:
         return auth
 
-    token = request.args.get("token", "")
+    token = (request.args.get("token") or "").strip()
     tenant = (request.args.get("tenant") or "").strip().lower()
+
+    if not tenant:
+        return Response("Falta tenant. Volvé a /admin.", status=400)
+
     t = get_tenant(tenant)
     if not t:
         return Response("Tenant inválido. Volvé a /admin.", status=400)
 
-    envios_rows = load_envios_rows(tenant, force=False)
+    # Lee envíos (cacheado si tu load_envios_rows cachea)
+    envios_rows = load_envios_rows(tenant, force=False) or []
 
     html = []
+    html.append("<!doctype html><html><head><meta charset='utf-8'><title>Panel empresa</title></head><body>")
     html.append("<h2>Panel empresa</h2>")
-    html.append(f"<p><b>Empresa:</b> {esc(t['display_name'])} &nbsp; (<code>{esc(t['slug'])}</code>)</p>")
+    html.append(f"<p><b>Empresa:</b> {esc(t.get('display_name',''))} &nbsp; (<code>{esc(t.get('slug',''))}</code>)</p>")
     html.append(f"<p><a href='/admin?token={esc(token)}'>← volver</a></p>")
-    html.append(f"<p><a href='/admin/send_test?tenant={esc(tenant)}&token={esc(token)}'>🧪 Envío de prueba</a></p>")
-    html.append("<hr>")
 
+    # Botón prueba
+    html.append(f"<p><a href='/admin/send_test?tenant={esc(tenant)}&token={esc(token)}'>🧪 Envío de prueba (1 persona)</a></p>")
+
+    # ---------- Envío masivo ----------
+    html.append("<hr>")
+    html.append("<h3>📩 Envío masivo (empresa completa)</h3>")
+    html.append("<form method='post' action='/admin/send_template_queue_start'>")
+    html.append(f"<input type='hidden' name='token' value='{esc(token)}'>")
+    html.append(f"<input type='hidden' name='tenant' value='{esc(tenant)}'>")
+    html.append("<label>Período (mm/aaaa): <input type='text' name='period' placeholder='01/2026' required></label><br><br>")
+    html.append("<label>Límite (0 = todos): <input type='number' name='limit' min='0' value='0'></label><br><br>")
+    # si querés que sea opción, cambiá a checkbox. Por ahora lo dejo fijo en true como venías usando.
+    html.append("<input type='hidden' name='require_pdf' value='true'>")
+    html.append("<button type='submit'>Enviar plantilla a toda la empresa</button>")
+    html.append("</form>")
+
+    # ---------- Reset ----------
+    html.append("<hr>")
+    html.append("<h3>🧹 Reset (limpiar por empresa/período)</h3>")
+    html.append("<p>Esto borra <code>pending_views</code> y <code>recibo_estado</code> SOLO para esta empresa (y período si lo completás).</p>")
+    html.append("<form method='post' action='/admin/reset' onsubmit='return confirm(\"¿Seguro? Esto borra pending y estados.\");'>")
+    html.append(f"<input type='hidden' name='token' value='{esc(token)}'>")
+    html.append(f"<input type='hidden' name='tenant' value='{esc(tenant)}'>")
+    html.append("<label>Período a resetear (opcional, mm/aaaa): <input type='text' name='period' placeholder='01/2026'></label><br><br>")
+    html.append("<button type='submit'>Resetear</button>")
+    html.append("</form>")
+
+    # ---------- Preview envíos ----------
+    html.append("<hr>")
     html.append("<h3>Preview Excel de envíos</h3>")
     html.append(f"<p>Filas: {len(envios_rows)}</p>")
+
     sample = envios_rows[:10]
     if sample:
         cols = list(sample[0].keys())
@@ -692,18 +722,22 @@ def admin_panel():
     else:
         html.append("<p>No se pudo leer el Excel de envíos o está vacío.</p>")
 
+    # ---------- Buscar períodos ----------
     html.append("<hr>")
     html.append("<h3>Buscar períodos por CUIL</h3>")
     html.append(f"""
       <form method="get" action="/admin/periodos">
         <input type="hidden" name="token" value="{esc(token)}">
         <input type="hidden" name="tenant" value="{esc(tenant)}">
-        <input type="text" name="cuil" placeholder="20xxxxxxxxx" required>
+        <input type="text" name="cuil" placeholder="20-xxxxxxxx-x" required>
         <button type="submit">Buscar</button>
       </form>
     """)
 
+    html.append("</body></html>")
     return Response("".join(html), mimetype="text/html")
+
+
 
 @app.get("/admin/periodos")
 def admin_periodos():
@@ -721,9 +755,172 @@ def admin_periodos():
     periods = list_periods_for_cuil(tenant, cuil)
     return jsonify({"tenant": tenant, "cuil": cuil, "periodos": periods})
 
+import pandas as pd
+
+def get_envios_df_for_tenant(tenant_slug: str, force: bool = False) -> pd.DataFrame:
+    """
+    Devuelve DataFrame del Excel de envíos de la empresa (tenant).
+    Usa tu función existente load_envios_rows(tenant,...).
+    """
+    rows = load_envios_rows(tenant_slug, force=force) or []
+    return pd.DataFrame(rows)
+
+
 @app.post("/twilio/webhook")
 def twilio_webhook_alias():
     return twilio_inbound()
+
+@app.post("/admin/reset_tenant")
+@admin_required
+def admin_reset_tenant():
+    token = _get_admin_token_from_request()
+    tenant = (request.form.get("tenant") or "").strip().lower()
+    period = (request.form.get("period") or "").strip()  # opcional
+
+    if not tenant:
+        return Response("Falta tenant", status=400)
+
+    conn = get_db_connection()
+    cur = conn.cursor()
+
+    # limpia pendings de esa empresa
+    cur.execute("DELETE FROM pending_views WHERE tenant=?;", (tenant,))
+
+    # si mandan period, limpia solo ese período; si no, limpia todo el estado
+    if period:
+        cur.execute("DELETE FROM recibo_estado WHERE tenant=? AND period=?;", (tenant, period))
+    else:
+        cur.execute("DELETE FROM recibo_estado WHERE tenant=?;", (tenant,))
+
+    conn.commit()
+    conn.close()
+
+    return redirect(f"/admin/panel?tenant={tenant}&token={token}&msg=reset_ok")
+
+from flask import redirect
+
+from flask import redirect
+
+@app.post("/admin/reset")
+@admin_required
+def admin_reset():
+    token = _get_admin_token_from_request()
+    tenant = (request.form.get("tenant") or "").strip().lower()
+    period = (request.form.get("period") or "").strip()
+
+    if not tenant:
+        return Response("Falta tenant", status=400)
+
+    conn = get_db_connection()
+    cur = conn.cursor()
+
+    # Limpia pending siempre
+    if period:
+        cur.execute("DELETE FROM pending_views WHERE tenant=? AND period=?;", (tenant, period))
+        cur.execute("DELETE FROM recibo_estado WHERE tenant=? AND period=?;", (tenant, period))
+    else:
+        cur.execute("DELETE FROM pending_views WHERE tenant=?;", (tenant,))
+        cur.execute("DELETE FROM recibo_estado WHERE tenant=?;", (tenant,))
+
+    conn.commit()
+    conn.close()
+
+    return redirect(f"/admin/panel?tenant={tenant}&token={token}&msg=reset_ok&period={period}")
+
+@app.post("/admin/send_template_queue_start")
+@admin_required
+def admin_send_template_queue_start():
+    token = _get_admin_token_from_request()
+
+    tenant = (request.form.get("tenant") or "").strip().lower()
+    period = (request.form.get("period") or "").strip()
+    limit = int((request.form.get("limit") or "0") or 0)
+    require_pdf = (request.form.get("require_pdf") or "true").lower() in ("1", "true", "yes", "on")
+
+    if not tenant:
+        return Response("Falta tenant", status=400)
+    if not period:
+        return Response("Falta period", status=400)
+
+    df = get_envios_df_for_tenant(tenant)
+    if df is None or df.empty:
+        return Response("Excel de envíos vacío o no encontrado", status=400)
+
+    df.columns = [str(c).strip().lower() for c in df.columns]
+
+    def pick(*names):
+        for n in names:
+            if n in df.columns:
+                return n
+        return None
+
+    c_nombre = pick("nombre", "name", "empleado", "persona")
+    c_tel = pick("telefono", "tel", "celular", "whatsapp", "numero")
+    c_arch = pick("archivo", "cuil", "archivo_norm")
+
+    if not c_tel or not c_arch:
+        return Response("El Excel debe tener columnas telefono y archivo (cuil).", status=400)
+
+    rows = df.to_dict(orient="records")
+    if limit > 0:
+        rows = rows[:limit]
+
+    sent = 0
+    skipped_no_pdf = 0
+    failed = 0
+
+    for r in rows:
+        nombre = str(r.get(c_nombre, "")).strip() if c_nombre else ""
+        tel_raw = str(r.get(c_tel, "")).strip()
+        arch_raw = str(r.get(c_arch, "")).strip()
+
+        if not tel_raw or not arch_raw:
+            continue
+
+        # normalizar whatsapp
+        tel_digits = "".join(ch for ch in tel_raw if ch.isdigit())
+        if not tel_digits:
+            continue
+        if not tel_digits.startswith("54"):
+            tel_digits = "54" + tel_digits
+        to_whatsapp = f"whatsapp:+{tel_digits}"
+
+        # cuil desde "archivo"
+        cuil = arch_raw.replace(".pdf", "").strip()
+        try:
+            cuil = strip_pdf(cuil)
+        except Exception:
+            pass
+
+        # si require_pdf, chequeo
+        if require_pdf:
+            try:
+                ok = pdf_exists_for_tenant_period_cuil(tenant, cuil, period)
+            except Exception:
+                ok = False
+            if not ok:
+                skipped_no_pdf += 1
+                continue
+
+        try:
+            sid = send_whatsapp_template(
+                to_whatsapp,
+                content_vars={"1": (nombre or "Hola")},
+                template_sid=TWILIO_TEMPLATE_SID,
+            )
+            sent += 1
+            print("SENT TEMPLATE", sid, tenant, cuil, period, to_whatsapp)
+
+            add_pending_view(to_whatsapp, tenant, cuil, period)
+
+        except Exception as e:
+            failed += 1
+            print("ERROR send template:", tenant, cuil, to_whatsapp, e)
+
+    return redirect(
+        f"/admin/panel?tenant={tenant}&token={token}&msg=mass_send_ok"
+        f"&sent={sent}&failed={failed}&skipped={skipped_no_pdf}&period={period}"
+    )
 
 
 @app.get("/admin/send_test")
@@ -817,6 +1014,11 @@ def admin_send_test():
 # =========================
 # Twilio inbound: VIEW_NOW + firma/observa
 # =========================
+import time
+from flask import Response, request
+
+TWILIO_SIGN_TEMPLATE_SID = os.environ.get("TWILIO_SIGN_TEMPLATE_SID", "").strip()
+
 @app.post("/twilio/inbound")
 def twilio_inbound():
     from_whatsapp = (request.form.get("From") or "").strip()
@@ -828,20 +1030,20 @@ def twilio_inbound():
     pending = get_latest_pending_view(from_whatsapp)
     print("PENDING:", pending)
 
-    # Si no hay pending, no podemos saber tenant/cuil/period
     if not pending:
-        return Response("No pending view", status=200)
+        return Response("OK", status=200)
 
     tenant = pending["tenant"]
     cuil = pending["cuil"]
     period = pending["period"]
+
+    # 🔒 Si ya cerró, no hacer nada más
     estado = get_recibo_estado(tenant, cuil, period)
     if estado in ("FIRMADO", "OBSERVADO"):
         msg = "✅ Este recibo ya fue firmado." if estado == "FIRMADO" else "📝 Este recibo quedó como observado."
         return Response(f"<Response><Message>{msg}</Message></Response>", mimetype="application/xml", status=200)
 
-
-    # 1) VIEW_NOW -> enviar PDF del periodo del pending view
+    # 1) VIEW_NOW -> enviar PDF + luego firma
     if button == "VIEW_NOW" or body == "VIEW_NOW":
         pdf_url = (
             f"{request.host_url.rstrip('/')}/media/pdf"
@@ -849,64 +1051,42 @@ def twilio_inbound():
         )
 
         try:
-            sid_pdf = send_whatsapp_pdf(
-                from_whatsapp,
-                pdf_url,
-                body=f"Acá tenés tu recibo {period}."
-            )
+            sid_pdf = send_whatsapp_pdf(from_whatsapp, pdf_url, body=f"Acá tenés tu recibo {period}.")
             print("SENT PDF SID:", sid_pdf)
 
-            # Estado: DISPONIBLE
             set_recibo_estado(tenant, cuil, period, "DISPONIBLE")
 
-            # IMPORTANTE:
-            # NO consumimos pending acá, porque lo vamos a necesitar para SIGN_OK / SIGN_OBS
-            # consume_pending_view(pending["id"])
-
-            # (opcional) mandar plantilla de firma/observa DESPUÉS del PDF
+            # ✅ FORZAMOS ORDEN: PDF primero, firma después
             if TWILIO_SIGN_TEMPLATE_SID:
-                try:
-                    time.sleep(2)  # fuerza orden: primero PDF, luego firma
-                    sid_sign = send_whatsapp_template(
-                        from_whatsapp,
-                        content_vars={"1": period},
-                        template_sid=TWILIO_SIGN_TEMPLATE_SID,
-                    )
-                    print("SENT SIGN TEMPLATE SID:", sid_sign)
-                except Exception as e:
-                    print("WARN sending sign template:", e)
-
+                time.sleep(2)
+                sid_sign = send_whatsapp_template(
+                    from_whatsapp,
+                    content_vars={"1": period},
+                    template_sid=TWILIO_SIGN_TEMPLATE_SID,
+                )
+                print("SENT SIGN TEMPLATE SID:", sid_sign)
 
         except Exception as e:
             print("ERROR sending PDF:", e)
 
         return Response("OK", status=200)
 
-    # 2) No lo necesita
+    # 2) NO_NEED
     if button == "NO_NEED" or body == "NO_NEED":
-        # Podés marcar estado especial si querés
         set_recibo_estado(tenant, cuil, period, "NO_NEED")
         consume_pending_view(pending["id"])
-        return Response("OK", status=200)
+        return Response("<Response><Message>✅ Perfecto, no hay problema.</Message></Response>", mimetype="application/xml", status=200)
 
+    # 3) SIGN_OK / SIGN_OBS
     if button in ("SIGN_OK", "SIGN_OBS") or body in ("SIGN_OK", "SIGN_OBS"):
         if button == "SIGN_OK" or body == "SIGN_OK":
             set_recibo_estado(tenant, cuil, period, "FIRMADO")
             consume_pending_view(pending["id"])
-            return Response(
-                "<Response><Message>✅ Recibo firmado. ¡Gracias!</Message></Response>",
-                mimetype="application/xml",
-                status=200
-            )
+            return Response("<Response><Message>✅ Recibo firmado. ¡Gracias!</Message></Response>", mimetype="application/xml", status=200)
         else:
             set_recibo_estado(tenant, cuil, period, "OBSERVADO")
             consume_pending_view(pending["id"])
-            return Response(
-                "<Response><Message>📝 Recibo observado. Vamos a revisarlo y te contactamos.</Message></Response>",
-                mimetype="application/xml",
-                status=200
-            )
-
+            return Response("<Response><Message>📝 Recibo observado. Vamos a revisarlo y te contactamos.</Message></Response>", mimetype="application/xml", status=200)
 
     return Response("OK", status=200)
 
