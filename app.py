@@ -407,17 +407,6 @@ def send_whatsapp_pdf(to_whatsapp: str, media_url: str, body: str, status_callba
     msg = client.messages.create(**payload)
     return msg.sid
 
-def save_pdf_sid(tenant: str, cuil: str, period: str, to_whatsapp: str, sid: str):
-    conn = get_db_connection()
-    cur = conn.cursor()
-    cur.execute("""
-        INSERT OR IGNORE INTO sent_pdfs
-        (tenant, cuil, period, to_whatsapp, message_sid, created_at)
-        VALUES (?, ?, ?, ?, ?, ?)
-    """, (tenant, cuil, period, to_whatsapp, sid, int(time.time())))
-    conn.commit()
-    conn.close()
-
 
 def send_whatsapp_template(to_whatsapp: str, content_vars: Optional[dict] = None, template_sid: Optional[str] = None) -> str:
     """
@@ -759,6 +748,15 @@ def admin_panel():
     html.append("<button type='submit'>Enviar plantilla a toda la empresa</button>")
     html.append("</form>")
 
+    html.append("<h3>Reportes</h3>")
+    html.append(f"""
+    <ul>
+    <li><a href="/admin/report_estado.csv?tenant={esc(tenant)}">📊 Estado de recibos (CSV)</a></li>
+    <li><a href="/admin/report_envios.csv?tenant={esc(tenant)}">📄 Envíos realizados (CSV)</a></li>
+    </ul>
+    """)
+
+
     # ---------- Reset ----------
     html.append("<hr>")
     html.append("<h3>🧹 Reset (limpiar por empresa/período)</h3>")
@@ -828,6 +826,92 @@ def get_envios_df_for_tenant(tenant_slug: str, force: bool = False) -> pd.DataFr
     """
     rows = load_envios_rows(tenant_slug, force=force) or []
     return pd.DataFrame(rows)
+
+def get_estado_report(tenant: str, period: str | None = None):
+    conn = get_db_connection()
+    conn.row_factory = sqlite3.Row
+    cur = conn.cursor()
+
+    if period:
+        cur.execute("""
+            SELECT cuil, period, estado, updated_at
+            FROM recibo_estado
+            WHERE tenant = ? AND period = ?
+            ORDER BY cuil
+        """, (tenant, period))
+    else:
+        cur.execute("""
+            SELECT cuil, period, estado, updated_at
+            FROM recibo_estado
+            WHERE tenant = ?
+            ORDER BY period DESC, cuil
+        """, (tenant,))
+
+    rows = cur.fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+@app.get("/admin/report_estado.csv")
+def admin_report_estado():
+    auth = require_admin()
+    if auth:
+        return auth
+
+    tenant = request.args.get("tenant", "").strip().lower()
+    period = request.args.get("period")
+
+    rows = get_estado_report(tenant, period)
+
+    def generate():
+        yield "cuil,period,estado,updated_at\n"
+        for r in rows:
+            yield f"{r['cuil']},{r['period']},{r['estado']},{r['updated_at']}\n"
+
+    return Response(
+        generate(),
+        mimetype="text/csv",
+        headers={
+            "Content-Disposition": f"attachment; filename=estado_{tenant}.csv"
+        }
+    )
+
+def get_sent_pdfs_report(tenant: str):
+    conn = get_db_connection()
+    conn.row_factory = sqlite3.Row
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT cuil, period, to_whatsapp, message_sid, created_at, sign_sent_at
+        FROM sent_pdfs
+        WHERE tenant = ?
+        ORDER BY created_at DESC
+    """, (tenant,))
+    rows = cur.fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+
+@app.get("/admin/report_envios.csv")
+def admin_report_envios():
+    auth = require_admin()
+    if auth:
+        return auth
+
+    tenant = request.args.get("tenant", "").strip().lower()
+    rows = get_sent_pdfs_report(tenant)
+
+    def generate():
+        yield "cuil,period,whatsapp,message_sid,created_at,sign_sent_at\n"
+        for r in rows:
+            yield f"{r['cuil']},{r['period']},{r['to_whatsapp']},{r['message_sid']},{r['created_at']},{r['sign_sent_at'] or ''}\n"
+
+    return Response(
+        generate(),
+        mimetype="text/csv",
+        headers={
+            "Content-Disposition": f"attachment; filename=envios_{tenant}.csv"
+        }
+    )
 
 
 @app.post("/twilio/webhook")
