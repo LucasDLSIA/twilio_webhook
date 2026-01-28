@@ -210,6 +210,110 @@ def find_phone_by_cuil(envios_rows: List[dict], cuil: str) -> Optional[str]:
                     return norm_whatsapp(str(r.get(pk, "")).strip())
     return None
 
+
+def period_to_folder_name(period: str) -> str:
+    # aceptamos mm/aaaa o mm-aaaa -> devolvemos mm-aaaa (así nombrás carpetas)
+    p = (period or "").strip().replace("-", "/")
+    mm, yyyy = p.split("/")
+    return f"{mm}-{yyyy}"
+
+def find_pdf_file_id_for_cuil_period(tenant_slug: str, cuil: str, period: str) -> Optional[str]:
+    t = get_tenant(tenant_slug)
+    if not t:
+        return None
+
+    service = drive_service()
+    root_id = t["drive_root_id"]
+    folder_name = period_to_folder_name(period)
+    filename = f"{cuil}.pdf"
+
+    # 1) encontrar carpeta del período dentro del root
+    folder_res = service.files().list(
+        q=(
+            f"'{root_id}' in parents and "
+            f"mimeType='application/vnd.google-apps.folder' and "
+            f"name='{folder_name}' and trashed=false"
+        ),
+        fields="files(id,name)",
+        pageSize=10,
+    ).execute().get("files", [])
+
+    if not folder_res:
+        return None
+
+    period_folder_id = folder_res[0]["id"]
+
+    # 2) buscar el PDF dentro de esa carpeta
+    file_res = service.files().list(
+        q=(
+            f"'{period_folder_id}' in parents and "
+            f"name='{filename}' and mimeType='application/pdf' and trashed=false"
+        ),
+        fields="files(id,name)",
+        pageSize=1,
+    ).execute().get("files", [])
+
+    if not file_res:
+        return None
+
+    return file_res[0]["id"]
+
+
+@app.get("/media/pdf")
+def media_pdf():
+    # para Twilio: la URL debe ser accesible públicamente.
+    # Le ponemos token por query para que no quede abierto.
+    token = request.args.get("token", "").strip()
+    if ADMIN_TOKEN and token != ADMIN_TOKEN:
+        return Response("Unauthorized", status=401)
+
+    tenant = (request.args.get("tenant") or "").strip().lower()
+    cuil = (request.args.get("cuil") or "").strip()
+    period = (request.args.get("period") or "").strip()
+
+    if not (tenant and cuil and period):
+        return Response("Faltan parámetros tenant/cuil/period", status=400)
+
+    file_id = find_pdf_file_id_for_cuil_period(tenant, cuil, period)
+    if not file_id:
+        return Response("PDF no encontrado", status=404)
+
+    service = drive_service()
+    req = service.files().get_media(fileId=file_id)
+    fh = io.BytesIO()
+    downloader = MediaIoBaseDownload(fh, req)
+    done = False
+    while not done:
+        _, done = downloader.next_chunk()
+    fh.seek(0)
+
+    data = fh.read()
+    resp = Response(data, mimetype="application/pdf")
+    resp.headers["Content-Disposition"] = f'inline; filename="{cuil}.pdf"'
+    return resp
+
+
+from twilio.rest import Client
+
+TWILIO_ACCOUNT_SID = os.environ.get("TWILIO_ACCOUNT_SID", "").strip()
+TWILIO_AUTH_TOKEN  = os.environ.get("TWILIO_AUTH_TOKEN", "").strip()
+TWILIO_WHATSAPP_FROM = os.environ.get("TWILIO_WHATSAPP_FROM", "").strip()  # ej: "whatsapp:+14155238886"
+
+def send_whatsapp_pdf(to_whatsapp: str, media_url: str, body: str) -> str:
+    if not (TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN and TWILIO_WHATSAPP_FROM):
+        raise RuntimeError("Faltan credenciales de Twilio en ENV")
+
+    client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
+    msg = client.messages.create(
+        from_=TWILIO_WHATSAPP_FROM,
+        to=to_whatsapp,
+        body=body,
+        media_url=[media_url],
+    )
+    return msg.sid
+
+
+
 # =========================
 # Drive: listar periodos por CUIL
 # =========================
@@ -401,7 +505,23 @@ def admin_send_test():
                 html.append("<p style='color:green'>👉 ACÁ VA EL ENVÍO REAL (Twilio)</p>")
 
                 # 🔥 ACÁ después conectamos Twilio
-                # send_whatsapp_pdf(phone, pdf_url, nombre, period)
+                pdf_url = (
+                    f"{request.host_url.rstrip('/')}/media/pdf"
+                    f"?tenant={tenant}&cuil={cuil}&period={period}&token={token}"
+                )
+
+                try:
+                    sid = send_whatsapp_pdf(
+                        phone,
+                        pdf_url,
+                        body=f"Recibo {period} - {person.get('nombre','')}".strip()
+                    )
+                    html.append(f"<p style='color:green'>✅ Enviado. SID: {esc(sid)}</p>")
+                    html.append(f"<p class='mono'>Media URL: {esc(pdf_url)}</p>")
+                except Exception as e:
+                    html.append(f"<p style='color:red'>❌ Error enviando: {esc(str(e))}</p>")
+                    html.append(f"<p class='mono'>Media URL: {esc(pdf_url)}</p>")
+
 
     return Response("".join(html), mimetype="text/html")
 
