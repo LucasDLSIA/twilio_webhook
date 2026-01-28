@@ -440,6 +440,7 @@ def init_db():
     conn = get_db_connection()
     cur = conn.cursor()
 
+    # 1) Crear tablas si no existen
     cur.execute("""
       CREATE TABLE IF NOT EXISTS pending_views (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -462,6 +463,22 @@ def init_db():
         UNIQUE(tenant, cuil, period)
       );
     """)
+
+    # 2) Migración liviana (si pending_views ya existía con columnas viejas)
+    #    Intentamos agregar columnas; si ya existen, ignoramos.
+    for sql in (
+        "ALTER TABLE pending_views ADD COLUMN tenant TEXT;",
+        "ALTER TABLE pending_views ADD COLUMN cuil TEXT;",
+        "ALTER TABLE pending_views ADD COLUMN period TEXT;",
+        "ALTER TABLE pending_views ADD COLUMN created_at INTEGER;",
+    ):
+        try:
+            cur.execute(sql)
+        except Exception:
+            pass
+
+    # 3) (Opcional) si querés, garantizamos UNIQUE por último pending por tenant+cuil+period
+    # SQLite no permite ADD CONSTRAINT fácil; lo dejamos así por ahora.
 
     conn.commit()
     conn.close()
