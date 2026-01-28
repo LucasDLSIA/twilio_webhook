@@ -670,6 +670,11 @@ def admin_periodos():
     periods = list_periods_for_cuil(tenant, cuil)
     return jsonify({"tenant": tenant, "cuil": cuil, "periodos": periods})
 
+@app.post("/twilio/webhook")
+def twilio_webhook_alias():
+    return twilio_inbound()
+
+
 @app.get("/admin/send_test")
 def admin_send_test():
     auth = require_admin()
@@ -763,23 +768,25 @@ def admin_send_test():
 # =========================
 @app.post("/twilio/inbound")
 def twilio_inbound():
-    # form-urlencoded
     from_whatsapp = (request.form.get("From") or "").strip()
     button = (request.form.get("ButtonPayload") or "").strip()
     body = (request.form.get("Body") or "").strip()
 
     print("INBOUND:", from_whatsapp, "ButtonPayload:", button, "Body:", body)
 
+    pending = get_latest_pending_view(from_whatsapp)
+    print("PENDING:", pending)
+
+    # Si no hay pending, no podemos saber tenant/cuil/period
+    if not pending:
+        return Response("No pending view", status=200)
+
+    tenant = pending["tenant"]
+    cuil = pending["cuil"]
+    period = pending["period"]
+
     # 1) VIEW_NOW -> enviar PDF del periodo del pending view
     if button == "VIEW_NOW" or body == "VIEW_NOW":
-        pending = get_latest_pending_view(from_whatsapp)
-        if not pending:
-            return Response("No pending view", status=200)
-
-        tenant = pending["tenant"]
-        cuil = pending["cuil"]
-        period = pending["period"]
-
         pdf_url = (
             f"{request.host_url.rstrip('/')}/media/pdf"
             f"?tenant={tenant}&cuil={cuil}&period={period}&token={ADMIN_TOKEN}"
@@ -793,7 +800,14 @@ def twilio_inbound():
             )
             print("SENT PDF SID:", sid_pdf)
 
-            # (opcional) mandar plantilla de firma/observa después del PDF
+            # Estado: DISPONIBLE
+            set_recibo_estado(tenant, cuil, period, "DISPONIBLE")
+
+            # IMPORTANTE:
+            # NO consumimos pending acá, porque lo vamos a necesitar para SIGN_OK / SIGN_OBS
+            # consume_pending_view(pending["id"])
+
+            # (opcional) mandar plantilla de firma/observa DESPUÉS del PDF
             if TWILIO_SIGN_TEMPLATE_SID:
                 try:
                     sid_sign = send_whatsapp_template(
@@ -805,28 +819,21 @@ def twilio_inbound():
                 except Exception as e:
                     print("WARN sending sign template:", e)
 
-            # Estado: DISPONIBLE
-            set_recibo_estado(tenant, cuil, period, "DISPONIBLE")
-
-            # Consumimos el pending para evitar mezclas
-            consume_pending_view(pending["id"])
-
         except Exception as e:
             print("ERROR sending PDF:", e)
 
         return Response("OK", status=200)
 
-    # 2) Firma / Observa (cuando tengas tu segunda plantilla con payloads)
-    if button in ("SIGN_OK", "SIGN_OBS"):
-        pending = get_latest_pending_view(from_whatsapp)
-        if not pending:
-            return Response("No pending view", status=200)
+    # 2) No lo necesita
+    if button == "NO_NEED" or body == "NO_NEED":
+        # Podés marcar estado especial si querés
+        set_recibo_estado(tenant, cuil, period, "NO_NEED")
+        consume_pending_view(pending["id"])
+        return Response("OK", status=200)
 
-        tenant = pending["tenant"]
-        cuil = pending["cuil"]
-        period = pending["period"]
-
-        if button == "SIGN_OK":
+    # 3) Firma / Observa (cuando tengas tu segunda plantilla con payloads)
+    if button in ("SIGN_OK", "SIGN_OBS") or body in ("SIGN_OK", "SIGN_OBS"):
+        if button == "SIGN_OK" or body == "SIGN_OK":
             set_recibo_estado(tenant, cuil, period, "FIRMADO")
         else:
             set_recibo_estado(tenant, cuil, period, "OBSERVADO")
@@ -835,6 +842,7 @@ def twilio_inbound():
         return Response("OK", status=200)
 
     return Response("OK", status=200)
+
 
 @app.get("/health")
 def health():
