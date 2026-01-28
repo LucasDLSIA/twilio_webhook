@@ -190,13 +190,12 @@ def load_envios_rows(tenant_slug: str, force: bool = False) -> List[dict]:
     return rows
 
 def find_phone_by_cuil(envios_rows: List[dict], cuil: str) -> Optional[str]:
-    cuil = (cuil or "").strip()
-    if not cuil:
+    target = norm_cuil(cuil)
+    if not target:
         return None
 
-    # intentamos encontrar columnas típicas
-    phone_keys = ["WhatsApp", "Telefono", "Teléfono", "CEL", "Celular", "to_whatsapp", "to"]
-    cuil_keys = ["CUIL", "Cuil", "Archivo", "archivo", "archivo_norm", "Archivo_norm"]
+    phone_keys = ["WhatsApp", "Telefono", "Teléfono", "CEL", "Celular", "to_whatsapp", "to", "WPP", "Whatsapp"]
+    cuil_keys = ["CUIL", "Cuil", "Archivo", "archivo", "archivo_norm", "Archivo_norm", "CUIT", "Cuit"]
 
     for r in envios_rows:
         rcuil = ""
@@ -204,10 +203,11 @@ def find_phone_by_cuil(envios_rows: List[dict], cuil: str) -> Optional[str]:
             if k in r and str(r.get(k, "")).strip():
                 rcuil = str(r.get(k, "")).strip()
                 break
-        if rcuil == cuil:
+
+        if norm_cuil(rcuil) == target:
             for pk in phone_keys:
                 if pk in r and str(r.get(pk, "")).strip():
-                    return str(r.get(pk, "")).strip()
+                    return norm_whatsapp(str(r.get(pk, "")).strip())
     return None
 
 # =========================
@@ -250,6 +250,25 @@ def list_periods_for_cuil(tenant_slug: str, cuil: str) -> List[str]:
 
     periods = sorted(set(periods), key=key, reverse=True)
     return periods
+
+def norm_digits(s: str) -> str:
+    return re.sub(r"\D", "", str(s or ""))
+
+def norm_cuil(s: str) -> str:
+    d = norm_digits(s)
+    # CUIL suele tener 11 dígitos. Si viene con basura, igual devolvemos dígitos.
+    return d
+
+def norm_whatsapp(s: str) -> str:
+    d = norm_digits(s)
+    if not d:
+        return ""
+    # Si ya viene con 54..., lo respetamos.
+    if d.startswith("54"):
+        return "whatsapp:+" + d
+    # Si viene tipo 11xxxxxxxx (ARG), le agregamos 54
+    return "whatsapp:+54" + d
+
 
 # =========================
 # Routes
@@ -337,6 +356,11 @@ def admin_send_test():
 
         if not phone:
             html.append("<p style='color:red'>No se encontró WhatsApp para ese CUIL.</p>")
+            html.append("<p class='mono'>Debug: primeros CUIL leídos:</p><ul>")
+            for r in envios[:20]:
+                rc = r.get("CUIL") or r.get("Archivo") or r.get("archivo_norm") or ""
+                html.append(f"<li>{esc(str(rc))} → {esc(norm_cuil(str(rc)))}</li>")
+            html.append("</ul>")
         else:
             periods = list_periods_for_cuil(tenant, cuil)
             if period not in periods:
