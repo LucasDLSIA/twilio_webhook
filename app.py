@@ -559,16 +559,17 @@ def init_db():
 
 init_db()
 
-def save_pdf_sid(tenant, cuil, period, sid):
+def save_pdf_sid(tenant: str, cuil: str, period: str, to_whatsapp: str, sid: str):
     conn = get_db_connection()
     cur = conn.cursor()
     cur.execute("""
         INSERT OR IGNORE INTO sent_pdfs
         (tenant, cuil, period, to_whatsapp, message_sid, created_at)
         VALUES (?, ?, ?, ?, ?, ?)
-    """, (tenant, cuil, period, get_whatsapp_for_cuil(tenant, cuil), sid, int(time.time())))
+    """, (tenant, cuil, period, to_whatsapp, sid, int(time.time())))
     conn.commit()
     conn.close()
+
 
 
 def get_pdf_by_sid(sid):
