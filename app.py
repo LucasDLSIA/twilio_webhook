@@ -14,22 +14,37 @@ from google.oauth2 import service_account
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload
 
+from twilio.rest import Client
+
 # =========================
 # Config
 # =========================
 ADMIN_TOKEN = os.environ.get("ADMIN_TOKEN", "").strip()
 EMPRESAS_FILE_ID = os.environ.get("EMPRESAS_FILE_ID", "").strip()
 
-# Service Account JSON: podés guardarlo como string en ENV (recomendado)
-# o como archivo (si tu build lo copia). Acá soportamos ambas.
+# Google Service Account
 GOOGLE_SA_JSON = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON", "").strip()
-GOOGLE_SA_FILE =  (   "/etc/secrets/Service_account.json"
-    if os.path.exists("/etc/secrets/Service_account.json")
-    else "Service_account.json"
+GOOGLE_SA_FILE = (
+    os.environ.get("GOOGLE_SERVICE_ACCOUNT_FILE", "").strip()
+    or os.environ.get("GOOGLE_APPLICATION_CREDENTIALS", "").strip()
+    or ("/etc/secrets/Service_account.json" if os.path.exists("/etc/secrets/Service_account.json") else "")
 )
 
+# Twilio
+TWILIO_ACCOUNT_SID = os.environ.get("TWILIO_ACCOUNT_SID", "").strip()
+TWILIO_AUTH_TOKEN = os.environ.get("TWILIO_AUTH_TOKEN", "").strip()
+TWILIO_WHATSAPP_FROM = os.environ.get("TWILIO_WHATSAPP_FROM", "").strip()
+TWILIO_MESSAGING_SERVICE_SID = os.environ.get("TWILIO_MESSAGING_SERVICE_SID", "").strip()
+
+# Plantillas (Content Templates)
+TWILIO_TEMPLATE_SID = os.environ.get("TWILIO_TEMPLATE_SID", "").strip()            # template con botón VIEW_NOW
+TWILIO_SIGN_TEMPLATE_SID = os.environ.get("TWILIO_SIGN_TEMPLATE_SID", "").strip()  # (opcional) template con botones SIGN_OK / SIGN_OBS
+
+# Persistencia (Render Disk)
+DB_PATH = os.environ.get("DB_PATH", "/data/app.db").strip()
+
 # Cache
-_EMP_CACHE = {"ts": 0, "rows": []}
+_EMP_CACHE = {"ts": 0.0, "rows": []}
 _ENV_CACHE: Dict[str, Dict] = {}  # tenant_slug -> {"ts":..., "rows":[...] }
 CACHE_TTL = int(os.environ.get("CACHE_TTL", "120"))
 
@@ -43,7 +58,7 @@ app = Flask(__name__)
 # =========================
 def esc(s: str) -> str:
     return (
-        (s or "")
+        (str(s or ""))
         .replace("&", "&amp;")
         .replace("<", "&lt;")
         .replace(">", "&gt;")
@@ -57,9 +72,29 @@ def slugify(name: str) -> str:
     name = re.sub(r"-{2,}", "-", name).strip("-")
     return name or "empresa"
 
+def norm_digits(s: str) -> str:
+    return re.sub(r"\D", "", str(s or ""))
+
+def norm_cuil(s: str) -> str:
+    return norm_digits(s)
+
+def strip_pdf(name: str) -> str:
+    s = str(name or "").strip()
+    if s.lower().endswith(".pdf"):
+        s = s[:-4]
+    return s.strip()
+
+def norm_whatsapp(s: str) -> str:
+    d = norm_digits(s)
+    if not d:
+        return ""
+    if d.startswith("54"):
+        return "whatsapp:+" + d
+    return "whatsapp:+54" + d
+
 def parse_period_folder(name: str) -> Optional[str]:
     """
-    Acepta: '01-2026', '01/2026', 'ENERO 2026' (opcional), etc.
+    Acepta: '01-2026', '01/2026'
     Devuelve siempre 'mm/aaaa' o None si no reconoce.
     """
     n = (name or "").strip()
@@ -70,9 +105,19 @@ def parse_period_folder(name: str) -> Optional[str]:
             return f"{mm}/{yyyy}"
     return None
 
+def period_to_folder_name(period: str) -> str:
+    """
+    Recibe 'mm/aaaa' o 'mm-aaaa' y devuelve 'mm-aaaa' (nombre de carpeta en Drive).
+    """
+    p = (period or "").strip().replace("-", "/")
+    mm, yyyy = p.split("/")
+    return f"{mm}-{yyyy}"
+
+# =========================
+# Auth admin (token por query/header)
+# =========================
 def admin_ok() -> bool:
     if not ADMIN_TOKEN:
-        # si no seteaste token, dejamos abierto (no recomendado, pero útil para prueba)
         return True
     tok = request.args.get("token", "") or request.headers.get("X-Admin-Token", "")
     return tok.strip() == ADMIN_TOKEN
@@ -81,6 +126,9 @@ def require_admin():
     if not admin_ok():
         return Response("Unauthorized (admin token requerido)", status=401)
 
+# =========================
+# Google Drive
+# =========================
 def drive_service():
     scopes = ["https://www.googleapis.com/auth/drive.readonly"]
     if GOOGLE_SA_JSON:
@@ -89,7 +137,7 @@ def drive_service():
     elif GOOGLE_SA_FILE:
         creds = service_account.Credentials.from_service_account_file(GOOGLE_SA_FILE, scopes=scopes)
     else:
-        raise RuntimeError("Falta GOOGLE_SERVICE_ACCOUNT_JSON o GOOGLE_SERVICE_ACCOUNT_FILE en ENV")
+        raise RuntimeError("Falta GOOGLE_SERVICE_ACCOUNT_JSON o GOOGLE_SERVICE_ACCOUNT_FILE/GOOGLE_APPLICATION_CREDENTIALS en ENV")
     return build("drive", "v3", credentials=creds, cache_discovery=False)
 
 def download_excel_df(file_id: str) -> pd.DataFrame:
@@ -117,7 +165,8 @@ def load_tenants(force: bool = False) -> List[dict]:
         return _EMP_CACHE["rows"]
 
     df = download_excel_df(EMPRESAS_FILE_ID)
-    # Tu formato:
+
+    # Formato esperado:
     # Empresa | Envios_File_ID | Drive_Root_ID
     cols_lower = {c.lower(): c for c in df.columns}
 
@@ -150,7 +199,7 @@ def load_tenants(force: bool = False) -> List[dict]:
             }
         )
 
-    # dedupe por slug (si hay filas repetidas)
+    # dedupe por slug
     seen = set()
     out = []
     for t in tenants:
@@ -184,39 +233,39 @@ def load_envios_rows(tenant_slug: str, force: bool = False) -> List[dict]:
 
     df = download_excel_df(t["envios_file_id"])
     df.columns = [str(c).strip() for c in df.columns]
-
     rows = df.fillna("").to_dict(orient="records")
+
     _ENV_CACHE[tenant_slug] = {"ts": now, "rows": rows}
     return rows
 
-def find_phone_by_cuil(envios_rows: List[dict], cuil: str) -> Optional[str]:
+def find_person_by_cuil(envios_rows: List[dict], cuil: str) -> Optional[dict]:
+    """
+    Tu formato real por empresa:
+      nombre | telefono | archivo | DNI
+    donde archivo = '20-xxxxxxxx-x.pdf'
+    """
     target = norm_cuil(cuil)
     if not target:
         return None
 
-    phone_keys = ["WhatsApp", "Telefono", "Teléfono", "CEL", "Celular", "to_whatsapp", "to", "WPP", "Whatsapp"]
-    cuil_keys = ["CUIL", "Cuil", "Archivo", "archivo", "archivo_norm", "Archivo_norm", "CUIT", "Cuit"]
-
     for r in envios_rows:
-        rcuil = ""
-        for k in cuil_keys:
-            if k in r and str(r.get(k, "")).strip():
-                rcuil = str(r.get(k, "")).strip()
-                break
-
-        if norm_cuil(rcuil) == target:
-            for pk in phone_keys:
-                if pk in r and str(r.get(pk, "")).strip():
-                    return norm_whatsapp(str(r.get(pk, "")).strip())
+        archivo = strip_pdf(r.get("archivo") or r.get("Archivo") or "")
+        if norm_cuil(archivo) == target:
+            nombre = str(r.get("nombre") or r.get("Nombre") or "").strip()
+            tel = str(r.get("telefono") or r.get("teléfono") or r.get("Telefono") or "").strip()
+            dni = str(r.get("dni") or r.get("DNI") or "").strip()
+            return {
+                "cuil": archivo,
+                "nombre": nombre,
+                "telefono_raw": tel,
+                "to_whatsapp": norm_whatsapp(tel),
+                "dni": dni,
+            }
     return None
 
-
-def period_to_folder_name(period: str) -> str:
-    # aceptamos mm/aaaa o mm-aaaa -> devolvemos mm-aaaa (así nombrás carpetas)
-    p = (period or "").strip().replace("-", "/")
-    mm, yyyy = p.split("/")
-    return f"{mm}-{yyyy}"
-
+# =========================
+# Drive: PDF
+# =========================
 def find_pdf_file_id_for_cuil_period(tenant_slug: str, cuil: str, period: str) -> Optional[str]:
     t = get_tenant(tenant_slug)
     if not t:
@@ -227,7 +276,7 @@ def find_pdf_file_id_for_cuil_period(tenant_slug: str, cuil: str, period: str) -
     folder_name = period_to_folder_name(period)
     filename = f"{cuil}.pdf"
 
-    # 1) encontrar carpeta del período dentro del root
+    # Carpeta del período
     folder_res = service.files().list(
         q=(
             f"'{root_id}' in parents and "
@@ -235,7 +284,7 @@ def find_pdf_file_id_for_cuil_period(tenant_slug: str, cuil: str, period: str) -
             f"name='{folder_name}' and trashed=false"
         ),
         fields="files(id,name)",
-        pageSize=10,
+        pageSize=5,
     ).execute().get("files", [])
 
     if not folder_res:
@@ -243,7 +292,7 @@ def find_pdf_file_id_for_cuil_period(tenant_slug: str, cuil: str, period: str) -
 
     period_folder_id = folder_res[0]["id"]
 
-    # 2) buscar el PDF dentro de esa carpeta
+    # PDF dentro de carpeta
     file_res = service.files().list(
         q=(
             f"'{period_folder_id}' in parents and "
@@ -258,11 +307,45 @@ def find_pdf_file_id_for_cuil_period(tenant_slug: str, cuil: str, period: str) -
 
     return file_res[0]["id"]
 
+def list_periods_for_cuil(tenant_slug: str, cuil: str) -> List[str]:
+    t = get_tenant(tenant_slug)
+    if not t:
+        return []
 
+    root_id = t["drive_root_id"]
+    filename = f"{cuil}.pdf"
+    service = drive_service()
+
+    folders = service.files().list(
+        q=f"'{root_id}' in parents and mimeType='application/vnd.google-apps.folder' and trashed=false",
+        fields="files(id,name)",
+        pageSize=1000,
+    ).execute().get("files", [])
+
+    periods = []
+    for f in folders:
+        label = parse_period_folder(f.get("name", ""))
+        if not label:
+            continue
+        res = service.files().list(
+            q=f"'{f['id']}' in parents and name='{filename}' and mimeType='application/pdf' and trashed=false",
+            fields="files(id)",
+            pageSize=1,
+        ).execute().get("files", [])
+        if res:
+            periods.append(label)
+
+    def key(p: str):
+        mm, yyyy = p.split("/")
+        return int(yyyy) * 100 + int(mm)
+
+    return sorted(set(periods), key=key, reverse=True)
+
+# =========================
+# Media endpoint (Twilio descarga PDF desde acá)
+# =========================
 @app.get("/media/pdf")
 def media_pdf():
-    # para Twilio: la URL debe ser accesible públicamente.
-    # Le ponemos token por query para que no quede abierto.
     token = request.args.get("token", "").strip()
     if ADMIN_TOKEN and token != ADMIN_TOKEN:
         return Response("Unauthorized", status=401)
@@ -292,94 +375,155 @@ def media_pdf():
     resp.headers["Content-Disposition"] = f'inline; filename="{cuil}.pdf"'
     return resp
 
-
-from twilio.rest import Client
-
-TWILIO_ACCOUNT_SID = os.environ.get("TWILIO_ACCOUNT_SID", "").strip()
-TWILIO_AUTH_TOKEN  = os.environ.get("TWILIO_AUTH_TOKEN", "").strip()
-TWILIO_WHATSAPP_FROM = os.environ.get("TWILIO_WHATSAPP_FROM", "").strip()  # ej: "whatsapp:+14155238886"
+# =========================
+# Twilio senders
+# =========================
+def _twilio_client() -> Client:
+    if not (TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN):
+        raise RuntimeError("Faltan TWILIO_ACCOUNT_SID / TWILIO_AUTH_TOKEN en ENV")
+    return Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
 
 def send_whatsapp_pdf(to_whatsapp: str, media_url: str, body: str) -> str:
-    if not (TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN and TWILIO_WHATSAPP_FROM):
-        raise RuntimeError("Faltan credenciales de Twilio en ENV")
+    if not (TWILIO_WHATSAPP_FROM or TWILIO_MESSAGING_SERVICE_SID):
+        raise RuntimeError("Falta TWILIO_WHATSAPP_FROM o TWILIO_MESSAGING_SERVICE_SID en ENV")
 
-    client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
-    msg = client.messages.create(
-        from_=TWILIO_WHATSAPP_FROM,
-        to=to_whatsapp,
-        body=body,
-        media_url=[media_url],
-    )
+    client = _twilio_client()
+    payload = {
+        "to": to_whatsapp,
+        "body": body or " ",
+        "media_url": [media_url],
+    }
+    if TWILIO_MESSAGING_SERVICE_SID:
+        payload["messaging_service_sid"] = TWILIO_MESSAGING_SERVICE_SID
+    else:
+        payload["from_"] = TWILIO_WHATSAPP_FROM
+
+    msg = client.messages.create(**payload)
     return msg.sid
 
+def send_whatsapp_template(to_whatsapp: str, content_vars: Optional[dict] = None, template_sid: Optional[str] = None) -> str:
+    """
+    Envío de plantilla aprobada (WhatsApp) usando Content Templates.
+    template_sid:
+      - por defecto usa TWILIO_TEMPLATE_SID (la de VIEW_NOW)
+      - podés pasar TWILIO_SIGN_TEMPLATE_SID para la de firma/observa
+    """
+    tpl = (template_sid or TWILIO_TEMPLATE_SID).strip()
+    if not tpl:
+        raise RuntimeError("Falta TWILIO_TEMPLATE_SID (ContentSid) en ENV")
+    if not (TWILIO_WHATSAPP_FROM or TWILIO_MESSAGING_SERVICE_SID):
+        raise RuntimeError("Falta TWILIO_WHATSAPP_FROM o TWILIO_MESSAGING_SERVICE_SID en ENV")
 
+    client = _twilio_client()
+    payload = {
+        "to": to_whatsapp,
+        "content_sid": tpl,
+    }
+    if TWILIO_MESSAGING_SERVICE_SID:
+        payload["messaging_service_sid"] = TWILIO_MESSAGING_SERVICE_SID
+    else:
+        payload["from_"] = TWILIO_WHATSAPP_FROM
+
+    if content_vars:
+        payload["content_variables"] = json.dumps(content_vars)
+
+    msg = client.messages.create(**payload)
+    return msg.sid
 
 # =========================
-# Drive: listar periodos por CUIL
+# DB: pending view + estado firma
 # =========================
-def list_periods_for_cuil(tenant_slug: str, cuil: str) -> List[str]:
-    t = get_tenant(tenant_slug)
-    if not t:
-        return []
+def get_db_connection():
+    return sqlite3.connect(DB_PATH)
 
-    root_id = t["drive_root_id"]
-    filename = f"{cuil}.pdf"
-    service = drive_service()
+def init_db():
+    conn = get_db_connection()
+    cur = conn.cursor()
 
-    # 1) listar carpetas dentro del root
-    folders = service.files().list(
-        q=f"'{root_id}' in parents and mimeType='application/vnd.google-apps.folder' and trashed=false",
-        fields="files(id,name)",
-        pageSize=1000,
-    ).execute().get("files", [])
+    cur.execute("""
+      CREATE TABLE IF NOT EXISTS pending_views (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        to_whatsapp TEXT NOT NULL,
+        tenant TEXT NOT NULL,
+        cuil TEXT NOT NULL,
+        period TEXT NOT NULL,
+        created_at INTEGER NOT NULL
+      );
+    """)
 
-    periods = []
-    for f in folders:
-        label = parse_period_folder(f.get("name", ""))
-        if not label:
-            continue
-        # 2) buscar el PDF dentro de esa carpeta
-        res = service.files().list(
-            q=f"'{f['id']}' in parents and name='{filename}' and mimeType='application/pdf' and trashed=false",
-            fields="files(id)",
-            pageSize=1,
-        ).execute().get("files", [])
-        if res:
-            periods.append(label)
+    cur.execute("""
+      CREATE TABLE IF NOT EXISTS recibo_estado (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        tenant TEXT NOT NULL,
+        cuil TEXT NOT NULL,
+        period TEXT NOT NULL,
+        estado TEXT NOT NULL,
+        updated_at INTEGER NOT NULL,
+        UNIQUE(tenant, cuil, period)
+      );
+    """)
 
-    # ordenar desc por año/mes
-    def key(p: str):
-        mm, yyyy = p.split("/")
-        return int(yyyy) * 100 + int(mm)
+    conn.commit()
+    conn.close()
 
-    periods = sorted(set(periods), key=key, reverse=True)
-    return periods
-def norm_digits(s: str) -> str:
-    return re.sub(r"\D", "", str(s or ""))
+init_db()
 
-def norm_cuil(s: str) -> str:
-    return norm_digits(s)
+def add_pending_view(to_whatsapp: str, tenant: str, cuil: str, period: str):
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute(
+        "INSERT INTO pending_views (to_whatsapp, tenant, cuil, period, created_at) VALUES (?, ?, ?, ?, ?)",
+        (to_whatsapp, tenant, cuil, period, int(time.time())),
+    )
+    conn.commit()
+    conn.close()
 
-def strip_pdf(name: str) -> str:
-    s = str(name or "").strip()
-    if s.lower().endswith(".pdf"):
-        s = s[:-4]
-    return s.strip()
+def get_latest_pending_view(from_whatsapp: str) -> Optional[dict]:
+    conn = get_db_connection()
+    conn.row_factory = sqlite3.Row
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT id, tenant, cuil, period
+        FROM pending_views
+        WHERE to_whatsapp = ?
+        ORDER BY created_at DESC
+        LIMIT 1
+        """,
+        (from_whatsapp,),
+    )
+    row = cur.fetchone()
+    conn.close()
+    return dict(row) if row else None
 
-def norm_whatsapp(s: str) -> str:
-    d = norm_digits(s)
-    if not d:
-        return ""
-    if d.startswith("54"):
-        return "whatsapp:+" + d
-    return "whatsapp:+54" + d
+def consume_pending_view(pending_id: int):
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute("DELETE FROM pending_views WHERE id = ?", (int(pending_id),))
+    conn.commit()
+    conn.close()
+
+def set_recibo_estado(tenant: str, cuil: str, period: str, estado: str):
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        INSERT INTO recibo_estado (tenant, cuil, period, estado, updated_at)
+        VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT(tenant, cuil, period) DO UPDATE SET
+          estado=excluded.estado,
+          updated_at=excluded.updated_at
+        """,
+        (tenant, cuil, period, estado, int(time.time())),
+    )
+    conn.commit()
+    conn.close()
 
 # =========================
 # Routes
 # =========================
 @app.get("/")
 def root():
-    # siempre admin
     tok = request.args.get("token", "")
     if tok:
         return redirect(f"/admin?token={tok}")
@@ -392,7 +536,7 @@ def admin_home():
         return auth
 
     token = request.args.get("token", "")
-    tenants = load_tenants(force=True)  # forzamos para ver cambios del Excel
+    tenants = load_tenants(force=True)
 
     html = []
     html.append("<h2>Panel Admin</h2>")
@@ -404,127 +548,17 @@ def admin_home():
     else:
         html.append("<p>Elegí la empresa:</p><ul>")
         for t in tenants:
+            panel_url = f"/admin/panel?tenant={esc(t['slug'])}&token={esc(token)}"
+            test_url = f"/admin/send_test?tenant={esc(t['slug'])}&token={esc(token)}"
             html.append(
-                f"<li><a href='/admin/panel?tenant={esc(t['slug'])}&token={esc(token)}'>"
-                f"{esc(t['display_name'])}</a></li>"
+                f"<li>"
+                f"<a href='{panel_url}'><b>{esc(t['display_name'])}</b></a>"
+                f" &nbsp;|&nbsp; "
+                f"<a href='{test_url}'>🧪 Prueba</a>"
+                f"</li>"
             )
         html.append("</ul>")
-
     return Response("".join(html), mimetype="text/html")
-
-def find_person_by_cuil(envios_rows: List[dict], cuil: str) -> Optional[dict]:
-    target = norm_cuil(cuil)
-    if not target:
-        return None
-
-    for r in envios_rows:
-        archivo = strip_pdf(r.get("archivo") or r.get("Archivo") or "")
-        if norm_cuil(archivo) == target:
-            nombre = str(r.get("nombre") or r.get("Nombre") or "").strip()
-            tel = str(r.get("telefono") or r.get("teléfono") or r.get("Telefono") or "").strip()
-            dni = str(r.get("dni") or r.get("DNI") or "").strip()
-            return {
-                "cuil": archivo,
-                "nombre": nombre,
-                "telefono_raw": tel,
-                "to_whatsapp": norm_whatsapp(tel),
-                "dni": dni,
-            }
-    return None
-
-
-@app.get("/admin/send_test")
-def admin_send_test():
-    auth = require_admin()
-    if auth:
-        return auth
-
-    token = request.args.get("token", "")
-    tenant = (request.args.get("tenant") or "").strip().lower()
-    cuil = (request.args.get("cuil") or "").strip()
-    period = (request.args.get("period") or "").strip()
-
-    t = get_tenant(tenant)
-    if not t:
-        return Response("Tenant inválido", status=400)
-
-    html = []
-    html.append("<h2>Envío de prueba (1 persona)</h2>")
-    html.append(f"<p><b>Empresa:</b> {esc(t['display_name'])}</p>")
-    html.append(f"<p><a href='/admin/panel?tenant={tenant}&token={token}'>← volver</a></p>")
-
-    # Form
-    html.append(f"""
-    <form method="get">
-      <input type="hidden" name="tenant" value="{esc(tenant)}">
-      <input type="hidden" name="token" value="{esc(token)}">
-
-      <label>CUIL<br>
-        <input type="text" name="cuil" value="{esc(cuil)}" required>
-      </label><br><br>
-
-      <label>Período (mm/aaaa)<br>
-        <input type="text" name="period" value="{esc(period)}" required>
-      </label><br><br>
-
-      <button type="submit">Enviar prueba</button>
-    </form>
-    """)
-
-    # Ejecutar si hay datos
-    if cuil and period:
-        html.append("<hr>")
-        html.append("<h3>Resultado</h3>")
-
-        envios = load_envios_rows(tenant)
-        phone = find_phone_by_cuil(envios, cuil)
-        person = find_person_by_cuil(envios, cuil)
-        if not person or not person.get("to_whatsapp"):
-            html.append("<p style='color:red'>No se encontró WhatsApp para ese CUIL en el Excel de envíos.</p>")
-        else:
-            phone = person["to_whatsapp"]
-            html.append("<p>✔ Persona encontrada</p>")
-            html.append(f"<p>👤 Nombre: {esc(person.get('nombre',''))}</p>")
-            html.append(f"<p>📞 WhatsApp: {esc(phone)}</p>")
-
-        if not phone:
-            html.append("<p style='color:red'>No se encontró WhatsApp para ese CUIL.</p>")
-            html.append("<p class='mono'>Debug: primeros CUIL leídos:</p><ul>")
-            for r in envios[:20]:
-                rc = r.get("CUIL") or r.get("Archivo") or r.get("archivo_norm") or ""
-                html.append(f"<li>{esc(str(rc))} → {esc(norm_cuil(str(rc)))}</li>")
-            html.append("</ul>")
-        else:
-            periods = list_periods_for_cuil(tenant, cuil)
-            if period not in periods:
-                html.append("<p style='color:red'>No se encontró el PDF para ese período.</p>")
-            else:
-                html.append("<p>✔ Persona encontrada</p>")
-                html.append(f"<p>📞 WhatsApp: {esc(phone)}</p>")
-                html.append(f"<p>📄 PDF disponible para {esc(period)}</p>")
-                html.append("<p style='color:green'>👉 ACÁ VA EL ENVÍO REAL (Twilio)</p>")
-
-                # 🔥 ACÁ después conectamos Twilio
-                pdf_url = (
-                    f"{request.host_url.rstrip('/')}/media/pdf"
-                    f"?tenant={tenant}&cuil={cuil}&period={period}&token={token}"
-                )
-
-                try:
-                    sid = send_whatsapp_pdf(
-                        phone,
-                        pdf_url,
-                        body=f"Recibo {period} - {person.get('nombre','')}".strip()
-                    )
-                    html.append(f"<p style='color:green'>✅ Enviado. SID: {esc(sid)}</p>")
-                    html.append(f"<p class='mono'>Media URL: {esc(pdf_url)}</p>")
-                except Exception as e:
-                    html.append(f"<p style='color:red'>❌ Error enviando: {esc(str(e))}</p>")
-                    html.append(f"<p class='mono'>Media URL: {esc(pdf_url)}</p>")
-
-
-    return Response("".join(html), mimetype="text/html")
-
 
 @app.get("/admin/panel")
 def admin_panel():
@@ -535,26 +569,18 @@ def admin_panel():
     token = request.args.get("token", "")
     tenant = (request.args.get("tenant") or "").strip().lower()
     t = get_tenant(tenant)
-
     if not t:
         return Response("Tenant inválido. Volvé a /admin.", status=400)
 
-    # cargar envíos de esa empresa
     envios_rows = load_envios_rows(tenant, force=False)
 
     html = []
     html.append("<h2>Panel empresa</h2>")
     html.append(f"<p><b>Empresa:</b> {esc(t['display_name'])} &nbsp; (<code>{esc(t['slug'])}</code>)</p>")
     html.append(f"<p><a href='/admin?token={esc(token)}'>← volver</a></p>")
+    html.append(f"<p><a href='/admin/send_test?tenant={esc(tenant)}&token={esc(token)}'>🧪 Envío de prueba</a></p>")
     html.append("<hr>")
 
-    html.append("<h3>Acciones</h3>")
-    html.append("<ul>")
-    html.append("<li>Ver envíos (preview)</li>")
-    html.append("<li>Buscar períodos por CUIL</li>")
-    html.append("</ul>")
-
-    # Preview envíos
     html.append("<h3>Preview Excel de envíos</h3>")
     html.append(f"<p>Filas: {len(envios_rows)}</p>")
     sample = envios_rows[:10]
@@ -568,7 +594,6 @@ def admin_panel():
     else:
         html.append("<p>No se pudo leer el Excel de envíos o está vacío.</p>")
 
-    # Buscar periodos por CUIL
     html.append("<hr>")
     html.append("<h3>Buscar períodos por CUIL</h3>")
     html.append(f"""
@@ -588,10 +613,8 @@ def admin_periodos():
     if auth:
         return auth
 
-    token = request.args.get("token", "")
     tenant = (request.args.get("tenant") or "").strip().lower()
     cuil = (request.args.get("cuil") or "").strip()
-
     if not get_tenant(tenant):
         return Response("Tenant inválido", status=400)
     if not cuil:
@@ -600,6 +623,172 @@ def admin_periodos():
     periods = list_periods_for_cuil(tenant, cuil)
     return jsonify({"tenant": tenant, "cuil": cuil, "periodos": periods})
 
+@app.get("/admin/send_test")
+def admin_send_test():
+    auth = require_admin()
+    if auth:
+        return auth
+
+    token = request.args.get("token", "")
+    tenant = (request.args.get("tenant") or "").strip().lower()
+    cuil = (request.args.get("cuil") or "").strip()
+    period = (request.args.get("period") or "").strip()
+
+    t = get_tenant(tenant)
+    if not t:
+        return Response("Tenant inválido", status=400)
+
+    html = []
+    html.append("<h2>Envío de prueba (1 persona)</h2>")
+    html.append(f"<p><b>Empresa:</b> {esc(t['display_name'])}</p>")
+    html.append(f"<p><a href='/admin?token={esc(token)}'>← volver</a></p>")
+
+    html.append(f"""
+    <form method="get">
+      <input type="hidden" name="tenant" value="{esc(tenant)}">
+      <input type="hidden" name="token" value="{esc(token)}">
+
+      <label>CUIL<br>
+        <input type="text" name="cuil" value="{esc(cuil)}" required>
+      </label><br><br>
+
+      <label>Período (mm/aaaa)<br>
+        <input type="text" name="period" value="{esc(period)}" required>
+      </label><br><br>
+
+      <button type="submit">Enviar plantilla (prueba)</button>
+    </form>
+    """)
+
+    if cuil and period:
+        html.append("<hr><h3>Resultado</h3>")
+
+        envios = load_envios_rows(tenant)
+        person = find_person_by_cuil(envios, cuil)
+
+        if not person or not person.get("to_whatsapp"):
+            html.append("<p style='color:red'>No se encontró WhatsApp para ese CUIL en el Excel de envíos.</p>")
+            return Response("".join(html), mimetype="text/html")
+
+        phone = person["to_whatsapp"]
+        html.append("<p>✔ Persona encontrada</p>")
+        html.append(f"<p>👤 Nombre: {esc(person.get('nombre',''))}</p>")
+        html.append(f"<p>📞 WhatsApp: {esc(phone)}</p>")
+
+        periods = list_periods_for_cuil(tenant, cuil)
+        if period not in periods:
+            html.append("<p style='color:red'>No se encontró el PDF para ese período.</p>")
+            html.append(f"<p class='mono'>Períodos disponibles: {esc(', '.join(periods))}</p>")
+            return Response("".join(html), mimetype="text/html")
+
+        html.append(f"<p>📄 PDF disponible para {esc(period)}</p>")
+
+        # Guardamos pending view ANTES del click VIEW_NOW
+        add_pending_view(phone, tenant, strip_pdf(cuil), period)
+
+        # Enviamos plantilla con botón VIEW_NOW (abre conversación)
+        try:
+            sid_tpl = send_whatsapp_template(
+                phone,
+                content_vars={
+                    "1": person.get("nombre", ""),
+                    "2": period,
+                },
+                template_sid=TWILIO_TEMPLATE_SID or None,
+            )
+            html.append(f"<p style='color:green'>✅ Plantilla enviada. SID: {esc(sid_tpl)}</p>")
+        except Exception as e:
+            html.append(f"<p style='color:red'>❌ Error enviando plantilla: {esc(str(e))}</p>")
+            return Response("".join(html), mimetype="text/html")
+
+        # Debug: URL del PDF (Twilio la va a pedir cuando toque VIEW_NOW)
+        pdf_url = (
+            f"{request.host_url.rstrip('/')}/media/pdf"
+            f"?tenant={tenant}&cuil={strip_pdf(cuil)}&period={period}&token={ADMIN_TOKEN or token}"
+        )
+        html.append(f"<p class='mono'>PDF URL (debug): {esc(pdf_url)}</p>")
+        html.append("<p>👉 Ahora el empleado toca el botón <b>VIEW_NOW</b> y se envía el PDF automáticamente.</p>")
+
+    return Response("".join(html), mimetype="text/html")
+
+# =========================
+# Twilio inbound: VIEW_NOW + firma/observa
+# =========================
+@app.post("/twilio/inbound")
+def twilio_inbound():
+    # form-urlencoded
+    from_whatsapp = (request.form.get("From") or "").strip()
+    button = (request.form.get("ButtonPayload") or "").strip()
+    body = (request.form.get("Body") or "").strip()
+
+    print("INBOUND:", from_whatsapp, "ButtonPayload:", button, "Body:", body)
+
+    # 1) VIEW_NOW -> enviar PDF del periodo del pending view
+    if button == "VIEW_NOW" or body == "VIEW_NOW":
+        pending = get_latest_pending_view(from_whatsapp)
+        if not pending:
+            return Response("No pending view", status=200)
+
+        tenant = pending["tenant"]
+        cuil = pending["cuil"]
+        period = pending["period"]
+
+        pdf_url = (
+            f"{request.host_url.rstrip('/')}/media/pdf"
+            f"?tenant={tenant}&cuil={cuil}&period={period}&token={ADMIN_TOKEN}"
+        )
+
+        try:
+            sid_pdf = send_whatsapp_pdf(
+                from_whatsapp,
+                pdf_url,
+                body=f"Acá tenés tu recibo {period}."
+            )
+            print("SENT PDF SID:", sid_pdf)
+
+            # (opcional) mandar plantilla de firma/observa después del PDF
+            if TWILIO_SIGN_TEMPLATE_SID:
+                try:
+                    sid_sign = send_whatsapp_template(
+                        from_whatsapp,
+                        content_vars={"1": period},
+                        template_sid=TWILIO_SIGN_TEMPLATE_SID,
+                    )
+                    print("SENT SIGN TEMPLATE SID:", sid_sign)
+                except Exception as e:
+                    print("WARN sending sign template:", e)
+
+            # Estado: DISPONIBLE
+            set_recibo_estado(tenant, cuil, period, "DISPONIBLE")
+
+            # Consumimos el pending para evitar mezclas
+            consume_pending_view(pending["id"])
+
+        except Exception as e:
+            print("ERROR sending PDF:", e)
+
+        return Response("OK", status=200)
+
+    # 2) Firma / Observa (cuando tengas tu segunda plantilla con payloads)
+    if button in ("SIGN_OK", "SIGN_OBS"):
+        pending = get_latest_pending_view(from_whatsapp)
+        if not pending:
+            return Response("No pending view", status=200)
+
+        tenant = pending["tenant"]
+        cuil = pending["cuil"]
+        period = pending["period"]
+
+        if button == "SIGN_OK":
+            set_recibo_estado(tenant, cuil, period, "FIRMADO")
+        else:
+            set_recibo_estado(tenant, cuil, period, "OBSERVADO")
+
+        consume_pending_view(pending["id"])
+        return Response("OK", status=200)
+
+    return Response("OK", status=200)
+
 @app.get("/health")
 def health():
-    return jsonify({"ok": True, "ts": int(time.time())})
+    return jsonify({"ok": True, "ts": int(time.time()), "db_path": DB_PATH})
