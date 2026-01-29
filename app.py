@@ -958,29 +958,53 @@ def admin_required(fn):
 import sqlite3, time
 
 def add_pending_view(to_whatsapp: str, tenant: str, cuil: str, period: str):
+    now = int(time.time())
     conn = get_db_connection()
     cur = conn.cursor()
+
     cur.execute("""
-      INSERT INTO pending_views (to_whatsapp, tenant, cuil, period, created_at)
-      VALUES (?, ?, ?, ?, ?);
-    """, (to_whatsapp, tenant, cuil, period, int(time.time())))
+      INSERT INTO pending_views (to_whatsapp, tenant, cuil, period, created_at, step, dni_attempts)
+      VALUES (?, ?, ?, ?, ?, 'READY', 0)
+      ON CONFLICT(to_whatsapp, tenant, cuil, period) DO UPDATE SET
+        created_at=excluded.created_at,
+        step='READY',
+        dni_attempts=0
+    """, (to_whatsapp, tenant, cuil, period, now))
+
     conn.commit()
     conn.close()
 
-def get_latest_pending_view(from_whatsapp: str):
+
+def get_latest_pending_view(to_whatsapp: str):
     conn = get_db_connection()
-    conn.row_factory = sqlite3.Row
     cur = conn.cursor()
     cur.execute("""
-      SELECT id, to_whatsapp, tenant, cuil, period, created_at
+      SELECT
+        id,
+        to_whatsapp,
+        tenant,
+        cuil,
+        period,
+        created_at,
+        COALESCE(step, 'READY') AS step,
+        COALESCE(dni_attempts, 0) AS dni_attempts
       FROM pending_views
-      WHERE to_whatsapp = ?
+      WHERE to_whatsapp=?
       ORDER BY created_at DESC
-      LIMIT 1;
-    """, (from_whatsapp,))
+      LIMIT 1
+    """, (to_whatsapp,))
     row = cur.fetchone()
     conn.close()
-    return dict(row) if row else None
+    if not row:
+        return None
+
+    # si usás sqlite3.Row como row_factory, esto funciona:
+    try:
+        return dict(row)
+    except Exception:
+        # fallback si fetchone devuelve tuple
+        keys = ["id","to_whatsapp","tenant","cuil","period","created_at","step","dni_attempts"]
+        return dict(zip(keys, row))
 
 def consume_pending_view(pending_id: int):
     conn = get_db_connection()
@@ -1861,6 +1885,7 @@ def twilio_inbound():
     cuil = pending["cuil"]
     period = pending["period"]
     step = (pending.get("step") or "READY").upper()
+    print("STEP:", step, "BODY_DIGITS:", "".join(ch for ch in body if ch.isdigit()))
 
     # 🔒 Si ya cerró, no hacer nada más
     estado = get_recibo_estado(tenant, cuil, period)
