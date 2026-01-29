@@ -434,6 +434,28 @@ def list_periods_for_cuil(tenant_slug: str, cuil: str) -> List[str]:
 
     return sorted(set(periods), key=key, reverse=True)
 
+
+def ensure_sqlite_columns(table: str, columns: dict[str, str]) -> None:
+    """
+    columns: {"colname": "INTEGER", "error_message": "TEXT", ...}
+    Agrega columnas faltantes via ALTER TABLE.
+    """
+    conn = get_db_connection()
+    cur = conn.cursor()
+
+    cur.execute(f"PRAGMA table_info({table});")
+    existing = {row[1] for row in cur.fetchall()}  # row[1] = name
+
+    for col, col_type in columns.items():
+        if col not in existing:
+            try:
+                cur.execute(f"ALTER TABLE {table} ADD COLUMN {col} {col_type};")
+            except Exception:
+                pass
+
+    conn.commit()
+    conn.close()
+
 # =========================
 # Media endpoint (Twilio descarga PDF desde acá)
 # =========================
@@ -561,60 +583,95 @@ def _set_status_on_table(table: str, sid: str, status: str, error_code=None, err
     conn.close()
 
 def is_pdf_sid(message_sid: str) -> bool:
-    if not message_sid:
-        return False
-
     conn = get_db_connection()
     cur = conn.cursor()
-
-    cur.execute(
-        "SELECT 1 FROM sent_pdfs WHERE message_sid = ? LIMIT 1;",
-        (message_sid,),
-    )
-    row = cur.fetchone()
+    cur.execute("SELECT 1 FROM sent_pdfs WHERE message_sid = ? LIMIT 1", (message_sid,))
+    ok = cur.fetchone() is not None
     conn.close()
-
-    return bool(row)
+    return ok
 
 
 @app.post("/twilio/status")
 def twilio_status():
     sid = (request.form.get("MessageSid") or "").strip()
     status = (request.form.get("MessageStatus") or "").strip().lower()
-    error_code = request.form.get("ErrorCode")
-    error_message = request.form.get("ErrorMessage")
+    error_code = (request.form.get("ErrorCode") or "").strip()
+    error_message = (request.form.get("ErrorMessage") or "").strip()
+    now = int(time.time())
 
     if not sid:
         return Response("OK", status=200)
 
-    # 1) Si es PDF
-    if is_pdf_sid(sid):  # tu helper actual
-        _set_status_on_table("sent_pdfs", sid, status, error_code, error_message)
+    conn = get_db_connection()
+    cur = conn.cursor()
 
-        # ✅ Cuando el PDF se entrega, recién ahí mando firma
-        if status == "delivered" and TWILIO_SIGN_TEMPLATE_SID:
-            info = get_sent_pdf_by_sid(sid)  # (tenant,cuil,period,to_whatsapp)
-            if info and not info.get("sign_sent_at"):
+    # actualizar tracking
+    cur.execute("""
+        UPDATE message_status
+        SET last_status = ?, last_status_at = ?,
+            error_code = CASE WHEN ? != '' THEN ? ELSE error_code END,
+            error_message = CASE WHEN ? != '' THEN ? ELSE error_message END
+        WHERE message_sid = ?
+    """, (status, now, error_code, error_code, error_message, error_message, sid))
+
+    if status == "delivered":
+        cur.execute("""
+            UPDATE message_status
+            SET delivered_at = COALESCE(delivered_at, ?)
+            WHERE message_sid = ?
+        """, (now, sid))
+
+    if status == "read":
+        cur.execute("""
+            UPDATE message_status
+            SET read_at = COALESCE(read_at, ?)
+            WHERE message_sid = ?
+        """, (now, sid))
+
+    if status == "failed":
+        cur.execute("""
+            UPDATE message_status
+            SET failed_at = COALESCE(failed_at, ?),
+                error_code = COALESCE(NULLIF(?, ''), error_code),
+                error_message = COALESCE(NULLIF(?, ''), error_message)
+            WHERE message_sid = ?
+        """, (now, error_code, error_message, sid))
+
+    # si fue delivered y es PDF -> mandar SIGN una sola vez
+    if status == "delivered":
+        cur.execute("""
+            SELECT tenant, cuil, period, to_whatsapp, sign_sent_at
+            FROM sent_pdfs
+            WHERE message_sid = ?
+            LIMIT 1
+        """, (sid,))
+        row = cur.fetchone()
+
+        if row:
+            tenant, cuil, period, to_whatsapp, sign_sent_at = row
+            if not sign_sent_at and TWILIO_SIGN_TEMPLATE_SID:
                 try:
-                    sign_sid = send_whatsapp_template(
-                        info["to_whatsapp"],
-                        content_vars={"1": info["period"]},
-                        template_sid=TWILIO_SIGN_TEMPLATE_SID,
-                        status_callback=STATUS_CALLBACK_URL,
+                    sid_sign = send_whatsapp_template(
+                        to_whatsapp,
+                        content_vars={"1": period},
+                        template_sid=TWILIO_SIGN_TEMPLATE_SID
                     )
-                    mark_sign_sent(sid)  # pone sign_sent_at
-                    print("SENT SIGN AFTER PDF DELIVERED:", sign_sid)
+                    # opcional: trackear el SIGN en message_status también
+                    cur.execute("""
+                        INSERT OR IGNORE INTO message_status
+                        (message_sid, to_whatsapp, tenant, cuil, period, kind, created_at, last_status, last_status_at)
+                        VALUES (?, ?, ?, ?, ?, 'sign', ?, 'sent', ?)
+                    """, (sid_sign, to_whatsapp, tenant, cuil, period, now, now))
+
+                    cur.execute("UPDATE sent_pdfs SET sign_sent_at = ? WHERE message_sid = ?", (now, sid))
+                    print("SENT SIGN AFTER PDF DELIVERED:", sid_sign)
                 except Exception as e:
-                    print("WARN sending sign after delivered:", e)
+                    print("WARN: could not send SIGN:", e)
 
-        return Response("OK", status=200)
-
-    # 2) Si es PLANTILLA VIEW_NOW
-    if is_template_sid(sid):  # te paso helper abajo
-        _set_status_on_table("sent_templates", sid, status, error_code, error_message)
-        return Response("OK", status=200)
-
+    conn.commit()
+    conn.close()
     return Response("OK", status=200)
+
 
 def is_template_sid(message_sid: str) -> bool:
     conn = get_db_connection()
@@ -668,9 +725,9 @@ def init_db():
     cur.execute("PRAGMA journal_mode=WAL;")
     cur.execute("PRAGMA synchronous=NORMAL;")
 
-    # =========
+    # -----------------------
     # pending_views
-    # =========
+    # -----------------------
     cur.execute("""
       CREATE TABLE IF NOT EXISTS pending_views (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -683,34 +740,24 @@ def init_db():
       );
     """)
 
-    # Compatibilidad si venías de esquema viejo
-    _try_alter(cur, "ALTER TABLE pending_views ADD COLUMN tenant TEXT;")
-    _try_alter(cur, "ALTER TABLE pending_views ADD COLUMN cuil TEXT;")
-    _try_alter(cur, "ALTER TABLE pending_views ADD COLUMN period TEXT;")
-    # (si tuviste archivo_norm/period_label, se corrige en funciones, no acá)
-
-    # =========
-    # recibo_estado (acá se guarda firmado/observado/no_need)
-    # =========
+    # -----------------------
+    # recibo_estado: SOLO respuesta usuario
+    # -----------------------
     cur.execute("""
       CREATE TABLE IF NOT EXISTS recibo_estado (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         tenant TEXT NOT NULL,
         cuil TEXT NOT NULL,
         period TEXT NOT NULL,
-        estado TEXT NOT NULL,         -- FIRMADO | OBSERVADO | NO_NEED (NO usamos DISPONIBLE en reporte)
+        estado TEXT NOT NULL,         -- FIRMADO | OBSERVADO | NO_NEED
         updated_at INTEGER NOT NULL,
         UNIQUE(tenant, cuil, period)
       );
     """)
-    _try_alter(cur, "ALTER TABLE recibo_estado ADD COLUMN tenant TEXT;")
-    _try_alter(cur, "ALTER TABLE recibo_estado ADD COLUMN cuil TEXT;")
-    _try_alter(cur, "ALTER TABLE recibo_estado ADD COLUMN period TEXT;")
-    _try_alter(cur, "ALTER TABLE recibo_estado ADD COLUMN updated_at INTEGER;")
 
-    # =========
-    # message_status (plantilla/pdf: enviado/entregado/leído/falló)
-    # =========
+    # -----------------------
+    # message_status: tracking Twilio (template/pdf)
+    # -----------------------
     cur.execute("""
       CREATE TABLE IF NOT EXISTS message_status (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -720,7 +767,7 @@ def init_db():
         cuil TEXT,
         period TEXT,
         nombre TEXT,
-        kind TEXT,                -- 'template' | 'pdf'
+        kind TEXT,                -- 'template' | 'pdf' | 'sign' (opcional)
         created_at INTEGER,
         last_status TEXT,
         last_status_at INTEGER,
@@ -732,24 +779,26 @@ def init_db():
       );
     """)
 
-    # Migraciones para DB ya creada (este bloque es el que te faltaba)
-    _try_alter(cur, "ALTER TABLE message_status ADD COLUMN tenant TEXT;")
-    _try_alter(cur, "ALTER TABLE message_status ADD COLUMN cuil TEXT;")
-    _try_alter(cur, "ALTER TABLE message_status ADD COLUMN period TEXT;")
-    _try_alter(cur, "ALTER TABLE message_status ADD COLUMN nombre TEXT;")
-    _try_alter(cur, "ALTER TABLE message_status ADD COLUMN kind TEXT;")
-    _try_alter(cur, "ALTER TABLE message_status ADD COLUMN created_at INTEGER;")
-    _try_alter(cur, "ALTER TABLE message_status ADD COLUMN last_status TEXT;")
-    _try_alter(cur, "ALTER TABLE message_status ADD COLUMN last_status_at INTEGER;")
-    _try_alter(cur, "ALTER TABLE message_status ADD COLUMN delivered_at INTEGER;")
-    _try_alter(cur, "ALTER TABLE message_status ADD COLUMN read_at INTEGER;")
-    _try_alter(cur, "ALTER TABLE message_status ADD COLUMN failed_at INTEGER;")
-    _try_alter(cur, "ALTER TABLE message_status ADD COLUMN error_code TEXT;")
-    _try_alter(cur, "ALTER TABLE message_status ADD COLUMN error_message TEXT;")
+    ensure_sqlite_columns("message_status", {
+        "to_whatsapp": "TEXT",
+        "tenant": "TEXT",
+        "cuil": "TEXT",
+        "period": "TEXT",
+        "nombre": "TEXT",
+        "kind": "TEXT",
+        "created_at": "INTEGER",
+        "last_status": "TEXT",
+        "last_status_at": "INTEGER",
+        "delivered_at": "INTEGER",
+        "read_at": "INTEGER",
+        "failed_at": "INTEGER",
+        "error_code": "TEXT",
+        "error_message": "TEXT",
+    })
 
-    # =========
-    # sent_pdfs (para mandar firma DESPUÉS del PDF vía /twilio/status)
-    # =========
+    # -----------------------
+    # sent_pdfs: SOLO para disparar SIGN después de delivered
+    # -----------------------
     cur.execute("""
       CREATE TABLE IF NOT EXISTS sent_pdfs (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -762,25 +811,19 @@ def init_db():
         sign_sent_at INTEGER
       );
     """)
-    _try_alter(cur, "ALTER TABLE sent_pdfs ADD COLUMN sign_sent_at INTEGER;")
+    ensure_sqlite_columns("sent_pdfs", {"sign_sent_at": "INTEGER"})
 
-    # =========
-    # índices
-    # =========
-    _try_alter(cur, "CREATE INDEX IF NOT EXISTS idx_pending_to_created ON pending_views(to_whatsapp, created_at);")
-    _try_alter(cur, "CREATE INDEX IF NOT EXISTS idx_estado_key ON recibo_estado(tenant, cuil, period);")
-    _try_alter(cur, "CREATE INDEX IF NOT EXISTS idx_msg_key ON message_status(tenant, cuil, period, kind);")
-    _try_alter(cur, "CREATE INDEX IF NOT EXISTS idx_msg_sid ON message_status(message_sid);")
-    _try_alter(cur, "CREATE INDEX IF NOT EXISTS idx_sentpdfs_sid ON sent_pdfs(message_sid);")
-        # === migraciones/columnas para status tracking ===
-    # columnas opcionales en sent_pdfs (solo si tu /twilio/status las usa)
-    _try_alter(cur, "ALTER TABLE sent_pdfs ADD COLUMN delivered_at INTEGER;")
-    _try_alter(cur, "ALTER TABLE sent_pdfs ADD COLUMN read_at INTEGER;")
-    _try_alter(cur, "ALTER TABLE sent_pdfs ADD COLUMN failed_at INTEGER;")
-    _try_alter(cur, "ALTER TABLE sent_pdfs ADD COLUMN error_code TEXT;")
-    _try_alter(cur, "ALTER TABLE sent_pdfs ADD COLUMN error_message TEXT;")
-    _try_alter(cur, "ALTER TABLE sent_pdfs ADD COLUMN status TEXT;")
-
+    # -----------------------
+    # indices
+    # -----------------------
+    try:
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_pending_to_created ON pending_views(to_whatsapp, created_at);")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_estado_key ON recibo_estado(tenant, cuil, period);")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_msg_key ON message_status(tenant, cuil, period, kind);")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_msg_sid ON message_status(message_sid);")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_sentpdfs_sid ON sent_pdfs(message_sid);")
+    except Exception:
+        pass
 
     conn.commit()
     conn.close()
@@ -789,13 +832,24 @@ def init_db():
 init_db()
 
 def save_pdf_sid(tenant: str, cuil: str, period: str, to_whatsapp: str, sid: str):
+    now = int(time.time())
     conn = get_db_connection()
     cur = conn.cursor()
+
+    # tracking para reporte
+    cur.execute("""
+        INSERT OR IGNORE INTO message_status
+        (message_sid, to_whatsapp, tenant, cuil, period, kind, created_at, last_status, last_status_at)
+        VALUES (?, ?, ?, ?, ?, 'pdf', ?, 'sent', ?)
+    """, (sid, to_whatsapp, tenant, cuil, period, now, now))
+
+    # tracking para enviar SIGN al delivered
     cur.execute("""
         INSERT OR IGNORE INTO sent_pdfs
         (tenant, cuil, period, to_whatsapp, message_sid, created_at)
         VALUES (?, ?, ?, ?, ?, ?)
-    """, (tenant, cuil, period, to_whatsapp, sid, int(time.time())))
+    """, (tenant, cuil, period, to_whatsapp, sid, now))
+
     conn.commit()
     conn.close()
 
@@ -916,19 +970,15 @@ def root():
         return redirect(f"/admin?token={tok}")
     return redirect("/admin")
 
-def save_template_sid(tenant: str, cuil: str, period: str, to_whatsapp: str, message_sid: str, nombre: str = ""):
+def save_template_sid(tenant: str, cuil: str, period: str, to_whatsapp: str, sid: str, nombre: str = ""):
+    now = int(time.time())
     conn = get_db_connection()
     cur = conn.cursor()
-    now = int(time.time())
-
-    # Guardamos en message_status como "template"
     cur.execute("""
-      INSERT OR IGNORE INTO message_status
+        INSERT OR IGNORE INTO message_status
         (message_sid, to_whatsapp, tenant, cuil, period, nombre, kind, created_at, last_status, last_status_at)
-      VALUES
-        (?, ?, ?, ?, ?, ?, 'template', ?, 'sent', ?);
-    """, (message_sid, to_whatsapp, tenant, cuil, period, nombre, now, now))
-
+        VALUES (?, ?, ?, ?, ?, ?, 'template', ?, 'sent', ?)
+    """, (sid, to_whatsapp, tenant, cuil, period, nombre, now, now))
     conn.commit()
     conn.close()
 
@@ -1012,17 +1062,18 @@ def admin_panel():
     <form method="get" action="/admin/report_recibos.xlsx" style="margin-bottom:10px;">
         <input type="hidden" name="token" value="{esc(token)}">
         <input type="hidden" name="tenant" value="{esc(tenant)}">
-        <label>Período (opcional, mm/aaaa): </label>
-        <input type="text" name="period" placeholder="01/2026" style="width:90px;">
+        <label>Período (opcional mm/aaaa):</label>
+        <input type="text" name="period" placeholder="01/2026" style="margin-left:8px;">
         <button type="submit">📄 Descargar reporte recibos (XLSX)</button>
     </form>
 
     <p>
-        <a href="/admin/report_envios.csv?tenant={esc(tenant)}&token={esc(token)}" target="_blank">
+        <a href="/admin/report_envios.csv?tenant={esc(tenant)}&token={esc(token)}">
         📄 Envíos realizados (CSV)
         </a>
     </p>
     """)
+
 
 
     # ---------- Reset ----------
@@ -1123,39 +1174,72 @@ from openpyxl import Workbook
 from openpyxl.utils import get_column_letter
 from flask import send_file
 import io
+import datetime
+
 
 def _fmt_ts(ts: int | None) -> str:
     if not ts:
         return ""
-    try:
-        return datetime.fromtimestamp(int(ts)).strftime("%Y-%m-%d %H:%M:%S")
-    except Exception:
-        return str(ts)
+    # tu server está en UTC, si querés BA: ajustá acá (UTC-3) o dejalo así
+    return datetime.datetime.fromtimestamp(int(ts), datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+
 
 @app.get("/admin/report_recibos.xlsx")
 @admin_required
 def admin_report_recibos_xlsx():
     token = _get_admin_token_from_request()
     tenant = (request.args.get("tenant") or "").strip().lower()
-    period = (request.args.get("period") or "").strip()  # opcional
+    period = (request.args.get("period") or "").strip()
 
     if not tenant:
         return Response("Falta tenant", status=400)
 
-    def ts_fmt(ts: int | None) -> str:
-        if not ts:
-            return ""
-        try:
-            return datetime.fromtimestamp(int(ts)).strftime("%Y-%m-%d %H:%M:%S")
-        except Exception:
-            return str(ts)
+    # 1) Traigo envíos (para nombre/whatsapp). Si no querés depender del excel, igual te queda.
+    df_env = None
+    try:
+        df_env = get_envios_df_for_tenant(tenant)
+        if df_env is not None and not df_env.empty:
+            df_env.columns = [str(c).strip().lower() for c in df_env.columns]
+    except Exception:
+        df_env = None
+
+    # map CUIL -> (nombre, whatsapp)
+    env_map = {}
+    if df_env is not None and not df_env.empty:
+        def pick(*names):
+            for n in names:
+                if n in df_env.columns:
+                    return n
+            return None
+        c_nombre = pick("nombre", "name", "empleado", "persona")
+        c_tel = pick("telefono", "tel", "celular", "whatsapp", "numero")
+        c_arch = pick("archivo", "cuil", "archivo_norm")
+        if c_tel and c_arch:
+            for r in df_env.to_dict(orient="records"):
+                arch_raw = str(r.get(c_arch, "")).strip()
+                tel_raw = str(r.get(c_tel, "")).strip()
+                nombre = str(r.get(c_nombre, "")).strip() if c_nombre else ""
+                if not arch_raw:
+                    continue
+                cuil = arch_raw.replace(".pdf", "").strip()
+                try:
+                    cuil = strip_pdf(cuil)
+                except Exception:
+                    pass
+                # normalizar whatsapp
+                tel_digits = "".join(ch for ch in tel_raw if ch.isdigit())
+                if tel_digits:
+                    if not tel_digits.startswith("54"):
+                        tel_digits = "54" + tel_digits
+                    wa = f"whatsapp:+{tel_digits}"
+                else:
+                    wa = ""
+                env_map[(cuil)] = (nombre, wa)
 
     conn = get_db_connection()
-    conn.row_factory = sqlite3.Row
     cur = conn.cursor()
 
-    # 1) Base: tomamos todo lo que exista en message_status + recibo_estado para ese tenant (+period opcional)
-    # Armamos un set de keys (tenant,cuil,period)
+    # 2) base: todas las combinaciones tenant/period/cuil que aparecen en message_status o recibo_estado
     params = [tenant]
     where_period = ""
     if period:
@@ -1163,139 +1247,93 @@ def admin_report_recibos_xlsx():
         params.append(period)
 
     cur.execute(f"""
-      SELECT tenant, cuil, period, to_whatsapp, nombre, kind,
-             created_at, delivered_at, read_at, failed_at
-      FROM message_status
-      WHERE tenant = ?
-      {where_period}
-    """, params)
-    ms_rows = cur.fetchall()
+        SELECT DISTINCT tenant, period, cuil
+        FROM (
+            SELECT tenant, period, cuil FROM message_status WHERE tenant = ? {where_period}
+            UNION
+            SELECT tenant, period, cuil FROM recibo_estado WHERE tenant = ? {where_period}
+        )
+        ORDER BY period, cuil
+    """, params + params)
 
-    # key -> estructura
-    data = {}  # (cuil,period) -> dict
+    keys = cur.fetchall()
 
-    def ensure(cuil_, period_):
-        k = (cuil_, period_)
-        if k not in data:
-            data[k] = {
-                "Periodo": period_,
-                "Nombre": "",
-                "CUIL": cuil_,
-                "WhatsApp": "",
-                "Plantilla_enviada": "",
-                "Plantilla_entregada": "",
-                "Plantilla_leida": "",
-                "Plantilla_fallida": "",
-                "PDF_enviado": "",
-                "PDF_entregado": "",
-                "PDF_leido": "",
-                "PDF_fallido": "",
-                "Respuesta_usuario": "",
-                "Respuesta_timestamp": "",
-            }
-        return data[k]
+    rows = []
+    for _tenant, _period, _cuil in keys:
+        # plantilla (VIEW_NOW)
+        cur.execute("""
+            SELECT created_at, delivered_at, read_at, failed_at
+            FROM message_status
+            WHERE tenant=? AND period=? AND cuil=? AND kind='template'
+            ORDER BY created_at DESC
+            LIMIT 1
+        """, (_tenant, _period, _cuil))
+        t = cur.fetchone() or (None, None, None, None)
 
-    for r in ms_rows:
-        cuil_ = (r["cuil"] or "").strip()
-        period_ = (r["period"] or "").strip()
-        if not cuil_ or not period_:
-            continue
+        # pdf
+        cur.execute("""
+            SELECT created_at, delivered_at, read_at, failed_at
+            FROM message_status
+            WHERE tenant=? AND period=? AND cuil=? AND kind='pdf'
+            ORDER BY created_at DESC
+            LIMIT 1
+        """, (_tenant, _period, _cuil))
+        p = cur.fetchone() or (None, None, None, None)
 
-        row = ensure(cuil_, period_)
-        if r["nombre"] and not row["Nombre"]:
-            row["Nombre"] = r["nombre"]
-        if r["to_whatsapp"] and not row["WhatsApp"]:
-            row["WhatsApp"] = r["to_whatsapp"]
+        # respuesta usuario
+        cur.execute("""
+            SELECT estado, updated_at
+            FROM recibo_estado
+            WHERE tenant=? AND period=? AND cuil=?
+            LIMIT 1
+        """, (_tenant, _period, _cuil))
+        e = cur.fetchone()
+        estado = (e[0] if e else "") or ""
+        updated_at = (e[1] if e else None)
 
-        kind = (r["kind"] or "").lower()
-        created_at = r["created_at"]
-        delivered_at = r["delivered_at"]
-        read_at = r["read_at"]
-        failed_at = r["failed_at"]
+        nombre, wa = env_map.get(_cuil, ("", ""))
 
-        if kind == "template":
-            row["Plantilla_enviada"] = row["Plantilla_enviada"] or ts_fmt(created_at)
-            row["Plantilla_entregada"] = row["Plantilla_entregada"] or ts_fmt(delivered_at)
-            row["Plantilla_leida"] = row["Plantilla_leida"] or ts_fmt(read_at)
-            row["Plantilla_fallida"] = row["Plantilla_fallida"] or ts_fmt(failed_at)
-
-        elif kind == "pdf":
-            row["PDF_enviado"] = row["PDF_enviado"] or ts_fmt(created_at)
-            row["PDF_entregado"] = row["PDF_entregado"] or ts_fmt(delivered_at)
-            row["PDF_leido"] = row["PDF_leido"] or ts_fmt(read_at)
-            row["PDF_fallido"] = row["PDF_fallido"] or ts_fmt(failed_at)
-
-    # 2) Respuesta usuario: sale de recibo_estado (solo FIRMADO/OBSERVADO/NO_NEED)
-    cur.execute(f"""
-      SELECT cuil, period, estado, updated_at
-      FROM recibo_estado
-      WHERE tenant = ?
-      {where_period}
-    """, params)
-    est_rows = cur.fetchall()
-
-    for r in est_rows:
-        cuil_ = (r["cuil"] or "").strip()
-        period_ = (r["period"] or "").strip()
-        if not cuil_ or not period_:
-            continue
-        row = ensure(cuil_, period_)
-        estado = (r["estado"] or "").strip().lower()
-
-        # Formato como querés: "firmado"/"observado"
-        if estado == "firmado":
-            row["Respuesta_usuario"] = "firmado"
-        elif estado == "observado":
-            row["Respuesta_usuario"] = "observado"
-        elif estado == "no_need":
-            row["Respuesta_usuario"] = "no_need"
-        else:
-            # si quedó cualquier otra cosa, no lo mostramos
-            row["Respuesta_usuario"] = row["Respuesta_usuario"] or ""
-
-        row["Respuesta_timestamp"] = row["Respuesta_timestamp"] or ts_fmt(r["updated_at"])
+        rows.append({
+            "Periodo": _period,
+            "Nombre": nombre,
+            "CUIL": _cuil,
+            "WhatsApp": wa,
+            "Plantilla_enviada": _fmt_ts(t[0]),
+            "Plantilla_entregada": _fmt_ts(t[1]),
+            "Plantilla_leida": _fmt_ts(t[2]),
+            "Plantilla_fallida": _fmt_ts(t[3]),
+            "PDF_enviado": _fmt_ts(p[0]),
+            "PDF_entregado": _fmt_ts(p[1]),
+            "PDF_leido": _fmt_ts(p[2]),
+            "PDF_fallido": _fmt_ts(p[3]),
+            "Respuesta_usuario": estado.lower() if estado else "",
+            "Respuesta_timestamp": _fmt_ts(updated_at),
+        })
 
     conn.close()
 
-    # 3) Generar XLSX
-    from openpyxl import Workbook
-    from openpyxl.utils import get_column_letter
+    import pandas as pd
+    import io
 
-    wb = Workbook()
-    ws = wb.active
-    ws.title = "Recibos"
+    df = pd.DataFrame(rows, columns=[
+        "Periodo","Nombre","CUIL","WhatsApp",
+        "Plantilla_enviada","Plantilla_entregada","Plantilla_leida","Plantilla_fallida",
+        "PDF_enviado","PDF_entregado","PDF_leido","PDF_fallido",
+        "Respuesta_usuario","Respuesta_timestamp"
+    ])
 
-    headers = [
-        "Periodo", "Nombre", "CUIL", "WhatsApp",
-        "Plantilla_enviada", "Plantilla_entregada", "Plantilla_leida", "Plantilla_fallida",
-        "PDF_enviado", "PDF_entregado", "PDF_leido", "PDF_fallido",
-        "Respuesta_usuario", "Respuesta_timestamp"
-    ]
-    ws.append(headers)
+    bio = io.BytesIO()
+    with pd.ExcelWriter(bio, engine="openpyxl") as writer:
+        df.to_excel(writer, index=False, sheet_name="Reporte")
 
-    # Orden: por periodo, luego nombre/cuil
-    rows_sorted = sorted(
-        data.values(),
-        key=lambda x: (x["Periodo"], x["Nombre"], x["CUIL"])
-    )
-    for r in rows_sorted:
-        ws.append([r.get(h, "") for h in headers])
-
-    # Auto ancho simple
-    for col_idx, h in enumerate(headers, 1):
-        ws.column_dimensions[get_column_letter(col_idx)].width = max(14, min(40, len(h) + 2))
-
-    out = io.BytesIO()
-    wb.save(out)
-    out.seek(0)
-
+    bio.seek(0)  # <- CLAVE para que no salga "a mitad"
     filename = f"reporte_recibos_{tenant}_{(period or 'todos').replace('/','-')}.xlsx"
-    return send_file(
-        out,
-        as_attachment=True,
-        download_name=filename,
-        mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    resp = Response(
+        bio.getvalue(),
+        mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
     )
+    resp.headers["Content-Disposition"] = f'attachment; filename="{filename}"'
+    return resp
 
 
 
