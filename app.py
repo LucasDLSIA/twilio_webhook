@@ -712,6 +712,8 @@ def get_db_connection():
     return conn
 
 
+import time, hashlib
+
 def _try_alter(cur, sql: str):
     try:
         cur.execute(sql)
@@ -725,9 +727,9 @@ def init_db():
     cur.execute("PRAGMA journal_mode=WAL;")
     cur.execute("PRAGMA synchronous=NORMAL;")
 
-    # -----------------------
-    # pending_views
-    # -----------------------
+    # =========
+    # pending_views (ahora con step + intentos)
+    # =========
     cur.execute("""
       CREATE TABLE IF NOT EXISTS pending_views (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -736,28 +738,32 @@ def init_db():
         cuil TEXT NOT NULL,
         period TEXT NOT NULL,
         created_at INTEGER NOT NULL,
+        step TEXT DEFAULT 'READY',          -- READY | AWAIT_DNI
+        dni_attempts INTEGER DEFAULT 0,
         UNIQUE(to_whatsapp, tenant, cuil, period)
       );
     """)
+    _try_alter(cur, "ALTER TABLE pending_views ADD COLUMN step TEXT;")
+    _try_alter(cur, "ALTER TABLE pending_views ADD COLUMN dni_attempts INTEGER;")
 
-    # -----------------------
-    # recibo_estado: SOLO respuesta usuario
-    # -----------------------
+    # =========
+    # recibo_estado (FIRMADO/OBSERVADO/NO_NEED)
+    # =========
     cur.execute("""
       CREATE TABLE IF NOT EXISTS recibo_estado (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         tenant TEXT NOT NULL,
         cuil TEXT NOT NULL,
         period TEXT NOT NULL,
-        estado TEXT NOT NULL,         -- FIRMADO | OBSERVADO | NO_NEED
+        estado TEXT NOT NULL,
         updated_at INTEGER NOT NULL,
         UNIQUE(tenant, cuil, period)
       );
     """)
 
-    # -----------------------
-    # message_status: tracking Twilio (template/pdf)
-    # -----------------------
+    # =========
+    # message_status (status template/pdf)
+    # =========
     cur.execute("""
       CREATE TABLE IF NOT EXISTS message_status (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -767,7 +773,7 @@ def init_db():
         cuil TEXT,
         period TEXT,
         nombre TEXT,
-        kind TEXT,                -- 'template' | 'pdf' | 'sign' (opcional)
+        kind TEXT,                -- 'template' | 'pdf'
         created_at INTEGER,
         last_status TEXT,
         last_status_at INTEGER,
@@ -778,27 +784,19 @@ def init_db():
         error_message TEXT
       );
     """)
+    # migraciones safe
+    for col, typ in [
+        ("to_whatsapp","TEXT"),("tenant","TEXT"),("cuil","TEXT"),("period","TEXT"),
+        ("nombre","TEXT"),("kind","TEXT"),("created_at","INTEGER"),
+        ("last_status","TEXT"),("last_status_at","INTEGER"),
+        ("delivered_at","INTEGER"),("read_at","INTEGER"),("failed_at","INTEGER"),
+        ("error_code","TEXT"),("error_message","TEXT"),
+    ]:
+        _try_alter(cur, f"ALTER TABLE message_status ADD COLUMN {col} {typ};")
 
-    ensure_sqlite_columns("message_status", {
-        "to_whatsapp": "TEXT",
-        "tenant": "TEXT",
-        "cuil": "TEXT",
-        "period": "TEXT",
-        "nombre": "TEXT",
-        "kind": "TEXT",
-        "created_at": "INTEGER",
-        "last_status": "TEXT",
-        "last_status_at": "INTEGER",
-        "delivered_at": "INTEGER",
-        "read_at": "INTEGER",
-        "failed_at": "INTEGER",
-        "error_code": "TEXT",
-        "error_message": "TEXT",
-    })
-
-    # -----------------------
-    # sent_pdfs: SOLO para disparar SIGN después de delivered
-    # -----------------------
+    # =========
+    # sent_pdfs (para mandar SIGN después del delivered)
+    # =========
     cur.execute("""
       CREATE TABLE IF NOT EXISTS sent_pdfs (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -811,19 +809,31 @@ def init_db():
         sign_sent_at INTEGER
       );
     """)
-    ensure_sqlite_columns("sent_pdfs", {"sign_sent_at": "INTEGER"})
+    _try_alter(cur, "ALTER TABLE sent_pdfs ADD COLUMN sign_sent_at INTEGER;")
 
-    # -----------------------
-    # indices
-    # -----------------------
-    try:
-        cur.execute("CREATE INDEX IF NOT EXISTS idx_pending_to_created ON pending_views(to_whatsapp, created_at);")
-        cur.execute("CREATE INDEX IF NOT EXISTS idx_estado_key ON recibo_estado(tenant, cuil, period);")
-        cur.execute("CREATE INDEX IF NOT EXISTS idx_msg_key ON message_status(tenant, cuil, period, kind);")
-        cur.execute("CREATE INDEX IF NOT EXISTS idx_msg_sid ON message_status(message_sid);")
-        cur.execute("CREATE INDEX IF NOT EXISTS idx_sentpdfs_sid ON sent_pdfs(message_sid);")
-    except Exception:
-        pass
+    # =========
+    # ✅ NUEVO: verified_contacts (verificación DNI por número)
+    # =========
+    cur.execute("""
+      CREATE TABLE IF NOT EXISTS verified_contacts (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        tenant TEXT NOT NULL,
+        cuil TEXT NOT NULL,
+        to_whatsapp TEXT NOT NULL,
+        dni_hash TEXT NOT NULL,
+        dni_last4 TEXT,
+        verified_at INTEGER NOT NULL,
+        UNIQUE(tenant, cuil, to_whatsapp)
+      );
+    """)
+
+    # índices útiles
+    _try_alter(cur, "CREATE INDEX IF NOT EXISTS idx_pending_to_created ON pending_views(to_whatsapp, created_at);")
+    _try_alter(cur, "CREATE INDEX IF NOT EXISTS idx_estado_key ON recibo_estado(tenant, cuil, period);")
+    _try_alter(cur, "CREATE INDEX IF NOT EXISTS idx_msg_key ON message_status(tenant, cuil, period, kind);")
+    _try_alter(cur, "CREATE INDEX IF NOT EXISTS idx_msg_sid ON message_status(message_sid);")
+    _try_alter(cur, "CREATE INDEX IF NOT EXISTS idx_sentpdfs_sid ON sent_pdfs(message_sid);")
+    _try_alter(cur, "CREATE INDEX IF NOT EXISTS idx_verified_key ON verified_contacts(tenant, cuil, to_whatsapp);")
 
     conn.commit()
     conn.close()
@@ -853,6 +863,68 @@ def save_pdf_sid(tenant: str, cuil: str, period: str, to_whatsapp: str, sid: str
     conn.commit()
     conn.close()
 
+def _digits(s: str) -> str:
+    return "".join(ch for ch in (s or "") if ch.isdigit())
+
+def cuil_to_dni(cuil: str) -> str | None:
+    """
+    Para personas físicas AR: CUIL = XX + DNI(8) + X
+    Ej: 20-28169249-3 -> DNI 28169249
+    """
+    d = _digits(cuil)
+    if len(d) != 11:
+        return None
+    return d[2:10]  # 8 dígitos
+
+def dni_hash(dni: str) -> str:
+    # no guardamos el DNI plano
+    return hashlib.sha256(dni.encode("utf-8")).hexdigest()
+
+def is_verified_contact(tenant: str, cuil: str, to_whatsapp: str) -> bool:
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute("""
+      SELECT 1 FROM verified_contacts
+      WHERE tenant=? AND cuil=? AND to_whatsapp=?
+      LIMIT 1
+    """, (tenant, cuil, to_whatsapp))
+    ok = cur.fetchone() is not None
+    conn.close()
+    return ok
+
+def set_verified_contact(tenant: str, cuil: str, to_whatsapp: str, dni: str):
+    h = dni_hash(dni)
+    last4 = dni[-4:] if dni else None
+    now = int(time.time())
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute("""
+      INSERT INTO verified_contacts (tenant, cuil, to_whatsapp, dni_hash, dni_last4, verified_at)
+      VALUES (?, ?, ?, ?, ?, ?)
+      ON CONFLICT(tenant, cuil, to_whatsapp) DO UPDATE SET
+        dni_hash=excluded.dni_hash,
+        dni_last4=excluded.dni_last4,
+        verified_at=excluded.verified_at
+    """, (tenant, cuil, to_whatsapp, h, last4, now))
+    conn.commit()
+    conn.close()
+
+def set_pending_step(pending_id: int, step: str):
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute("UPDATE pending_views SET step=? WHERE id=?", (step, pending_id))
+    conn.commit()
+    conn.close()
+
+def inc_pending_dni_attempts(pending_id: int) -> int:
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute("UPDATE pending_views SET dni_attempts = COALESCE(dni_attempts,0) + 1 WHERE id=?", (pending_id,))
+    cur.execute("SELECT dni_attempts FROM pending_views WHERE id=?", (pending_id,))
+    n = (cur.fetchone() or [0])[0]
+    conn.commit()
+    conn.close()
+    return int(n)
 
 
 def get_pdf_by_sid(sid):
@@ -1788,6 +1860,7 @@ def twilio_inbound():
     tenant = pending["tenant"]
     cuil = pending["cuil"]
     period = pending["period"]
+    step = (pending.get("step") or "READY").upper()
 
     # 🔒 Si ya cerró, no hacer nada más
     estado = get_recibo_estado(tenant, cuil, period)
@@ -1795,35 +1868,63 @@ def twilio_inbound():
         msg = "✅ Este recibo ya fue firmado." if estado == "FIRMADO" else "📝 Este recibo quedó como observado."
         return Response(f"<Response><Message>{msg}</Message></Response>", mimetype="application/xml", status=200)
 
-    # 1) VIEW_NOW -> enviar PDF + luego firma
-    if button == "VIEW_NOW" or body == "VIEW_NOW":
-        pdf_url = (
-            f"{request.host_url.rstrip('/')}/media/pdf"
-            f"?tenant={tenant}&cuil={cuil}&period={period}&token={ADMIN_TOKEN}"
-        )
+    # 0) Si estamos esperando DNI, tratamos el body como DNI
+    if step == "AWAIT_DNI":
+        dni_user = _digits(body)
 
-        try:
-            sid_pdf = send_whatsapp_pdf(
-                from_whatsapp,
-                pdf_url,
-                body=f"Acá tenés tu recibo {period}.",
-                status_callback=STATUS_CALLBACK_URL,   # <-- CLAVE
+        # si tocó botones mientras pedíamos DNI, lo guiamos
+        if button:
+            return Response(
+                "<Response><Message>🔐 Para continuar, enviá tu DNI (solo números).</Message></Response>",
+                mimetype="application/xml",
+                status=200
             )
-            print("SENT PDF SID:", sid_pdf)
 
-            set_recibo_estado(tenant, cuil, period, "DISPONIBLE")
+        dni_expected = cuil_to_dni(cuil)
+        if not dni_expected or len(dni_user) < 7:
+            inc_pending_dni_attempts(pending["id"])
+            return Response(
+                "<Response><Message>🔐 Enviá tu DNI (solo números, sin puntos). Ej: 28169249</Message></Response>",
+                mimetype="application/xml",
+                status=200
+            )
 
-            # Guardamos SID para que /twilio/status sepa que este delivered era un PDF
-            save_pdf_sid(tenant, cuil, period, from_whatsapp, sid_pdf)
+        if dni_user != dni_expected:
+            tries = inc_pending_dni_attempts(pending["id"])
+            if tries >= 3:
+                # seguridad: cortamos para evitar brute force
+                consume_pending_view(pending["id"])
+                return Response(
+                    "<Response><Message>❌ DNI incorrecto (3 intentos). Volvé a solicitar el recibo desde el mensaje inicial.</Message></Response>",
+                    mimetype="application/xml",
+                    status=200
+                )
+            return Response(
+                f"<Response><Message>❌ DNI incorrecto. Intento {tries}/3. Probá de nuevo (solo números).</Message></Response>",
+                mimetype="application/xml",
+                status=200
+            )
 
-            # NO mandes la plantilla de firma acá
-            # Se manda en /twilio/status cuando delivered
+        # ✅ verificado
+        set_verified_contact(tenant, cuil, from_whatsapp, dni_user)
+        set_pending_step(pending["id"], "READY")
 
-        except Exception as e:
-            print("ERROR sending PDF:", e)
+        # ahora sí mandamos el PDF como si hubiera tocado VIEW_NOW
+        return _send_pdf_flow(from_whatsapp, tenant, cuil, period)
 
-        return Response("OK", status=200)
+    # 1) VIEW_NOW
+    if button == "VIEW_NOW" or body == "VIEW_NOW":
+        # ✅ si NO está verificado, pedimos DNI
+        if not is_verified_contact(tenant, cuil, from_whatsapp):
+            set_pending_step(pending["id"], "AWAIT_DNI")
+            return Response(
+                "<Response><Message>🔐 Para ver tu recibo, enviá tu DNI (solo números, sin puntos).</Message></Response>",
+                mimetype="application/xml",
+                status=200
+            )
 
+        # ✅ ya verificado: mandamos directo
+        return _send_pdf_flow(from_whatsapp, tenant, cuil, period)
 
     # 2) NO_NEED
     if button == "NO_NEED" or body == "NO_NEED":
@@ -1841,6 +1942,41 @@ def twilio_inbound():
             set_recibo_estado(tenant, cuil, period, "OBSERVADO")
             consume_pending_view(pending["id"])
             return Response("<Response><Message>📝 Recibo observado. Vamos a revisarlo y te contactamos.</Message></Response>", mimetype="application/xml", status=200)
+
+    return Response("OK", status=200)
+
+
+def _send_pdf_flow(from_whatsapp: str, tenant: str, cuil: str, period: str):
+    # ⚠️ opcional pero recomendado: re-chequear que exista PDF antes de enviar
+    file_id = find_pdf_file_id_for_cuil_period(tenant, cuil, period)
+    if not file_id:
+        return Response(
+            "<Response><Message>⚠️ No encontramos tu recibo para ese período. Si creés que es un error, avisá a RRHH.</Message></Response>",
+            mimetype="application/xml",
+            status=200
+        )
+
+    pdf_url = (
+        f"{request.host_url.rstrip('/')}/media/pdf"
+        f"?tenant={tenant}&cuil={cuil}&period={period}&token={ADMIN_TOKEN}"
+    )
+
+    try:
+        sid_pdf = send_whatsapp_pdf(
+            from_whatsapp,
+            pdf_url,
+            body=f"Acá tenés tu recibo {period}.",
+            status_callback=STATUS_CALLBACK_URL,
+        )
+        print("SENT PDF SID:", sid_pdf)
+
+        # estado interno si querés, pero tu reporte NO lo usa como "respuesta usuario"
+        set_recibo_estado(tenant, cuil, period, "DISPONIBLE")
+
+        save_pdf_sid(tenant, cuil, period, from_whatsapp, sid_pdf)
+
+    except Exception as e:
+        print("ERROR sending PDF:", e)
 
     return Response("OK", status=200)
 
