@@ -265,46 +265,8 @@ def find_person_by_cuil(envios_rows: List[dict], cuil: str) -> Optional[dict]:
 # =========================
 # Drive: PDF
 # =========================
-def find_pdf_file_id_for_cuil_period(tenant_slug: str, cuil: str, period: str) -> Optional[str]:
-    t = get_tenant(tenant_slug)
-    if not t:
-        return None
-
-    service = drive_service()
-    root_id = t["drive_root_id"]
-    folder_name = period_to_folder_name(period)
-    filename = f"{cuil}.pdf"
-
-    # Carpeta del período
-    folder_res = service.files().list(
-        q=(
-            f"'{root_id}' in parents and "
-            f"mimeType='application/vnd.google-apps.folder' and "
-            f"name='{folder_name}' and trashed=false"
-        ),
-        fields="files(id,name)",
-        pageSize=5,
-    ).execute().get("files", [])
-
-    if not folder_res:
-        return None
-
-    period_folder_id = folder_res[0]["id"]
-
-    # PDF dentro de carpeta
-    file_res = service.files().list(
-        q=(
-            f"'{period_folder_id}' in parents and "
-            f"name='{filename}' and mimeType='application/pdf' and trashed=false"
-        ),
-        fields="files(id,name)",
-        pageSize=1,
-    ).execute().get("files", [])
-
-    if not file_res:
-        return None
-
-    return file_res[0]["id"]
+def find_pdf_file_id_for_cuil_period(tenant: str, cuil: str, period: str) -> str | None:
+    return find_pdf_file_id(tenant, cuil, period)
 
 def list_periods_for_cuil(tenant_slug: str, cuil: str) -> List[str]:
     t = get_tenant(tenant_slug)
@@ -356,7 +318,8 @@ def media_pdf():
     if not (tenant and cuil and period):
         return Response("Faltan parámetros tenant/cuil/period", status=400)
 
-    file_id = find_pdf_file_id_for_cuil_period(tenant, cuil, period)
+    # ✅ MISMA FUNCIÓN que usás para validar existencia antes de mandar plantilla
+    file_id = find_pdf_file_id(tenant, cuil, period)
     if not file_id:
         return Response("PDF no encontrado", status=404)
 
@@ -371,7 +334,7 @@ def media_pdf():
 
     data = fh.read()
     resp = Response(data, mimetype="application/pdf")
-    resp.headers["Content-Disposition"] = f'inline; filename="{cuil}.pdf"'
+    resp.headers["Content-Disposition"] = f'inline; filename="{strip_pdf(cuil)}.pdf"'
     return resp
 
 # =========================
@@ -417,13 +380,12 @@ def send_whatsapp_template(
     """
     Envío de plantilla aprobada (WhatsApp) usando Content Templates.
     template_sid:
-      - por defecto usa TWILIO_TEMPLATE_SID (VIEW_NOW)
-      - podés pasar TWILIO_SIGN_TEMPLATE_SID (firma / observa)
+      - por defecto usa TWILIO_TEMPLATE_SID (la de VIEW_NOW)
+      - podés pasar TWILIO_SIGN_TEMPLATE_SID para la de firma/observa
     """
-    tpl = (template_sid or TWILIO_TEMPLATE_SID).strip()
+    tpl = (template_sid or TWILIO_TEMPLATE_SID or "").strip()
     if not tpl:
         raise RuntimeError("Falta TWILIO_TEMPLATE_SID (ContentSid) en ENV")
-
     if not (TWILIO_WHATSAPP_FROM or TWILIO_MESSAGING_SERVICE_SID):
         raise RuntimeError("Falta TWILIO_WHATSAPP_FROM o TWILIO_MESSAGING_SERVICE_SID en ENV")
 
@@ -433,10 +395,6 @@ def send_whatsapp_template(
         "to": to_whatsapp,
         "content_sid": tpl,
     }
-
-    if status_callback:
-        payload["status_callback"] = status_callback
-
     if TWILIO_MESSAGING_SERVICE_SID:
         payload["messaging_service_sid"] = TWILIO_MESSAGING_SERVICE_SID
     else:
@@ -445,8 +403,12 @@ def send_whatsapp_template(
     if content_vars:
         payload["content_variables"] = json.dumps(content_vars)
 
+    if status_callback:
+        payload["status_callback"] = status_callback
+
     msg = client.messages.create(**payload)
     return msg.sid
+# =========================
 
 def _set_status_on_table(table: str, sid: str, status: str, error_code=None, error_message=None):
     now = int(time.time())
@@ -561,10 +523,22 @@ def get_db_connection():
     return conn
 
 
+def _try_alter(cur, sql: str):
+    try:
+        cur.execute(sql)
+    except Exception:
+        pass
+
 def init_db():
     conn = get_db_connection()
     cur = conn.cursor()
 
+    cur.execute("PRAGMA journal_mode=WAL;")
+    cur.execute("PRAGMA synchronous=NORMAL;")
+
+    # =========
+    # pending_views
+    # =========
     cur.execute("""
       CREATE TABLE IF NOT EXISTS pending_views (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -572,22 +546,78 @@ def init_db():
         tenant TEXT NOT NULL,
         cuil TEXT NOT NULL,
         period TEXT NOT NULL,
-        created_at INTEGER NOT NULL
+        created_at INTEGER NOT NULL,
+        UNIQUE(to_whatsapp, tenant, cuil, period)
       );
     """)
 
+    # Compatibilidad si venías de esquema viejo
+    _try_alter(cur, "ALTER TABLE pending_views ADD COLUMN tenant TEXT;")
+    _try_alter(cur, "ALTER TABLE pending_views ADD COLUMN cuil TEXT;")
+    _try_alter(cur, "ALTER TABLE pending_views ADD COLUMN period TEXT;")
+    # (si tuviste archivo_norm/period_label, se corrige en funciones, no acá)
+
+    # =========
+    # recibo_estado (acá se guarda firmado/observado/no_need)
+    # =========
     cur.execute("""
       CREATE TABLE IF NOT EXISTS recibo_estado (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         tenant TEXT NOT NULL,
         cuil TEXT NOT NULL,
         period TEXT NOT NULL,
-        estado TEXT NOT NULL,         -- DISPONIBLE | FIRMADO | OBSERVADO | NO_NEED
+        estado TEXT NOT NULL,         -- FIRMADO | OBSERVADO | NO_NEED (NO usamos DISPONIBLE en reporte)
         updated_at INTEGER NOT NULL,
         UNIQUE(tenant, cuil, period)
       );
     """)
+    _try_alter(cur, "ALTER TABLE recibo_estado ADD COLUMN tenant TEXT;")
+    _try_alter(cur, "ALTER TABLE recibo_estado ADD COLUMN cuil TEXT;")
+    _try_alter(cur, "ALTER TABLE recibo_estado ADD COLUMN period TEXT;")
+    _try_alter(cur, "ALTER TABLE recibo_estado ADD COLUMN updated_at INTEGER;")
 
+    # =========
+    # message_status (plantilla/pdf: enviado/entregado/leído/falló)
+    # =========
+    cur.execute("""
+      CREATE TABLE IF NOT EXISTS message_status (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        message_sid TEXT UNIQUE NOT NULL,
+        to_whatsapp TEXT,
+        tenant TEXT,
+        cuil TEXT,
+        period TEXT,
+        nombre TEXT,
+        kind TEXT,                -- 'template' | 'pdf'
+        created_at INTEGER,
+        last_status TEXT,
+        last_status_at INTEGER,
+        delivered_at INTEGER,
+        read_at INTEGER,
+        failed_at INTEGER,
+        error_code TEXT,
+        error_message TEXT
+      );
+    """)
+
+    # Migraciones para DB ya creada (este bloque es el que te faltaba)
+    _try_alter(cur, "ALTER TABLE message_status ADD COLUMN tenant TEXT;")
+    _try_alter(cur, "ALTER TABLE message_status ADD COLUMN cuil TEXT;")
+    _try_alter(cur, "ALTER TABLE message_status ADD COLUMN period TEXT;")
+    _try_alter(cur, "ALTER TABLE message_status ADD COLUMN nombre TEXT;")
+    _try_alter(cur, "ALTER TABLE message_status ADD COLUMN kind TEXT;")
+    _try_alter(cur, "ALTER TABLE message_status ADD COLUMN created_at INTEGER;")
+    _try_alter(cur, "ALTER TABLE message_status ADD COLUMN last_status TEXT;")
+    _try_alter(cur, "ALTER TABLE message_status ADD COLUMN last_status_at INTEGER;")
+    _try_alter(cur, "ALTER TABLE message_status ADD COLUMN delivered_at INTEGER;")
+    _try_alter(cur, "ALTER TABLE message_status ADD COLUMN read_at INTEGER;")
+    _try_alter(cur, "ALTER TABLE message_status ADD COLUMN failed_at INTEGER;")
+    _try_alter(cur, "ALTER TABLE message_status ADD COLUMN error_code TEXT;")
+    _try_alter(cur, "ALTER TABLE message_status ADD COLUMN error_message TEXT;")
+
+    # =========
+    # sent_pdfs (para mandar firma DESPUÉS del PDF vía /twilio/status)
+    # =========
     cur.execute("""
       CREATE TABLE IF NOT EXISTS sent_pdfs (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -600,43 +630,16 @@ def init_db():
         sign_sent_at INTEGER
       );
     """)
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS sent_templates (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        tenant TEXT NOT NULL,
-        cuil TEXT NOT NULL,
-        period TEXT NOT NULL,
-        to_whatsapp TEXT NOT NULL,
-        message_sid TEXT NOT NULL UNIQUE,
-        created_at INTEGER NOT NULL,
-        delivered_at INTEGER,
-        read_at INTEGER,
-        failed_at INTEGER,
-        error_code TEXT,
-        error_message TEXT
-    );
-    """)
+    _try_alter(cur, "ALTER TABLE sent_pdfs ADD COLUMN sign_sent_at INTEGER;")
 
-    # indices útiles
-    try:
-        cur.execute("CREATE INDEX IF NOT EXISTS idx_senttpl_key ON sent_templates(tenant, period, cuil);")
-    except Exception:
-        pass
-
-
-    # Si la tabla existía sin sign_sent_at, la agregamos
-    try:
-        cur.execute("ALTER TABLE sent_pdfs ADD COLUMN sign_sent_at INTEGER;")
-    except Exception:
-        pass
-
-    # índices útiles
-    try:
-        cur.execute("CREATE INDEX IF NOT EXISTS idx_pending_to_created ON pending_views(to_whatsapp, created_at);")
-        cur.execute("CREATE INDEX IF NOT EXISTS idx_estado_key ON recibo_estado(tenant, cuil, period);")
-        cur.execute("CREATE INDEX IF NOT EXISTS idx_sentpdfs_sid ON sent_pdfs(message_sid);")
-    except Exception:
-        pass
+    # =========
+    # índices
+    # =========
+    _try_alter(cur, "CREATE INDEX IF NOT EXISTS idx_pending_to_created ON pending_views(to_whatsapp, created_at);")
+    _try_alter(cur, "CREATE INDEX IF NOT EXISTS idx_estado_key ON recibo_estado(tenant, cuil, period);")
+    _try_alter(cur, "CREATE INDEX IF NOT EXISTS idx_msg_key ON message_status(tenant, cuil, period, kind);")
+    _try_alter(cur, "CREATE INDEX IF NOT EXISTS idx_msg_sid ON message_status(message_sid);")
+    _try_alter(cur, "CREATE INDEX IF NOT EXISTS idx_sentpdfs_sid ON sent_pdfs(message_sid);")
 
     conn.commit()
     conn.close()
@@ -772,20 +775,22 @@ def root():
         return redirect(f"/admin?token={tok}")
     return redirect("/admin")
 
-def save_template_sid(tenant: str, cuil: str, period: str, to_whatsapp: str, message_sid: str):
+def save_template_sid(tenant: str, cuil: str, period: str, to_whatsapp: str, message_sid: str, nombre: str = ""):
     conn = get_db_connection()
     cur = conn.cursor()
     now = int(time.time())
-    cur.execute(
-        """
-        INSERT OR IGNORE INTO sent_templates
-          (tenant, cuil, period, to_whatsapp, message_sid, created_at)
-        VALUES (?, ?, ?, ?, ?, ?);
-        """,
-        (tenant, cuil, period, to_whatsapp, message_sid, now),
-    )
+
+    # Guardamos en message_status como "template"
+    cur.execute("""
+      INSERT OR IGNORE INTO message_status
+        (message_sid, to_whatsapp, tenant, cuil, period, nombre, kind, created_at, last_status, last_status_at)
+      VALUES
+        (?, ?, ?, ?, ?, ?, 'template', ?, 'sent', ?);
+    """, (message_sid, to_whatsapp, tenant, cuil, period, nombre, now, now))
+
     conn.commit()
     conn.close()
+
 
 
 @app.get("/admin")
@@ -862,40 +867,21 @@ def admin_panel():
 
     html.append("<hr>")
     html.append("<h3>Reportes</h3>")
-
-    html.append("""
-    <form method="get" action="/admin/report_recibos.xlsx" style="margin-bottom:12px;">
-    <input type="hidden" name="tenant" value="{tenant}">
-    <input type="hidden" name="token" value="{token}">
-    
-    <label>
-        Período (opcional):
-        <input type="text" name="period" placeholder="01/2026">
-    </label>
-
-    <button type="submit">📄 Descargar reporte de recibos</button>
+    html.append(f"""
+    <form method="get" action="/admin/report_recibos.xlsx" style="margin-bottom:10px;">
+        <input type="hidden" name="token" value="{esc(token)}">
+        <input type="hidden" name="tenant" value="{esc(tenant)}">
+        <label>Período (opcional, mm/aaaa): </label>
+        <input type="text" name="period" placeholder="01/2026" style="width:90px;">
+        <button type="submit">📄 Descargar reporte recibos (XLSX)</button>
     </form>
-    """.format(
-        tenant=esc(tenant),
-        token=esc(token)
-    ))
 
-    html.append("""
-    <form method="get" action="/admin/report_envios.csv">
-    <input type="hidden" name="tenant" value="{tenant}">
-    <input type="hidden" name="token" value="{token}">
-    
-    <label>
-        Período (opcional):
-        <input type="text" name="period" placeholder="01/2026">
-    </label>
-
-    <button type="submit">📄 Envíos realizados (CSV)</button>
-    </form>
-    """.format(
-        tenant=esc(tenant),
-        token=esc(token)
-    ))
+    <p>
+        <a href="/admin/report_envios.csv?tenant={esc(tenant)}&token={esc(token)}" target="_blank">
+        📄 Envíos realizados (CSV)
+        </a>
+    </p>
+    """)
 
 
     # ---------- Reset ----------
@@ -1015,165 +1001,161 @@ def admin_report_recibos_xlsx():
     if not tenant:
         return Response("Falta tenant", status=400)
 
-    # Nombre + whatsapp desde Excel envíos
-    df = get_envios_df_for_tenant(tenant)
-    cuil_to = {}
-    if df is not None and not df.empty:
-        df.columns = [str(c).strip().lower() for c in df.columns]
-
-        def pick(*names):
-            for n in names:
-                if n in df.columns:
-                    return n
-            return None
-
-        c_nombre = pick("nombre", "name", "empleado", "persona")
-        c_tel = pick("telefono", "tel", "celular", "whatsapp", "numero")
-        c_arch = pick("archivo", "cuil", "archivo_norm")
-
-        if c_tel and c_arch:
-            for r in df.to_dict(orient="records"):
-                arch_raw = str(r.get(c_arch, "")).strip()
-                tel_raw = str(r.get(c_tel, "")).strip()
-                nombre = str(r.get(c_nombre, "")).strip() if c_nombre else ""
-                if not arch_raw:
-                    continue
-                cuil = arch_raw.replace(".pdf", "").strip()
-                try:
-                    cuil = strip_pdf(cuil)
-                except Exception:
-                    pass
-
-                tel_digits = "".join(ch for ch in tel_raw if ch.isdigit())
-                if tel_digits and not tel_digits.startswith("54"):
-                    tel_digits = "54" + tel_digits
-                wa = f"whatsapp:+{tel_digits}" if tel_digits else ""
-
-                cuil_to[cuil] = {"nombre": nombre, "whatsapp": wa}
+    def ts_fmt(ts: int | None) -> str:
+        if not ts:
+            return ""
+        try:
+            return datetime.fromtimestamp(int(ts)).strftime("%Y-%m-%d %H:%M:%S")
+        except Exception:
+            return str(ts)
 
     conn = get_db_connection()
     conn.row_factory = sqlite3.Row
     cur = conn.cursor()
 
-    # juntamos claves desde 3 lugares (plantilla/pdf/respuesta)
+    # 1) Base: tomamos todo lo que exista en message_status + recibo_estado para ese tenant (+period opcional)
+    # Armamos un set de keys (tenant,cuil,period)
     params = [tenant]
-    period_clause = ""
+    where_period = ""
     if period:
-        period_clause = " AND period = ? "
+        where_period = " AND period = ? "
         params.append(period)
 
     cur.execute(f"""
-        SELECT DISTINCT tenant, cuil, period, to_whatsapp
-        FROM sent_templates
-        WHERE tenant = ? {period_clause}
-        UNION
-        SELECT DISTINCT tenant, cuil, period, to_whatsapp
-        FROM sent_pdfs
-        WHERE tenant = ? {period_clause}
-        UNION
-        SELECT DISTINCT tenant, cuil, period, NULL as to_whatsapp
-        FROM recibo_estado
-        WHERE tenant = ? {period_clause}
-        ORDER BY period, cuil;
-    """, params + params + params)
+      SELECT tenant, cuil, period, to_whatsapp, nombre, kind,
+             created_at, delivered_at, read_at, failed_at
+      FROM message_status
+      WHERE tenant = ?
+      {where_period}
+    """, params)
+    ms_rows = cur.fetchall()
 
-    keys = cur.fetchall()
+    # key -> estructura
+    data = {}  # (cuil,period) -> dict
 
-    # armamos filas
-    rows_out = []
-    for k in keys:
-        cuil = k["cuil"]
-        per = k["period"]
-        to_whatsapp = k["to_whatsapp"] or (cuil_to.get(cuil, {}).get("whatsapp") or "")
-        nombre = cuil_to.get(cuil, {}).get("nombre") or ""
+    def ensure(cuil_, period_):
+        k = (cuil_, period_)
+        if k not in data:
+            data[k] = {
+                "Periodo": period_,
+                "Nombre": "",
+                "CUIL": cuil_,
+                "WhatsApp": "",
+                "Plantilla_enviada": "",
+                "Plantilla_entregada": "",
+                "Plantilla_leida": "",
+                "Plantilla_fallida": "",
+                "PDF_enviado": "",
+                "PDF_entregado": "",
+                "PDF_leido": "",
+                "PDF_fallido": "",
+                "Respuesta_usuario": "",
+                "Respuesta_timestamp": "",
+            }
+        return data[k]
 
-        # plantilla
-        cur.execute("""
-            SELECT created_at, delivered_at, read_at, failed_at
-            FROM sent_templates
-            WHERE tenant=? AND cuil=? AND period=?
-            ORDER BY created_at DESC
-            LIMIT 1;
-        """, (tenant, cuil, per))
-        tpl = cur.fetchone()
+    for r in ms_rows:
+        cuil_ = (r["cuil"] or "").strip()
+        period_ = (r["period"] or "").strip()
+        if not cuil_ or not period_:
+            continue
 
-        # pdf
-        cur.execute("""
-            SELECT created_at, delivered_at, read_at, failed_at
-            FROM sent_pdfs
-            WHERE tenant=? AND cuil=? AND period=?
-            ORDER BY created_at DESC
-            LIMIT 1;
-        """, (tenant, cuil, per))
-        pdf = cur.fetchone()
+        row = ensure(cuil_, period_)
+        if r["nombre"] and not row["Nombre"]:
+            row["Nombre"] = r["nombre"]
+        if r["to_whatsapp"] and not row["WhatsApp"]:
+            row["WhatsApp"] = r["to_whatsapp"]
 
-        # respuesta final (sin "DISPONIBLE")
-        cur.execute("""
-            SELECT estado, updated_at
-            FROM recibo_estado
-            WHERE tenant=? AND cuil=? AND period=?
-            LIMIT 1;
-        """, (tenant, cuil, per))
-        est = cur.fetchone()
+        kind = (r["kind"] or "").lower()
+        created_at = r["created_at"]
+        delivered_at = r["delivered_at"]
+        read_at = r["read_at"]
+        failed_at = r["failed_at"]
 
-        resp = ""
-        resp_ts = ""
-        if est:
-            if est["estado"] in ("FIRMADO", "OBSERVADO", "NO_NEED"):
-                resp = est["estado"].lower()  # firmado/observado/no_need
-                resp_ts = _fmt_ts(est["updated_at"])
-            else:
-                resp = ""
-                resp_ts = ""
+        if kind == "template":
+            row["Plantilla_enviada"] = row["Plantilla_enviada"] or ts_fmt(created_at)
+            row["Plantilla_entregada"] = row["Plantilla_entregada"] or ts_fmt(delivered_at)
+            row["Plantilla_leida"] = row["Plantilla_leida"] or ts_fmt(read_at)
+            row["Plantilla_fallida"] = row["Plantilla_fallida"] or ts_fmt(failed_at)
 
-        rows_out.append([
-            per,
-            nombre,
-            cuil,
-            to_whatsapp,
-            _fmt_ts(tpl["created_at"]) if tpl else "",
-            _fmt_ts(tpl["delivered_at"]) if tpl else "",
-            _fmt_ts(tpl["read_at"]) if tpl else "",
-            _fmt_ts(tpl["failed_at"]) if tpl else "",
-            _fmt_ts(pdf["created_at"]) if pdf else "",
-            _fmt_ts(pdf["delivered_at"]) if pdf else "",
-            _fmt_ts(pdf["read_at"]) if pdf else "",
-            _fmt_ts(pdf["failed_at"]) if pdf else "",
-            resp,
-            resp_ts,
-        ])
+        elif kind == "pdf":
+            row["PDF_enviado"] = row["PDF_enviado"] or ts_fmt(created_at)
+            row["PDF_entregado"] = row["PDF_entregado"] or ts_fmt(delivered_at)
+            row["PDF_leido"] = row["PDF_leido"] or ts_fmt(read_at)
+            row["PDF_fallido"] = row["PDF_fallido"] or ts_fmt(failed_at)
+
+    # 2) Respuesta usuario: sale de recibo_estado (solo FIRMADO/OBSERVADO/NO_NEED)
+    cur.execute(f"""
+      SELECT cuil, period, estado, updated_at
+      FROM recibo_estado
+      WHERE tenant = ?
+      {where_period}
+    """, params)
+    est_rows = cur.fetchall()
+
+    for r in est_rows:
+        cuil_ = (r["cuil"] or "").strip()
+        period_ = (r["period"] or "").strip()
+        if not cuil_ or not period_:
+            continue
+        row = ensure(cuil_, period_)
+        estado = (r["estado"] or "").strip().lower()
+
+        # Formato como querés: "firmado"/"observado"
+        if estado == "firmado":
+            row["Respuesta_usuario"] = "firmado"
+        elif estado == "observado":
+            row["Respuesta_usuario"] = "observado"
+        elif estado == "no_need":
+            row["Respuesta_usuario"] = "no_need"
+        else:
+            # si quedó cualquier otra cosa, no lo mostramos
+            row["Respuesta_usuario"] = row["Respuesta_usuario"] or ""
+
+        row["Respuesta_timestamp"] = row["Respuesta_timestamp"] or ts_fmt(r["updated_at"])
 
     conn.close()
 
-    headers = [
-        "Periodo","Nombre","CUIL","WhatsApp",
-        "Plantilla_enviada","Plantilla_entregada","Plantilla_leida","Plantilla_fallida",
-        "PDF_enviado","PDF_entregado","PDF_leido","PDF_fallido",
-        "Respuesta_usuario","Respuesta_timestamp"
-    ]
+    # 3) Generar XLSX
+    from openpyxl import Workbook
+    from openpyxl.utils import get_column_letter
 
     wb = Workbook()
     ws = wb.active
-    ws.title = "Reporte"
+    ws.title = "Recibos"
+
+    headers = [
+        "Periodo", "Nombre", "CUIL", "WhatsApp",
+        "Plantilla_enviada", "Plantilla_entregada", "Plantilla_leida", "Plantilla_fallida",
+        "PDF_enviado", "PDF_entregado", "PDF_leido", "PDF_fallido",
+        "Respuesta_usuario", "Respuesta_timestamp"
+    ]
     ws.append(headers)
-    for r in rows_out:
-        ws.append(r)
 
-    # auto ancho
-    for col in range(1, len(headers)+1):
-        ws.column_dimensions[get_column_letter(col)].width = 20
+    # Orden: por periodo, luego nombre/cuil
+    rows_sorted = sorted(
+        data.values(),
+        key=lambda x: (x["Periodo"], x["Nombre"], x["CUIL"])
+    )
+    for r in rows_sorted:
+        ws.append([r.get(h, "") for h in headers])
 
-    buf = io.BytesIO()
-    wb.save(buf)
-    buf.seek(0)
+    # Auto ancho simple
+    for col_idx, h in enumerate(headers, 1):
+        ws.column_dimensions[get_column_letter(col_idx)].width = max(14, min(40, len(h) + 2))
 
-    filename = f"reporte_recibos_{tenant}{'_'+period.replace('/','-') if period else ''}.xlsx"
+    out = io.BytesIO()
+    wb.save(out)
+    out.seek(0)
+
+    filename = f"reporte_recibos_{tenant}_{(period or 'todos').replace('/','-')}.xlsx"
     return send_file(
-        buf,
+        out,
         as_attachment=True,
         download_name=filename,
-        mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     )
+
 
 
 @app.get("/admin/report_estado.csv")
@@ -1238,10 +1220,51 @@ def admin_report_envios():
         }
     )
 
+def _period_variants(period: str) -> list[str]:
+    # period esperado: "01/2026" (o "01-2026")
+    p = (period or "").strip()
+    p = p.replace("-", "/").replace("_", "/").replace(".", "/").replace(" ", "/")
+    # si viene "012026" intentar normalizar
+    if len(p) == 6 and p.isdigit():
+        p = f"{p[:2]}/{p[2:]}"
+    if "/" not in p:
+        return [p]
+
+    mm, yyyy = p.split("/", 1)
+    mm = mm.zfill(2)
+    yyyy = yyyy.strip()
+
+    return [
+        f"{mm}/{yyyy}",
+        f"{mm}-{yyyy}",
+        f"{mm}_{yyyy}",
+        f"{mm} {yyyy}",
+        f"{mm}.{yyyy}",
+        f"{mm}{yyyy}",
+    ]
+
+
+def _find_period_folder_id(service, root_id: str, period: str) -> str | None:
+    # Busca una carpeta del período DIRECTAMENTE bajo root_id
+    for name in _period_variants(period):
+        q = (
+            f"'{root_id}' in parents and trashed=false "
+            f"and mimeType='application/vnd.google-apps.folder' "
+            f"and name='{name}'"
+        )
+        res = service.files().list(q=q, fields="files(id,name)", pageSize=1).execute()
+        files = res.get("files", [])
+        if files:
+            return files[0]["id"]
+    return None
+
+
 def find_pdf_file_id(tenant: str, cuil: str, period: str) -> str | None:
     """
-    Devuelve fileId del PDF en Drive o None si no existe.
-    IMPORTANTE: esto tiene que coincidir con la lógica real de /media/pdf.
+    Devuelve fileId del PDF en Drive o None si no existe PARA ESE PERÍODO.
+    Regla (recomendada): /root/{PERIODO}/{CUIL}.pdf
+
+    IMPORTANTE: /media/pdf debe usar esta misma función.
     """
     t = get_tenant(tenant)
     if not t:
@@ -1251,25 +1274,35 @@ def find_pdf_file_id(tenant: str, cuil: str, period: str) -> str | None:
     if not root_id:
         return None
 
-    # Normalizaciones
     cuil = strip_pdf(cuil).strip()
-    period = period.strip()  # "01/2026"
+    period = (period or "").strip()
 
     service = drive_service()
 
-    # OJO: acá depende de cómo estén guardados tus PDFs.
-    # Si los guardás por nombre exacto "20-xxxx.pdf" dentro de una carpeta del periodo,
-    # tenés que buscar primero la carpeta del periodo y luego el archivo.
-    #
-    # Te dejo una búsqueda simple por nombre en el root (si vos no usás subcarpetas por periodo):
+    # 1) Buscar carpeta del período (si no existe -> NO HAY PDF para ese período)
+    period_folder_id = _find_period_folder_id(service, root_id, period)
+    if not period_folder_id:
+        return None
+
+    # 2) Buscar archivo dentro de esa carpeta
     filename = f"{cuil}.pdf"
 
-    q = (
-        f"'{root_id}' in parents and trashed=false "
+    q_exact = (
+        f"'{period_folder_id}' in parents and trashed=false "
         f"and name='{filename}'"
     )
+    res = service.files().list(q=q_exact, fields="files(id,name)", pageSize=1).execute()
+    files = res.get("files", [])
+    if files:
+        return files[0]["id"]
 
-    res = service.files().list(q=q, fields="files(id,name)", pageSize=1).execute()
+    # 3) Fallback: por si el nombre no es exacto pero contiene el CUIL
+    q_contains = (
+        f"'{period_folder_id}' in parents and trashed=false "
+        f"and mimeType='application/pdf' "
+        f"and name contains '{cuil}'"
+    )
+    res = service.files().list(q=q_contains, fields="files(id,name)", pageSize=1).execute()
     files = res.get("files", [])
     return files[0]["id"] if files else None
 
@@ -1400,16 +1433,17 @@ def admin_send_template_queue_start():
         except Exception:
             continue
 
-        # 🔒 PASO CRÍTICO: verificar que exista PDF
-        try:
-            pdf_file_id = find_pdf_file_id(tenant, cuil, period)
-        except Exception:
-            pdf_file_id = None
+        # 🔒 verificar PDF (solo si require_pdf=True)
+        if require_pdf:
+            try:
+                pdf_file_id = find_pdf_file_id(tenant, cuil, period)
+            except Exception:
+                pdf_file_id = None
 
-        if not pdf_file_id:
-            skipped_no_pdf += 1
-            print("SKIP (no pdf):", tenant, cuil, period)
-            continue   # ⛔ NO MANDA PLANTILLA
+            if not pdf_file_id:
+                skipped_no_pdf += 1
+                print("SKIP (no pdf):", tenant, cuil, period)
+                continue  # ⛔ NO MANDA PLANTILLA
 
         # ✅ Recién ahora mandamos VIEW_NOW
         try:
@@ -1421,21 +1455,20 @@ def admin_send_template_queue_start():
             )
 
             sent += 1
-            save_template_sid(tenant, cuil, period, to_whatsapp, sid)
+            save_template_sid(tenant, cuil, period, to_whatsapp, sid, nombre=nombre)
 
             print("SENT VIEW_NOW", sid, tenant, cuil, period)
-
             add_pending_view(to_whatsapp, tenant, cuil, period)
 
         except Exception as e:
             failed += 1
             print("ERROR send template:", tenant, cuil, to_whatsapp, e)
 
-
     return redirect(
         f"/admin/panel?tenant={tenant}&token={token}&msg=mass_send_ok"
         f"&sent={sent}&failed={failed}&skipped={skipped_no_pdf}&period={period}"
     )
+
 
 
 @app.get("/admin/send_test")
