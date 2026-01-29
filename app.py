@@ -962,13 +962,16 @@ def add_pending_view(to_whatsapp: str, tenant: str, cuil: str, period: str):
     conn = get_db_connection()
     cur = conn.cursor()
 
+    # borrar cualquier pending previo para ese 4-tuple (evita duplicados)
+    cur.execute("""
+      DELETE FROM pending_views
+      WHERE to_whatsapp=? AND tenant=? AND cuil=? AND period=?
+    """, (to_whatsapp, tenant, cuil, period))
+
+    # insertar nuevo pending
     cur.execute("""
       INSERT INTO pending_views (to_whatsapp, tenant, cuil, period, created_at, step, dni_attempts)
       VALUES (?, ?, ?, ?, ?, 'READY', 0)
-      ON CONFLICT(to_whatsapp, tenant, cuil, period) DO UPDATE SET
-        created_at=excluded.created_at,
-        step='READY',
-        dni_attempts=0
     """, (to_whatsapp, tenant, cuil, period, now))
 
     conn.commit()
