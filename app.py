@@ -352,67 +352,61 @@ def debug_list_pdfs_in_folder(folder_id: str):
 # Drive: PDF
 # =========================
 def find_pdf_file_id_for_cuil_period(tenant: str, cuil: str, period: str) -> str | None:
-    print("\n=== FIND PDF DEBUG ===")
-    print("tenant:", tenant)
-    print("cuil raw:", cuil)
-    print("period raw:", period)
-
     t = get_tenant(tenant)
-    print("tenant config:", t)
-
     if not t:
-        print("❌ tenant no encontrado")
+        print("❌ tenant inválido:", tenant)
         return None
 
-    root_id = (t.get("recibos_root_id") or t.get("drive_root_id") or "").strip()
-    print("root_id:", root_id)
+    root_id = (t.get("drive_root_id") or t.get("recibos_root_id") or "").strip()
     if not root_id:
-        print("❌ tenant sin recibos_root_id/drive_root_id")
+        print("❌ tenant sin root_id:", tenant, t)
         return None
 
-    cuil_norm = strip_pdf(cuil).strip()
-    filename = f"{cuil_norm}.pdf"
-    print("filename esperado:", filename)
+    cuil = strip_pdf(cuil).strip()
+    filename = f"{cuil}.pdf"
+
+    # Normalizo period a variantes típicas de carpeta
+    p = period.strip()
+    variants = {p, p.replace("/", "-"), p.replace("/", "_")}
 
     service = drive_service()
 
-    # 1) Intentar carpeta de período
-    period_names = _norm_period_variants(period)
-    print("period variants:", period_names)
+    # DEBUG: listar carpetas del root
+    print("ROOT_ID:", root_id)
+    root_children = _drive_list_children(root_id, page_size=30)
+    print("📂 ROOT children sample:", [(x["name"], x["mimeType"]) for x in root_children[:15]])
 
-    folder_id = None
-    folders = _drive_list_children(service, root_id, mime_type="application/vnd.google-apps.folder", page_size=200)
-    print("carpetas en root:", [f["name"] for f in folders][:40], "..." if len(folders) > 40 else "")
-
-    for f in folders:
-        if (f.get("name") or "").strip() in period_names:
-            folder_id = f["id"]
-            print("✅ carpeta período matcheó:", f["name"], "id:", folder_id)
+    # 1) Buscar carpeta de período
+    period_folder_id = None
+    for v in variants:
+        fid = _drive_find_folder_by_name(root_id, v)
+        if fid:
+            period_folder_id = fid
+            print("✅ Period folder:", v, fid)
             break
 
-    if folder_id:
-        fid = _drive_find_child_by_exact_name(service, folder_id, filename, mime_type="application/pdf")
-        print("pdf en carpeta período:", fid)
-        if fid:
-            print("✅ PDF encontrado en carpeta período")
-            return fid
-        else:
-            print("❌ no está el pdf en la carpeta período")
+    # 2) Si no hay carpeta por período, intentar buscar el PDF directo en root (fallback)
+    if not period_folder_id:
+        print("⚠️ No encontré carpeta de período. Busco PDF directo en root:", filename)
+        q = f"'{root_id}' in parents and trashed=false and name='{filename}'"
+        res = service.files().list(q=q, fields="files(id,name)", pageSize=5).execute()
+        files = res.get("files", [])
+        return files[0]["id"] if files else None
 
-    # 2) Fallback: buscar en root directo
-    fid = _drive_find_child_by_exact_name(service, root_id, filename, mime_type="application/pdf")
-    print("pdf en root:", fid)
-    if fid:
-        print("✅ PDF encontrado en root")
-        return fid
+    # DEBUG: listar archivos dentro del periodo
+    period_children = _drive_list_children(period_folder_id, page_size=50)
+    print("📄 PERIOD children sample:", [x["name"] for x in period_children[:25]])
 
-    # 3) Debug extra: ver si existe un archivo parecido (mismo cuil sin .pdf, etc.)
-    all_files = _drive_list_children(service, root_id, mime_type=None, page_size=200)
-    matches = [x["name"] for x in all_files if cuil_norm in (x.get("name") or "")]
-    print("archivos que contienen el cuil en el nombre:", matches[:30], "..." if len(matches) > 30 else "")
+    # 3) Buscar el PDF dentro de la carpeta del período
+    q = f"'{period_folder_id}' in parents and trashed=false and name='{filename}'"
+    res = service.files().list(q=q, fields="files(id,name)", pageSize=5).execute()
+    files = res.get("files", [])
+    if files:
+        return files[0]["id"]
 
-    print("❌ PDF NO ENCONTRADO")
+    print("🔎 NO ENCONTRÉ:", filename, "en carpeta período:", period_folder_id)
     return None
+
 
 def list_periods_for_cuil(tenant_slug: str, cuil: str) -> List[str]:
     t = get_tenant(tenant_slug)
@@ -1502,6 +1496,28 @@ def admin_reset():
 
     return redirect(f"/admin/panel?tenant={tenant}&token={token}&msg=reset_ok&period={period}")
 
+def _drive_list_children(parent_id: str, page_size: int = 30):
+    service = drive_service()
+    q = f"'{parent_id}' in parents and trashed=false"
+    res = service.files().list(
+        q=q,
+        fields="files(id,name,mimeType)",
+        pageSize=page_size
+    ).execute()
+    return res.get("files", [])
+
+def _drive_find_folder_by_name(parent_id: str, name: str) -> str | None:
+    service = drive_service()
+    q = (
+        f"'{parent_id}' in parents and trashed=false "
+        f"and mimeType='application/vnd.google-apps.folder' "
+        f"and name='{name}'"
+    )
+    res = service.files().list(q=q, fields="files(id,name)", pageSize=5).execute()
+    files = res.get("files", [])
+    return files[0]["id"] if files else None
+
+
 @app.post("/admin/send_template_queue_start")
 @admin_required
 def admin_send_template_queue_start():
@@ -1574,7 +1590,8 @@ def admin_send_template_queue_start():
 
         # 🔒 verificar PDF (solo si require_pdf=True)
         if require_pdf:
-            pdf_file_id = find_pdf_file_id(tenant, cuil, period)
+            pdf_file_id = find_pdf_file_id_for_cuil_period(tenant, cuil, period)
+
             if not pdf_file_id:
                 skipped_no_pdf += 1
                 print("SKIP (no pdf):", tenant, cuil, period)
