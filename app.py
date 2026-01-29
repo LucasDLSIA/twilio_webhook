@@ -835,6 +835,32 @@ def init_db():
     _try_alter(cur, "CREATE INDEX IF NOT EXISTS idx_sentpdfs_sid ON sent_pdfs(message_sid);")
     _try_alter(cur, "CREATE INDEX IF NOT EXISTS idx_verified_key ON verified_contacts(tenant, cuil, to_whatsapp);")
 
+    # =========
+    # verifications: vincula WhatsApp <-> CUIL (y opcional DNI hash)
+    # =========
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS verifications (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        tenant TEXT NOT NULL,
+        cuil TEXT NOT NULL,
+        to_whatsapp TEXT NOT NULL,
+        dni_hash TEXT,
+        dni_last4 TEXT,
+        verified_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL,
+        UNIQUE(tenant, cuil, to_whatsapp)
+    );
+    """)
+
+    _try_alter(cur, "ALTER TABLE verifications ADD COLUMN dni_hash TEXT;")
+    _try_alter(cur, "ALTER TABLE verifications ADD COLUMN dni_last4 TEXT;")
+    _try_alter(cur, "ALTER TABLE verifications ADD COLUMN verified_at INTEGER;")
+    _try_alter(cur, "ALTER TABLE verifications ADD COLUMN updated_at INTEGER;")
+
+    _try_alter(cur, "CREATE INDEX IF NOT EXISTS idx_verif_tenant_cuil ON verifications(tenant, cuil);")
+    _try_alter(cur, "CREATE INDEX IF NOT EXISTS idx_verif_tenant_wa ON verifications(tenant, to_whatsapp);")
+
+
     conn.commit()
     conn.close()
 
@@ -876,9 +902,88 @@ def cuil_to_dni(cuil: str) -> str | None:
         return None
     return d[2:10]  # 8 dígitos
 
-def dni_hash(dni: str) -> str:
-    # no guardamos el DNI plano
-    return hashlib.sha256(dni.encode("utf-8")).hexdigest()
+import hashlib
+
+def _hash_dni(dni: str) -> tuple[str, str]:
+    dni_digits = "".join(ch for ch in (dni or "") if ch.isdigit())
+    last4 = dni_digits[-4:] if len(dni_digits) >= 4 else dni_digits
+    h = hashlib.sha256(dni_digits.encode("utf-8")).hexdigest() if dni_digits else ""
+    return h, last4
+
+def is_verified(tenant: str, cuil: str, to_whatsapp: str) -> bool:
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute("""
+      SELECT 1 FROM verifications
+      WHERE tenant=? AND cuil=? AND to_whatsapp=?
+      LIMIT 1
+    """, (tenant, cuil, to_whatsapp))
+    ok = cur.fetchone() is not None
+    conn.close()
+    return ok
+
+def upsert_verification(tenant: str, cuil: str, to_whatsapp: str, dni: str | None = None):
+    now = int(time.time())
+    dni_hash, dni_last4 = _hash_dni(dni or "")
+    conn = get_db_connection()
+    cur = conn.cursor()
+
+    # Upsert “manual” compatible sin depender de UNIQUE en DB vieja
+    cur.execute("""
+      SELECT id FROM verifications
+      WHERE tenant=? AND cuil=? AND to_whatsapp=?
+      LIMIT 1
+    """, (tenant, cuil, to_whatsapp))
+    row = cur.fetchone()
+
+    if row:
+        cur.execute("""
+          UPDATE verifications
+          SET dni_hash=?, dni_last4=?, updated_at=?
+          WHERE id=?
+        """, (dni_hash or None, dni_last4 or None, now, row[0]))
+    else:
+        cur.execute("""
+          INSERT INTO verifications (tenant, cuil, to_whatsapp, dni_hash, dni_last4, verified_at, updated_at)
+          VALUES (?, ?, ?, ?, ?, ?, ?)
+        """, (tenant, cuil, to_whatsapp, dni_hash or None, dni_last4 or None, now, now))
+
+    conn.commit()
+    conn.close()
+
+def delete_verification(tenant: str, cuil: str, to_whatsapp: str):
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute("""
+      DELETE FROM verifications
+      WHERE tenant=? AND cuil=? AND to_whatsapp=?
+    """, (tenant, cuil, to_whatsapp))
+    conn.commit()
+    conn.close()
+
+def get_verifications_rows(tenant: str):
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute("""
+      SELECT tenant, cuil, to_whatsapp, dni_last4, verified_at, updated_at
+      FROM verifications
+      WHERE tenant=?
+      ORDER BY updated_at DESC
+    """, (tenant,))
+    rows = cur.fetchall()
+    conn.close()
+
+    out = []
+    for t, c, w, last4, v_at, u_at in rows:
+        out.append({
+            "tenant": t,
+            "cuil": c,
+            "to_whatsapp": w,
+            "dni_last4": last4 or "",
+            "verified_at": v_at,
+            "updated_at": u_at,
+        })
+    return out
 
 def is_verified_contact(tenant: str, cuil: str, to_whatsapp: str) -> bool:
     conn = get_db_connection()
@@ -1114,6 +1219,120 @@ def admin_home():
         html.append("</ul>")
     return Response("".join(html), mimetype="text/html")
 
+from flask import send_file
+import pandas as pd
+import io
+
+@app.get("/admin/verifications.xlsx")
+@admin_required
+def admin_verifications_xlsx():
+    tenant = (request.args.get("tenant") or "").strip().lower()
+    rows = get_verifications_rows(tenant)
+
+    df = pd.DataFrame(rows)
+    # columnas “humanas”
+    if not df.empty:
+        df["verified_at"] = df["verified_at"].apply(ts_str)
+        df["updated_at"] = df["updated_at"].apply(ts_str)
+
+    out = io.BytesIO()
+    with pd.ExcelWriter(out, engine="openpyxl") as writer:
+        df.to_excel(writer, index=False, sheet_name="verificaciones")
+    out.seek(0)
+
+    fname = f"verificaciones_{tenant}.xlsx"
+    return send_file(out, as_attachment=True, download_name=fname,
+                     mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+
+
+@app.post("/admin/verifications_import")
+@admin_required
+def admin_verifications_import():
+    token = _get_admin_token_from_request()
+    tenant = (request.form.get("tenant") or "").strip().lower()
+
+    f = request.files.get("file")
+    if not f:
+        return Response("Falta archivo", status=400)
+
+    df = pd.read_excel(f)
+    if df is None or df.empty:
+        return Response("Excel vacío", status=400)
+
+    df.columns = [str(c).strip().lower() for c in df.columns]
+
+    def pick(*names):
+        for n in names:
+            if n in df.columns:
+                return n
+        return None
+
+    c_cuil = pick("cuil", "archivo", "archivo_norm")
+    c_wa = pick("whatsapp", "telefono", "tel", "celular", "numero")
+    c_dni = pick("dni", "documento", "doc")
+
+    if not c_cuil or not c_wa:
+        return Response("Columnas requeridas: cuil + whatsapp/telefono", status=400)
+
+    imported = 0
+    for _, r in df.iterrows():
+        cuil = str(r.get(c_cuil, "")).strip()
+        wa_raw = str(r.get(c_wa, "")).strip()
+        dni = str(r.get(c_dni, "")).strip() if c_dni else ""
+
+        if not cuil or not wa_raw:
+            continue
+
+        # normalizar whatsapp
+        tel_digits = "".join(ch for ch in wa_raw if ch.isdigit())
+        if not tel_digits:
+            continue
+        if not tel_digits.startswith("54"):
+            tel_digits = "54" + tel_digits
+        to_whatsapp = f"whatsapp:+{tel_digits}"
+
+        try:
+            cuil = strip_pdf(cuil)  # tu normalizador de cuil
+        except Exception:
+            pass
+
+        upsert_verification(tenant, cuil, to_whatsapp, dni=dni)
+        imported += 1
+
+    return redirect(f"/admin/panel?tenant={tenant}&token={token}&msg=verif_import_ok&n={imported}")
+
+
+@app.post("/admin/verifications_update")
+@admin_required
+def admin_verifications_update():
+    token = _get_admin_token_from_request()
+    tenant = (request.form.get("tenant") or "").strip().lower()
+    cuil = (request.form.get("cuil") or "").strip()
+    to_whatsapp = (request.form.get("to_whatsapp") or "").strip()
+    dni = (request.form.get("dni") or "").strip()
+
+    if not (tenant and cuil and to_whatsapp):
+        return Response("Faltan datos", status=400)
+
+    upsert_verification(tenant, cuil, to_whatsapp, dni=dni)
+    return redirect(f"/admin/panel?tenant={tenant}&token={token}&msg=verif_updated")
+
+
+@app.post("/admin/verifications_delete")
+@admin_required
+def admin_verifications_delete():
+    token = _get_admin_token_from_request()
+    tenant = (request.form.get("tenant") or "").strip().lower()
+    cuil = (request.form.get("cuil") or "").strip()
+    to_whatsapp = (request.form.get("to_whatsapp") or "").strip()
+
+    if not (tenant and cuil and to_whatsapp):
+        return Response("Faltan datos", status=400)
+
+    delete_verification(tenant, cuil, to_whatsapp)
+    return redirect(f"/admin/panel?tenant={tenant}&token={token}&msg=verif_deleted")
+
+
 @app.get("/admin/panel")
 def admin_panel():
     auth = require_admin()
@@ -1156,22 +1375,95 @@ def admin_panel():
     html.append("</form>")
 
     html.append("<hr>")
-    html.append("<h3>Reportes</h3>")
-    html.append(f"""
-    <form method="get" action="/admin/report_recibos.xlsx" style="margin-bottom:10px;">
-        <input type="hidden" name="token" value="{esc(token)}">
-        <input type="hidden" name="tenant" value="{esc(tenant)}">
-        <label>Período (opcional mm/aaaa):</label>
-        <input type="text" name="period" placeholder="01/2026" style="margin-left:8px;">
-        <button type="submit">📄 Descargar reporte recibos (XLSX)</button>
-    </form>
+    # ---- Selector periodo reportes ----
+    selected_period = (request.args.get("period") or "").strip()
 
-    <p>
-        <a href="/admin/report_envios.csv?tenant={esc(tenant)}&token={esc(token)}">
-        📄 Envíos realizados (CSV)
-        </a>
-    </p>
+    html.append("<hr>")
+    html.append("<h3>Reportes</h3>")
+    html.append("<form method='get' action='/admin/panel'>")
+    html.append(f"<input type='hidden' name='token' value='{esc(token)}'>")
+    html.append(f"<input type='hidden' name='tenant' value='{esc(tenant)}'>")
+    html.append("<label>Período para reportes (mm/aaaa):</label> ")
+    html.append(f"<input type='text' name='period' value='{esc(selected_period)}' placeholder='01/2026'> ")
+    html.append("<button type='submit'>Aplicar</button>")
+    html.append("</form>")
+
+    html.append(
+    f"<p><a href='/admin/report_recibos.xlsx?tenant={esc(tenant)}&period={esc(selected_period)}&token={esc(token)}'>"
+    "📄 Descargar reporte de recibos</a></p>"
+    )
+    html.append(
+    f"<p><a href='/admin/report_envios.csv?tenant={esc(tenant)}&token={esc(token)}'>"
+    "📄 Envíos realizados (CSV)</a></p>"
+    )
+
+    # ---- Verificaciones ----
+    html.append("<hr>")
+    html.append("<h3>Verificaciones</h3>")
+    html.append("<p>Podés importar desde Excel y también editar/borrar a mano.</p>")
+
+    html.append("<div style='display:flex; gap:12px; flex-wrap:wrap;'>")
+
+    # Descargar excel verificaciones
+    html.append(
+    f"<a class='btn' href='/admin/verifications.xlsx?tenant={esc(tenant)}&token={esc(token)}'>"
+    "⬇️ Descargar verificaciones (XLSX)</a>"
+    )
+
+    # Importar excel verificaciones
+    html.append(f"""
+    <form method="post" action="/admin/verifications_import" enctype="multipart/form-data" style="border:1px solid #ddd;padding:10px;border-radius:8px;">
+    <input type="hidden" name="token" value="{esc(token)}">
+    <input type="hidden" name="tenant" value="{esc(tenant)}">
+    <div><b>Importar verificaciones</b></div>
+    <input type="file" name="file" accept=".xlsx" required>
+    <button type="submit">Importar</button>
+    <div style="font-size:12px;color:#666;margin-top:6px;">
+        Columnas requeridas: <code>cuil</code>, <code>whatsapp</code> (o teléfono). Opcional: <code>dni</code>.
+    </div>
+    </form>
     """)
+
+    html.append("</div>")
+
+    # Tabla editable
+    verifs = get_verifications_rows(tenant)
+    html.append(f"<p>Registros: {len(verifs)}</p>")
+
+    if verifs:
+        html.append("<table border='1' cellpadding='6' cellspacing='0'>")
+        html.append("<tr><th>CUIL</th><th>WhatsApp</th><th>DNI (últ 4)</th><th>Verificado</th><th>Acciones</th></tr>")
+        for r in verifs[:200]:
+            html.append("<tr>")
+            html.append(f"<td>{esc(r['cuil'])}</td>")
+            html.append(f"<td>{esc(r['to_whatsapp'])}</td>")
+            html.append(f"<td>{esc(r['dni_last4'])}</td>")
+            html.append(f"<td>{esc(ts_str(r['verified_at']))}</td>")
+            html.append("<td>")
+            # Editar (simple: re-ingresar dni)
+            html.append(f"""
+            <form method="post" action="/admin/verifications_update" style="display:inline;">
+                <input type="hidden" name="token" value="{esc(token)}">
+                <input type="hidden" name="tenant" value="{esc(tenant)}">
+                <input type="hidden" name="cuil" value="{esc(r['cuil'])}">
+                <input type="hidden" name="to_whatsapp" value="{esc(r['to_whatsapp'])}">
+                <input type="text" name="dni" placeholder="DNI (opcional)" style="width:120px;">
+                <button type="submit">Guardar</button>
+            </form>
+            <form method="post" action="/admin/verifications_delete" style="display:inline;margin-left:6px;" onsubmit="return confirm('¿Borrar verificación?');">
+                <input type="hidden" name="token" value="{esc(token)}">
+                <input type="hidden" name="tenant" value="{esc(tenant)}">
+                <input type="hidden" name="cuil" value="{esc(r['cuil'])}">
+                <input type="hidden" name="to_whatsapp" value="{esc(r['to_whatsapp'])}">
+                <button type="submit" class="btn-danger">Borrar</button>
+            </form>
+            """)
+            html.append("</td>")
+            html.append("</tr>")
+        html.append("</table>")
+    else:
+        html.append("<p>No hay verificaciones cargadas.</p>")
+
 
 
 
@@ -1888,91 +2180,88 @@ def twilio_inbound():
     cuil = pending["cuil"]
     period = pending["period"]
     step = (pending.get("step") or "READY").upper()
-    print("STEP:", step, "BODY_DIGITS:", "".join(ch for ch in body if ch.isdigit()))
+
+    print("STEP:", step, "BODY_DIGITS:", _digits(body))
 
     # 🔒 Si ya cerró, no hacer nada más
     estado = get_recibo_estado(tenant, cuil, period)
     if estado in ("FIRMADO", "OBSERVADO"):
         msg = "✅ Este recibo ya fue firmado." if estado == "FIRMADO" else "📝 Este recibo quedó como observado."
-        return Response(f"<Response><Message>{msg}</Message></Response>", mimetype="application/xml", status=200)
+        return twiml(msg)
 
-    # 0) Si estamos esperando DNI, tratamos el body como DNI
+    # =========================
+    # 0) Estamos esperando DNI
+    # =========================
     if step == "AWAIT_DNI":
         dni_user = _digits(body)
 
-        # si tocó botones mientras pedíamos DNI, lo guiamos
+        # Si tocó botones mientras pedíamos DNI
         if button:
-            return Response(
-                "<Response><Message>🔐 Para continuar, enviá tu DNI (solo números).</Message></Response>",
-                mimetype="application/xml",
-                status=200
-            )
+            return twiml("🔐 Para continuar, enviá tu DNI (solo números).")
 
         dni_expected = cuil_to_dni(cuil)
         if not dni_expected or len(dni_user) < 7:
             inc_pending_dni_attempts(pending["id"])
-            return Response(
-                "<Response><Message>🔐 Enviá tu DNI (solo números, sin puntos). Ej: 28169249</Message></Response>",
-                mimetype="application/xml",
-                status=200
-            )
+            return twiml("🔐 Enviá tu DNI (solo números, sin puntos). Ej: 28169249")
 
         if dni_user != dni_expected:
             tries = inc_pending_dni_attempts(pending["id"])
             if tries >= 3:
-                # seguridad: cortamos para evitar brute force
                 consume_pending_view(pending["id"])
-                return Response(
-                    "<Response><Message>❌ DNI incorrecto (3 intentos). Volvé a solicitar el recibo desde el mensaje inicial.</Message></Response>",
-                    mimetype="application/xml",
-                    status=200
-                )
-            return Response(
-                f"<Response><Message>❌ DNI incorrecto. Intento {tries}/3. Probá de nuevo (solo números).</Message></Response>",
-                mimetype="application/xml",
-                status=200
-            )
+                return twiml("❌ DNI incorrecto (3 intentos). Volvé a solicitar el recibo desde el mensaje inicial.")
+            return twiml(f"❌ DNI incorrecto. Intento {tries}/3. Probá de nuevo (solo números).")
 
-        # ✅ verificado
+        # ✅ DNI OK -> verificamos, volvemos a READY y enviamos PDF
         set_verified_contact(tenant, cuil, from_whatsapp, dni_user)
         set_pending_step(pending["id"], "READY")
 
-        # ahora sí mandamos el PDF como si hubiera tocado VIEW_NOW
-        return _send_pdf_flow(from_whatsapp, tenant, cuil, period)
+        try:
+            _send_pdf_flow(from_whatsapp, tenant, cuil, period)
+        except Exception as e:
+            print("ERROR _send_pdf_flow after DNI:", e)
+            return twiml("✅ DNI verificado, pero hubo un error enviando el recibo. Avisá a RRHH.")
 
+        return twiml("✅ DNI verificado. Te envío el recibo ahora.")
+
+    # =========================
     # 1) VIEW_NOW
+    # =========================
     if button == "VIEW_NOW" or body == "VIEW_NOW":
-        # ✅ si NO está verificado, pedimos DNI
+        # Si NO está verificado, pedir DNI
         if not is_verified_contact(tenant, cuil, from_whatsapp):
             set_pending_step(pending["id"], "AWAIT_DNI")
-            return Response(
-                "<Response><Message>🔐 Para ver tu recibo, enviá tu DNI (solo números, sin puntos).</Message></Response>",
-                mimetype="application/xml",
-                status=200
-            )
+            return twiml("🔐 Para ver tu recibo, enviá tu DNI (solo números, sin puntos).")
 
-        # ✅ ya verificado: mandamos directo
-        return _send_pdf_flow(from_whatsapp, tenant, cuil, period)
+        # Ya verificado: enviamos directo
+        try:
+            _send_pdf_flow(from_whatsapp, tenant, cuil, period)
+        except Exception as e:
+            print("ERROR _send_pdf_flow on VIEW_NOW:", e)
+            return twiml("❌ No pude enviar el PDF en este momento. Avisá a RRHH.")
+        return twiml("📄 Perfecto. Te envío el recibo ahora.")
 
+    # =========================
     # 2) NO_NEED
+    # =========================
     if button == "NO_NEED" or body == "NO_NEED":
         set_recibo_estado(tenant, cuil, period, "NO_NEED")
         consume_pending_view(pending["id"])
-        return Response("<Response><Message>✅ Perfecto, no hay problema.</Message></Response>", mimetype="application/xml", status=200)
+        return twiml("✅ Perfecto, no hay problema.")
 
+    # =========================
     # 3) SIGN_OK / SIGN_OBS
+    # =========================
     if button in ("SIGN_OK", "SIGN_OBS") or body in ("SIGN_OK", "SIGN_OBS"):
         if button == "SIGN_OK" or body == "SIGN_OK":
             set_recibo_estado(tenant, cuil, period, "FIRMADO")
             consume_pending_view(pending["id"])
-            return Response("<Response><Message>✅ Recibo firmado. ¡Gracias!</Message></Response>", mimetype="application/xml", status=200)
+            return twiml("✅ Recibo firmado. ¡Gracias!")
         else:
             set_recibo_estado(tenant, cuil, period, "OBSERVADO")
             consume_pending_view(pending["id"])
-            return Response("<Response><Message>📝 Recibo observado. Vamos a revisarlo y te contactamos.</Message></Response>", mimetype="application/xml", status=200)
+            return twiml("📝 Recibo observado. Vamos a revisarlo y te contactamos.")
 
     return Response("OK", status=200)
-
 
 def _send_pdf_flow(from_whatsapp: str, tenant: str, cuil: str, period: str):
     # ⚠️ opcional pero recomendado: re-chequear que exista PDF antes de enviar
