@@ -322,6 +322,21 @@ def _drive_find_child_by_exact_name(service, parent_id: str, name: str, mime_typ
     files = res.get("files", [])
     return files[0]["id"] if files else None
 
+def debug_list_pdfs_in_folder(folder_id: str):
+    service = drive_service()
+    q = f"'{folder_id}' in parents and trashed=false and mimeType='application/pdf'"
+    res = service.files().list(
+        q=q,
+        fields="files(id,name)",
+        pageSize=50
+    ).execute()
+
+    files = res.get("files", [])
+    print("📂 DEBUG PDFs en carpeta", folder_id)
+    if not files:
+        print("   (no hay PDFs)")
+    for f in files:
+        print("   -", f["name"], "| id:", f["id"])
 
 
 # Drive: PDF
@@ -1383,51 +1398,40 @@ def _find_period_folder_id(service, root_id: str, period: str) -> str | None:
 
 
 def find_pdf_file_id(tenant: str, cuil: str, period: str) -> str | None:
-    """
-    Devuelve fileId del PDF en Drive o None si no existe PARA ESE PERÍODO.
-    Regla (recomendada): /root/{PERIODO}/{CUIL}.pdf
-
-    IMPORTANTE: /media/pdf debe usar esta misma función.
-    """
     t = get_tenant(tenant)
     if not t:
+        print("❌ tenant no encontrado:", tenant)
         return None
 
     root_id = (t.get("recibos_root_id") or "").strip()
+    print("ROOT_ID:", root_id)
+
     if not root_id:
+        print("❌ tenant sin recibos_root_id")
         return None
 
-    cuil = strip_pdf(cuil).strip()
-    period = (period or "").strip()
+    # ⚠️ acá todavía NO asumimos nada
+    # primero mostramos qué PDFs hay
+    debug_list_pdfs_in_folder(root_id)
+
+    filename = f"{strip_pdf(cuil)}.pdf"
+    print("BUSCANDO PDF:", filename)
 
     service = drive_service()
-
-    # 1) Buscar carpeta del período (si no existe -> NO HAY PDF para ese período)
-    period_folder_id = _find_period_folder_id(service, root_id, period)
-    if not period_folder_id:
-        return None
-
-    # 2) Buscar archivo dentro de esa carpeta
-    filename = f"{cuil}.pdf"
-
-    q_exact = (
-        f"'{period_folder_id}' in parents and trashed=false "
+    q = (
+        f"'{root_id}' in parents and trashed=false "
         f"and name='{filename}'"
     )
-    res = service.files().list(q=q_exact, fields="files(id,name)", pageSize=1).execute()
+
+    res = service.files().list(q=q, fields="files(id,name)", pageSize=1).execute()
     files = res.get("files", [])
     if files:
+        print("✅ PDF ENCONTRADO:", files[0]["name"])
         return files[0]["id"]
 
-    # 3) Fallback: por si el nombre no es exacto pero contiene el CUIL
-    q_contains = (
-        f"'{period_folder_id}' in parents and trashed=false "
-        f"and mimeType='application/pdf' "
-        f"and name contains '{cuil}'"
-    )
-    res = service.files().list(q=q_contains, fields="files(id,name)", pageSize=1).execute()
-    files = res.get("files", [])
-    return files[0]["id"] if files else None
+    print("❌ PDF NO ENCONTRADO:", filename)
+    return None
+
 
 
 @app.post("/twilio/webhook")
