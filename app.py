@@ -155,66 +155,76 @@ def download_excel_df(file_id: str) -> pd.DataFrame:
 # =========================
 # Tenants (Empresas.xlsx)
 # =========================
-def load_tenants(force: bool = False) -> List[dict]:
-    if not EMPRESAS_FILE_ID:
-        return []
+_TENANTS_CACHE = {"ts": 0, "items": []}
+_TENANTS_TTL = 60  # segundos
 
+def load_tenants(force: bool = False) -> list[dict]:
+    """
+    Lee el Excel maestro (EMPRESAS_FILE_ID) y devuelve tenants normalizados.
+    Soporta headers: Empresa, Envios_File_ID, Drive_Root_ID (case-insensitive)
+    y también: slug, display_name, envios_file_id, recibos_root_id, drive_root_id, root_id.
+    """
     now = time.time()
-    if (not force) and _EMP_CACHE["rows"] and (now - _EMP_CACHE["ts"] < CACHE_TTL):
-        return _EMP_CACHE["rows"]
+    if (not force) and _TENANTS_CACHE["items"] and (now - _TENANTS_CACHE["ts"] < _TENANTS_TTL):
+        return _TENANTS_CACHE["items"]
 
     df = download_excel_df(EMPRESAS_FILE_ID)
-
-    # Formato esperado:
-    # Empresa | Envios_File_ID | Drive_Root_ID
-    cols_lower = {c.lower(): c for c in df.columns}
-
-    def get_col(*names):
-        for n in names:
-            if n.lower() in cols_lower:
-                return cols_lower[n.lower()]
-        return None
-
-    c_empresa = get_col("Empresa", "empresa", "display_name", "nombre")
-    c_envios = get_col("Envios_File_ID", "envios_file_id", "envios")
-    c_root = get_col("Drive_Root_ID", "drive_root_id", "recibos_root_id", "root_id")
-
-    if not (c_empresa and c_envios and c_root):
+    if df is None or df.empty:
+        _TENANTS_CACHE.update({"ts": now, "items": []})
         return []
 
-    tenants: List[dict] = []
+    df.columns = [str(c).strip().lower() for c in df.columns]
+
+    def pick(*names):
+        for n in names:
+            if n in df.columns:
+                return n
+        return None
+
+    c_slug = pick("slug", "empresa", "tenant")
+    c_name = pick("display_name", "nombre", "name", "empresa")
+    c_env  = pick("envios_file_id", "envios_file_id ", "envios", "envios_id", "envios_file", "enviosfileid")
+    c_root = pick("drive_root_id", "recibos_root_id", "root_id", "drive_root_folder_id", "carpeta_root_id", "drive_root")
+
+    # MUY IMPORTANTE: tu Excel real trae Envios_File_ID y Drive_Root_ID
+    # al bajar a lower quedan: envios_file_id y drive_root_id → con esto lo levanta.
+
+    items = []
     for _, r in df.iterrows():
-        empresa = str(r.get(c_empresa, "")).strip()
-        env_id = str(r.get(c_envios, "")).strip()
-        root_id = str(r.get(c_root, "")).strip()
-        if not empresa or not env_id or not root_id:
+        raw_slug = str(r.get(c_slug, "")).strip()
+        if not raw_slug:
             continue
-        tenants.append(
-            {
-                "slug": slugify(empresa),
-                "display_name": empresa,
-                "envios_file_id": env_id,
-                "drive_root_id": root_id,
-            }
-        )
 
-    # dedupe por slug
-    seen = set()
-    out = []
-    for t in tenants:
-        if t["slug"] in seen:
-            continue
-        seen.add(t["slug"])
-        out.append(t)
+        slug = slugify(raw_slug)  # o tu normalizador de slug
+        display_name = str(r.get(c_name, raw_slug)).strip() if c_name else raw_slug
 
-    _EMP_CACHE["rows"] = out
-    _EMP_CACHE["ts"] = now
-    return out
+        envios_file_id = str(r.get(c_env, "")).strip() if c_env else ""
+        drive_root_id  = str(r.get(c_root, "")).strip() if c_root else ""
 
-def get_tenant(tenant_slug: str) -> Optional[dict]:
-    tenant_slug = (tenant_slug or "").strip().lower()
+        # Normalizamos claves: SIEMPRE devolvemos ambos nombres
+        items.append({
+            "slug": slug,
+            "display_name": display_name,
+            "envios_file_id": envios_file_id,
+            "drive_root_id": drive_root_id,
+            "recibos_root_id": drive_root_id,   # compatibilidad con funciones viejas
+        })
+
+    _TENANTS_CACHE.update({"ts": now, "items": items})
+    return items
+
+def get_tenant(slug: str) -> dict | None:
+    slug = (slug or "").strip().lower()
+    if not slug:
+        return None
+
     for t in load_tenants():
-        if t["slug"] == tenant_slug:
+        if (t.get("slug") or "").strip().lower() == slug:
+            # fallback por si falta alguno
+            if not t.get("recibos_root_id") and t.get("drive_root_id"):
+                t["recibos_root_id"] = t["drive_root_id"]
+            if not t.get("drive_root_id") and t.get("recibos_root_id"):
+                t["drive_root_id"] = t["recibos_root_id"]
             return t
     return None
 
@@ -1398,39 +1408,36 @@ def _find_period_folder_id(service, root_id: str, period: str) -> str | None:
 
 
 def find_pdf_file_id(tenant: str, cuil: str, period: str) -> str | None:
+    """
+    Busca el PDF {cuil}.pdf en el root del tenant.
+    (Misma lógica que /media/pdf)
+    """
     t = get_tenant(tenant)
     if not t:
-        print("❌ tenant no encontrado:", tenant)
+        print("❌ tenant inválido:", tenant)
         return None
 
-    root_id = (t.get("recibos_root_id") or "").strip()
+    root_id = (t.get("drive_root_id") or t.get("recibos_root_id") or "").strip()
     print("ROOT_ID:", root_id)
 
     if not root_id:
-        print("❌ tenant sin recibos_root_id")
+        print("❌ tenant sin drive_root_id/recibos_root_id:", tenant, t)
         return None
 
-    # ⚠️ acá todavía NO asumimos nada
-    # primero mostramos qué PDFs hay
-    debug_list_pdfs_in_folder(root_id)
-
-    filename = f"{strip_pdf(cuil)}.pdf"
-    print("BUSCANDO PDF:", filename)
+    cuil = strip_pdf(cuil).strip()
+    filename = f"{cuil}.pdf"
 
     service = drive_service()
-    q = (
-        f"'{root_id}' in parents and trashed=false "
-        f"and name='{filename}'"
-    )
 
-    res = service.files().list(q=q, fields="files(id,name)", pageSize=1).execute()
+    q = f"'{root_id}' in parents and trashed=false and name='{filename}'"
+    res = service.files().list(q=q, fields="files(id,name)", pageSize=5).execute()
     files = res.get("files", [])
-    if files:
-        print("✅ PDF ENCONTRADO:", files[0]["name"])
-        return files[0]["id"]
 
-    print("❌ PDF NO ENCONTRADO:", filename)
-    return None
+    # debug útil
+    if not files:
+        print("🔎 NO ENCONTRÉ:", filename, "en root:", root_id)
+
+    return files[0]["id"] if files else None
 
 
 
@@ -1567,16 +1574,11 @@ def admin_send_template_queue_start():
 
         # 🔒 verificar PDF (solo si require_pdf=True)
         if require_pdf:
-            try:
-                pdf_file_id = find_pdf_file_id(tenant, cuil, period)
-            except Exception:
-                pdf_file_id = None
-
+            pdf_file_id = find_pdf_file_id(tenant, cuil, period)
             if not pdf_file_id:
                 skipped_no_pdf += 1
                 print("SKIP (no pdf):", tenant, cuil, period)
-                continue  # ⛔ NO MANDA PLANTILLA
-
+                continue
         # ✅ Recién ahora mandamos VIEW_NOW
         try:
             sid = send_whatsapp_template(
