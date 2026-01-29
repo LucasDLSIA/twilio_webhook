@@ -265,8 +265,46 @@ def find_person_by_cuil(envios_rows: List[dict], cuil: str) -> Optional[dict]:
 # =========================
 # Drive: PDF
 # =========================
-def find_pdf_file_id_for_cuil_period(tenant: str, cuil: str, period: str) -> str | None:
-    return find_pdf_file_id(tenant, cuil, period)
+def find_pdf_file_id_for_cuil_period(tenant_slug: str, cuil: str, period: str) -> Optional[str]:
+    t = get_tenant(tenant_slug)
+    if not t:
+        return None
+
+    service = drive_service()
+    root_id = t["drive_root_id"]
+    folder_name = period_to_folder_name(period)
+    filename = f"{cuil}.pdf"
+
+    # Carpeta del período
+    folder_res = service.files().list(
+        q=(
+            f"'{root_id}' in parents and "
+            f"mimeType='application/vnd.google-apps.folder' and "
+            f"name='{folder_name}' and trashed=false"
+        ),
+        fields="files(id,name)",
+        pageSize=5,
+    ).execute().get("files", [])
+
+    if not folder_res:
+        return None
+
+    period_folder_id = folder_res[0]["id"]
+
+    # PDF dentro de carpeta
+    file_res = service.files().list(
+        q=(
+            f"'{period_folder_id}' in parents and "
+            f"name='{filename}' and mimeType='application/pdf' and trashed=false"
+        ),
+        fields="files(id,name)",
+        pageSize=1,
+    ).execute().get("files", [])
+
+    if not file_res:
+        return None
+
+    return file_res[0]["id"]
 
 def list_periods_for_cuil(tenant_slug: str, cuil: str) -> List[str]:
     t = get_tenant(tenant_slug)
