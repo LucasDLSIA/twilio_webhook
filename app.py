@@ -437,37 +437,6 @@ def list_periods_for_cuil(tenant_slug: str, cuil: str) -> List[str]:
 # =========================
 # Media endpoint (Twilio descarga PDF desde acá)
 # =========================
-@app.get("/media/pdf")
-def media_pdf():
-    token = request.args.get("token", "").strip()
-    if ADMIN_TOKEN and token != ADMIN_TOKEN:
-        return Response("Unauthorized", status=401)
-
-    tenant = (request.args.get("tenant") or "").strip().lower()
-    cuil = (request.args.get("cuil") or "").strip()
-    period = (request.args.get("period") or "").strip()
-
-    if not (tenant and cuil and period):
-        return Response("Faltan parámetros tenant/cuil/period", status=400)
-
-    file_id = find_pdf_file_id_for_cuil_period(tenant, cuil, period)
-    if not file_id:
-        return Response("PDF no encontrado", status=404)
-
-    service = drive_service()
-    req = service.files().get_media(fileId=file_id)
-    fh = io.BytesIO()
-    downloader = MediaIoBaseDownload(fh, req)
-    done = False
-    while not done:
-        _, done = downloader.next_chunk()
-    fh.seek(0)
-
-    data = fh.read()
-    resp = Response(data, mimetype="application/pdf")
-    resp.headers["Content-Disposition"] = f'inline; filename="{strip_pdf(cuil)}.pdf"'
-    return resp
-
 # =========================
 @app.get("/media/pdf")
 def media_pdf():
