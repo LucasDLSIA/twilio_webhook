@@ -357,55 +357,47 @@ def find_pdf_file_id_for_cuil_period(tenant: str, cuil: str, period: str) -> str
         print("❌ tenant inválido:", tenant)
         return None
 
-    root_id = (t.get("drive_root_id") or t.get("recibos_root_id") or "").strip()
+    root_id = (t.get("recibos_root_id") or t.get("drive_root_id") or "").strip()
     if not root_id:
-        print("❌ tenant sin root_id:", tenant, t)
+        print("❌ tenant sin recibos_root_id:", tenant)
         return None
 
     cuil = strip_pdf(cuil).strip()
     filename = f"{cuil}.pdf"
 
-    # Normalizo period a variantes típicas de carpeta
-    p = period.strip()
-    variants = {p, p.replace("/", "-"), p.replace("/", "_")}
+    # el root tiene subcarpetas por período tipo "12-2025"
+    # si te pasan "12/2025", lo convertimos
+    period = period.strip()
+    period_folder_name = period.replace("/", "-")
 
     service = drive_service()
 
-    # DEBUG: listar carpetas del root
-    print("ROOT_ID:", root_id)
-    root_children = _drive_list_children(root_id, page_size=30)
-    print("📂 ROOT children sample:", [(x["name"], x["mimeType"]) for x in root_children[:15]])
+    # 1) buscar carpeta del período dentro del root
+    q_folder = (
+        f"'{root_id}' in parents and trashed=false "
+        f"and mimeType='application/vnd.google-apps.folder' "
+        f"and name='{period_folder_name}'"
+    )
+    res = service.files().list(q=q_folder, fields="files(id,name)", pageSize=5).execute()
+    folders = res.get("files", [])
+    if not folders:
+        print(f"❌ No encontré carpeta período '{period_folder_name}' en root {root_id}")
+        return None
 
-    # 1) Buscar carpeta de período
-    period_folder_id = None
-    for v in variants:
-        fid = _drive_find_folder_by_name(root_id, v)
-        if fid:
-            period_folder_id = fid
-            print("✅ Period folder:", v, fid)
-            break
+    period_id = folders[0]["id"]
 
-    # 2) Si no hay carpeta por período, intentar buscar el PDF directo en root (fallback)
-    if not period_folder_id:
-        print("⚠️ No encontré carpeta de período. Busco PDF directo en root:", filename)
-        q = f"'{root_id}' in parents and trashed=false and name='{filename}'"
-        res = service.files().list(q=q, fields="files(id,name)", pageSize=5).execute()
-        files = res.get("files", [])
-        return files[0]["id"] if files else None
+    # 2) buscar el PDF dentro de esa carpeta
+    q_pdf = (
+        f"'{period_id}' in parents and trashed=false "
+        f"and name='{filename}'"
+    )
+    res2 = service.files().list(q=q_pdf, fields="files(id,name)", pageSize=5).execute()
+    files = res2.get("files", [])
+    if not files:
+        print(f"❌ No encontré {filename} dentro de carpeta período {period_folder_name} ({period_id})")
+        return None
 
-    # DEBUG: listar archivos dentro del periodo
-    period_children = _drive_list_children(period_folder_id, page_size=50)
-    print("📄 PERIOD children sample:", [x["name"] for x in period_children[:25]])
-
-    # 3) Buscar el PDF dentro de la carpeta del período
-    q = f"'{period_folder_id}' in parents and trashed=false and name='{filename}'"
-    res = service.files().list(q=q, fields="files(id,name)", pageSize=5).execute()
-    files = res.get("files", [])
-    if files:
-        return files[0]["id"]
-
-    print("🔎 NO ENCONTRÉ:", filename, "en carpeta período:", period_folder_id)
-    return None
+    return files[0]["id"]
 
 
 def list_periods_for_cuil(tenant_slug: str, cuil: str) -> List[str]:
@@ -447,8 +439,6 @@ def list_periods_for_cuil(tenant_slug: str, cuil: str) -> List[str]:
 # =========================
 @app.get("/media/pdf")
 def media_pdf():
-    print("\n=== MEDIA PDF ===")
-    print("ARGS:", dict(request.args))
     token = request.args.get("token", "").strip()
     if ADMIN_TOKEN and token != ADMIN_TOKEN:
         return Response("Unauthorized", status=401)
@@ -460,8 +450,7 @@ def media_pdf():
     if not (tenant and cuil and period):
         return Response("Faltan parámetros tenant/cuil/period", status=400)
 
-    # ✅ MISMA FUNCIÓN que usás para validar existencia antes de mandar plantilla
-    file_id = find_pdf_file_id(tenant, cuil, period)
+    file_id = find_pdf_file_id_for_cuil_period(tenant, cuil, period)
     if not file_id:
         return Response("PDF no encontrado", status=404)
 
@@ -480,6 +469,38 @@ def media_pdf():
     return resp
 
 # =========================
+@app.get("/media/pdf")
+def media_pdf():
+    token = request.args.get("token", "").strip()
+    if ADMIN_TOKEN and token != ADMIN_TOKEN:
+        return Response("Unauthorized", status=401)
+
+    tenant = (request.args.get("tenant") or "").strip().lower()
+    cuil = (request.args.get("cuil") or "").strip()
+    period = (request.args.get("period") or "").strip()
+
+    if not (tenant and cuil and period):
+        return Response("Faltan parámetros tenant/cuil/period", status=400)
+
+    file_id = find_pdf_file_id_for_cuil_period(tenant, cuil, period)
+    if not file_id:
+        return Response("PDF no encontrado", status=404)
+
+    service = drive_service()
+    req = service.files().get_media(fileId=file_id)
+    fh = io.BytesIO()
+    downloader = MediaIoBaseDownload(fh, req)
+    done = False
+    while not done:
+        _, done = downloader.next_chunk()
+    fh.seek(0)
+
+    data = fh.read()
+    resp = Response(data, mimetype="application/pdf")
+    resp.headers["Content-Disposition"] = f'inline; filename="{strip_pdf(cuil)}.pdf"'
+    return resp
+
+
 # Twilio senders
 # =========================
 def _twilio_client() -> Client:
@@ -782,6 +803,15 @@ def init_db():
     _try_alter(cur, "CREATE INDEX IF NOT EXISTS idx_msg_key ON message_status(tenant, cuil, period, kind);")
     _try_alter(cur, "CREATE INDEX IF NOT EXISTS idx_msg_sid ON message_status(message_sid);")
     _try_alter(cur, "CREATE INDEX IF NOT EXISTS idx_sentpdfs_sid ON sent_pdfs(message_sid);")
+        # === migraciones/columnas para status tracking ===
+    # columnas opcionales en sent_pdfs (solo si tu /twilio/status las usa)
+    _try_alter(cur, "ALTER TABLE sent_pdfs ADD COLUMN delivered_at INTEGER;")
+    _try_alter(cur, "ALTER TABLE sent_pdfs ADD COLUMN read_at INTEGER;")
+    _try_alter(cur, "ALTER TABLE sent_pdfs ADD COLUMN failed_at INTEGER;")
+    _try_alter(cur, "ALTER TABLE sent_pdfs ADD COLUMN error_code TEXT;")
+    _try_alter(cur, "ALTER TABLE sent_pdfs ADD COLUMN error_message TEXT;")
+    _try_alter(cur, "ALTER TABLE sent_pdfs ADD COLUMN status TEXT;")
+
 
     conn.commit()
     conn.close()
