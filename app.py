@@ -1223,6 +1223,18 @@ from flask import send_file
 import pandas as pd
 import io
 
+from datetime import datetime, timezone
+
+def ts_str(ts: int | None) -> str:
+    if not ts:
+        return ""
+    try:
+        # Render usa UTC en logs; acá lo mostramos simple en formato legible
+        return datetime.fromtimestamp(int(ts), tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+    except Exception:
+        return ""
+
+
 @app.get("/admin/verifications.xlsx")
 @admin_required
 def admin_verifications_xlsx():
@@ -1243,6 +1255,32 @@ def admin_verifications_xlsx():
     fname = f"verificaciones_{tenant}.xlsx"
     return send_file(out, as_attachment=True, download_name=fname,
                      mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+
+@app.get("/admin/verifications_template.xlsx")
+@admin_required
+def admin_verifications_template_xlsx():
+    from openpyxl import Workbook
+    import io
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Verificaciones"
+
+    ws.append(["tenant", "cuil", "whatsapp", "dni", "verified_at"])
+
+    # fila ejemplo (podés sacarla si no querés)
+    ws.append(["los-robles", "20-28169249-3", "whatsapp:+5491136222572", "28169249", ""])
+
+    buf = io.BytesIO()
+    wb.save(buf)
+    buf.seek(0)
+
+    resp = Response(
+        buf.read(),
+        mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    )
+    resp.headers["Content-Disposition"] = 'attachment; filename="verifications_template.xlsx"'
+    return resp
 
 
 @app.post("/admin/verifications_import")
@@ -1387,6 +1425,10 @@ def admin_panel():
     html.append(f"<input type='text' name='period' value='{esc(selected_period)}' placeholder='01/2026'> ")
     html.append("<button type='submit'>Aplicar</button>")
     html.append("</form>")
+    html.append(
+  f"<a href='/admin/verifications_template.xlsx?token={esc(token)}'>"
+  "⬇️ Descargar template de verificaciones</a>"
+    )
 
     html.append(
     f"<p><a href='/admin/report_recibos.xlsx?tenant={esc(tenant)}&period={esc(selected_period)}&token={esc(token)}'>"
