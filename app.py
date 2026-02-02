@@ -844,6 +844,9 @@ def init_db():
     _try_alter(cur, "CREATE INDEX IF NOT EXISTS idx_verif_tenant_cuil ON verifications(tenant, cuil);")
     _try_alter(cur, "CREATE INDEX IF NOT EXISTS idx_verif_tenant_wa ON verifications(tenant, to_whatsapp);")
 
+
+
+
     conn.commit()
     conn.close()
 
@@ -980,25 +983,22 @@ def get_verifications_rows(tenant: str):
     conn = get_db_connection()
     cur = conn.cursor()
     cur.execute("""
-      SELECT tenant, cuil, to_whatsapp, dni_last4, verified_at, updated_at
-      FROM verifications
-      WHERE tenant=?
-      ORDER BY updated_at DESC
+        SELECT
+            cuil,
+            to_whatsapp,
+            COALESCE(nombre,'') AS nombre,
+            COALESCE(dni_last4,'') AS dni_last4,
+            verified_at,
+            updated_at
+        FROM verifications
+        WHERE tenant=?
+        ORDER BY updated_at DESC, verified_at DESC
+        LIMIT 1000
     """, (tenant,))
-    rows = cur.fetchall()
+    rows = [dict(r) for r in cur.fetchall()]
     conn.close()
+    return rows
 
-    out = []
-    for t, c, w, last4, v_at, u_at in rows:
-        out.append({
-            "tenant": t,
-            "cuil": c,
-            "to_whatsapp": w,
-            "dni_last4": last4 or "",
-            "verified_at": v_at,
-            "updated_at": u_at,
-        })
-    return out
 
 def is_verified_contact(tenant: str, cuil: str, to_whatsapp: str) -> bool:
     conn = get_db_connection()
@@ -1436,7 +1436,10 @@ def admin_verifications_import():
     for r in rows:
         cuil_raw = str(r.get(c_cuil, "")).strip()
         wpp_raw  = str(r.get(c_wpp, "")).strip()
-        nombre   = str(r.get(c_nombre, "")).strip() if c_nombre else ""
+        raw_nombre = r.get(c_nombre) if c_nombre else None
+        nombre = ""
+        if raw_nombre is not None and str(raw_nombre).strip().lower() != "nan":
+            nombre = str(raw_nombre).strip()
 
         if not cuil_raw or not wpp_raw:
             skipped += 1
