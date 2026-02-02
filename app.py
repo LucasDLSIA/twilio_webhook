@@ -708,7 +708,8 @@ def mark_sign_sent(pdf_sid: str):
 DB_PATH = os.environ.get("DB_PATH", "/data/app.db")
 
 def get_db_connection():
-    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
     return conn
 
 
