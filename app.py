@@ -1205,7 +1205,6 @@ import pandas as pd
 from flask import request, Response, send_file
 
 @app.get("/admin/report_recibos.xlsx")
-@admin_required
 def admin_report_recibos_xlsx():
     token = _get_admin_token_from_request()
     tenant = (request.args.get("tenant") or "").strip().lower()
