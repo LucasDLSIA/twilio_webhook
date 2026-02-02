@@ -1003,32 +1003,55 @@ def get_verifications_rows(tenant: str):
 
 def is_verified_contact(tenant: str, cuil: str, to_whatsapp: str) -> bool:
     conn = get_db_connection()
+    conn.row_factory = sqlite3.Row
     cur = conn.cursor()
+
     cur.execute("""
-      SELECT 1 FROM verified_contacts
-      WHERE tenant=? AND cuil=? AND to_whatsapp=?
-      LIMIT 1
+        SELECT 1
+        FROM verifications
+        WHERE tenant=? AND cuil=? AND to_whatsapp=?
+        LIMIT 1
     """, (tenant, cuil, to_whatsapp))
+
     ok = cur.fetchone() is not None
     conn.close()
     return ok
 
-def set_verified_contact(tenant: str, cuil: str, to_whatsapp: str, dni: str):
-    h = dni_hash(dni)
-    last4 = dni[-4:] if dni else None
+import hashlib
+
+def _dni_hash(dni: str, tenant: str) -> str:
+    # Salt simple por tenant (podés cambiar por SECRET_KEY si tenés)
+    raw = f"{tenant}|{dni}".encode("utf-8")
+    return hashlib.sha256(raw).hexdigest()
+
+
+def set_verified_contact(tenant: str, cuil: str, to_whatsapp: str, dni: str, nombre: str = ""):
     now = int(time.time())
+    dni = "".join(ch for ch in (dni or "") if ch.isdigit())
+    dni_h = _dni_hash(dni, tenant)
+    dni_last4 = dni[-4:] if len(dni) >= 4 else None
+
     conn = get_db_connection()
     cur = conn.cursor()
+
     cur.execute("""
-      INSERT INTO verified_contacts (tenant, cuil, to_whatsapp, dni_hash, dni_last4, verified_at)
-      VALUES (?, ?, ?, ?, ?, ?)
-      ON CONFLICT(tenant, cuil, to_whatsapp) DO UPDATE SET
-        dni_hash=excluded.dni_hash,
-        dni_last4=excluded.dni_last4,
-        verified_at=excluded.verified_at
-    """, (tenant, cuil, to_whatsapp, h, last4, now))
+        INSERT INTO verifications (tenant, cuil, to_whatsapp, nombre, dni_hash, dni_last4, verified_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(tenant, cuil, to_whatsapp)
+        DO UPDATE SET
+            nombre = CASE
+                        WHEN excluded.nombre IS NOT NULL AND excluded.nombre <> '' THEN excluded.nombre
+                        ELSE verifications.nombre
+                     END,
+            dni_hash=excluded.dni_hash,
+            dni_last4=excluded.dni_last4,
+            verified_at=excluded.verified_at,
+            updated_at=excluded.updated_at
+    """, (tenant, cuil, to_whatsapp, (nombre or "").strip(), dni_h, dni_last4, now, now))
+
     conn.commit()
     conn.close()
+
 
 def set_pending_step(pending_id: int, step: str):
     conn = get_db_connection()
@@ -1296,22 +1319,6 @@ def admin_report_recibos_xlsx():
     )
 
 
-def set_verified_contact(tenant: str, cuil: str, to_whatsapp: str, dni: str):
-    nombre = get_nombre_for_cuil(tenant, cuil)
-
-    conn = get_db_connection()
-    cur = conn.cursor()
-    now = int(time.time())
-
-    cur.execute("""
-      INSERT INTO verified_contacts(tenant, cuil, to_whatsapp, dni, nombre, verified_at)
-      VALUES(?,?,?,?,?,?)
-      ON CONFLICT(tenant, cuil, to_whatsapp)
-      DO UPDATE SET dni=excluded.dni, nombre=excluded.nombre, verified_at=excluded.verified_at
-    """, (tenant, cuil, to_whatsapp, dni, nombre, now))
-
-    conn.commit()
-    conn.close()
 
 def list_verified_contacts(tenant: str, q: str = ""):
     conn = get_db_connection()
@@ -2583,7 +2590,7 @@ def twilio_inbound():
             return twiml(f"❌ DNI incorrecto. Intento {tries}/3. Probá de nuevo (solo números).")
 
         # ✅ DNI OK -> verificamos, volvemos a READY y enviamos PDF
-        set_verified_contact(tenant, cuil, from_whatsapp, dni_user)
+        set_verified_contact(tenant, cuil, from_whatsapp, dni_user, nombre=pending.get("nombre",""))
         set_pending_step(pending["id"], "READY")
 
         try:
