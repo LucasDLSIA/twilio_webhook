@@ -2523,6 +2523,14 @@ def admin_send_test():
 import time
 from flask import Response, request
 
+def twiml(msg: str):
+    return Response(
+        f"<Response><Message>{msg}</Message></Response>",
+        mimetype="application/xml",
+        status=200
+    )
+
+
 TWILIO_SIGN_TEMPLATE_SID = os.environ.get("TWILIO_SIGN_TEMPLATE_SID", "").strip()
 
 @app.post("/twilio/inbound")
