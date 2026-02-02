@@ -1638,44 +1638,6 @@ def admin_panel():
 
     html.append("</div>")
 
-    # Tabla editable
-    verifs = get_verifications_rows(tenant)
-    html.append(f"<p>Registros: {len(verifs)}</p>")
-
-    if verifs:
-        html.append("<table border='1' cellpadding='6' cellspacing='0'>")
-        html.append("<tr><th>Nombre</th><th>CUIL</th><th>WhatsApp</th><th>DNI (últ 4)</th><th>Verificado</th><th>Acciones</th></tr>")
-        for r in verifs[:200]:
-            html.append("<tr>")
-            html.append(f"<td>{esc(r.get('nombre') or '')}</td>")
-            html.append(f"<td>{esc(r['cuil'])}</td>")
-            html.append(f"<td>{esc(r['to_whatsapp'])}</td>")
-            html.append(f"<td>{esc(r['dni_last4'])}</td>")
-            html.append(f"<td>{esc(ts_str(r['verified_at']))}</td>")
-            html.append("<td>")
-            # Editar (simple: re-ingresar dni)
-            html.append(f"""
-            <form method="post" action="/admin/verifications_update" style="display:inline;">
-                <input type="hidden" name="token" value="{esc(token)}">
-                <input type="hidden" name="tenant" value="{esc(tenant)}">
-                <input type="hidden" name="cuil" value="{esc(r['cuil'])}">
-                <input type="hidden" name="to_whatsapp" value="{esc(r['to_whatsapp'])}">
-                <input type="text" name="dni" placeholder="DNI (opcional)" style="width:120px;">
-                <button type="submit">Guardar</button>
-            </form>
-            <form method="post" action="/admin/verifications_delete" style="display:inline;margin-left:6px;" onsubmit="return confirm('¿Borrar verificación?');">
-                <input type="hidden" name="token" value="{esc(token)}">
-                <input type="hidden" name="tenant" value="{esc(tenant)}">
-                <input type="hidden" name="cuil" value="{esc(r['cuil'])}">
-                <input type="hidden" name="to_whatsapp" value="{esc(r['to_whatsapp'])}">
-                <button type="submit" class="btn-danger">Borrar</button>
-            </form>
-            """)
-            html.append("</td>")
-            html.append("</tr>")
-        html.append("</table>")
-    else:
-        html.append("<p>No hay verificaciones cargadas.</p>")
 
 
 
