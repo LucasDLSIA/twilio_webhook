@@ -1089,6 +1089,213 @@ def get_nombre_for_cuil(tenant: str, cuil: str) -> str:
     except Exception:
         return ""
 
+def _db_fetchall_dict(sql, params=()):
+    conn = get_db_connection()
+    conn.row_factory = sqlite3.Row
+    cur = conn.cursor()
+    cur.execute(sql, params)
+    rows = [dict(r) for r in cur.fetchall()]
+    conn.close()
+    return rows
+
+def get_recibo_estado_rows(tenant: str, period_label: str = ""):
+    if period_label:
+        return _db_fetchall_dict(
+            "SELECT tenant,cuil,period,estado,updated_at FROM recibo_estado WHERE tenant=? AND period=?",
+            (tenant, period_label)
+        )
+    return _db_fetchall_dict(
+        "SELECT tenant,cuil,period,estado,updated_at FROM recibo_estado WHERE tenant=?",
+        (tenant,)
+    )
+
+def get_verifications_rows_for_report(tenant: str):
+    return _db_fetchall_dict(
+        "SELECT tenant,cuil,to_whatsapp,nombre,verified_at FROM verifications WHERE tenant=?",
+        (tenant,)
+    )
+
+def get_message_status_rows(tenant: str, period_label: str = ""):
+    if period_label:
+        return _db_fetchall_dict(
+            """
+            SELECT tenant,cuil,period,to_whatsapp,nombre,kind,created_at,last_status,last_status_at,
+                   delivered_at,read_at,failed_at,error_code,error_message
+            FROM message_status
+            WHERE tenant=? AND period=?
+            """,
+            (tenant, period_label)
+        )
+    return _db_fetchall_dict(
+        """
+        SELECT tenant,cuil,period,to_whatsapp,nombre,kind,created_at,last_status,last_status_at,
+               delivered_at,read_at,failed_at,error_code,error_message
+        FROM message_status
+        WHERE tenant=?
+        """,
+        (tenant,)
+    )
+
+from io import BytesIO
+import time
+import re
+from flask import Response, request, send_file
+from openpyxl import Workbook
+from openpyxl.utils import get_column_letter
+
+def period_to_label(p: str) -> str:
+    p = (p or "").strip()
+    if not p:
+        return ""
+    # admite 01/2026 o 01-2026
+    p = p.replace("-", "/")
+    # normaliza 1/2026 -> 01/2026
+    m = re.match(r"^(\d{1,2})/(\d{4})$", p)
+    if not m:
+        return p
+    mm = int(m.group(1))
+    yyyy = m.group(2)
+    return f"{mm:02d}/{yyyy}"
+
+def ts_str(ts):
+    if not ts:
+        return ""
+    try:
+        return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(int(ts)))
+    except Exception:
+        return str(ts)
+
+def _autosize_ws(ws):
+    for col in ws.columns:
+        max_len = 0
+        col_letter = get_column_letter(col[0].column)
+        for cell in col:
+            v = "" if cell.value is None else str(cell.value)
+            if len(v) > max_len:
+                max_len = len(v)
+        ws.column_dimensions[col_letter].width = min(max_len + 2, 55)
+
+
+@app.get("/admin/report_recibos.xlsx")
+def admin_report_recibos_xlsx():
+    token = (request.args.get("token") or "").strip()
+    tenant = (request.args.get("tenant") or "").strip().lower()
+    period_q = period_to_label(request.args.get("period") or "")
+
+    if not tenant:
+        return Response("Falta tenant", status=400)
+
+    # 1) Datos base desde DB
+    estados = get_recibo_estado_rows(tenant, period_q)
+    verifs = get_verifications_rows_for_report(tenant)
+    msgs   = get_message_status_rows(tenant, period_q)
+
+    # 2) Indexamos para lookup rápido
+    # verifications: (cuil,to_whatsapp)->{nombre,verified_at}
+    verif_by_key = {}
+    for v in verifs:
+        key = (v.get("cuil") or "", v.get("to_whatsapp") or "")
+        verif_by_key[key] = v
+
+    # message_status: (cuil,period,kind)->último registro (si hay varios, nos quedamos con el más nuevo)
+    msg_by_key = {}
+    for m in msgs:
+        key = (m.get("cuil") or "", m.get("period") or "", m.get("kind") or "")
+        prev = msg_by_key.get(key)
+        if not prev or int(m.get("created_at") or 0) >= int(prev.get("created_at") or 0):
+            msg_by_key[key] = m
+
+    # estados: (cuil,period)->estado
+    estado_by_key = {(e.get("cuil") or "", e.get("period") or ""): e for e in estados}
+
+    # 3) Fuente de “personas”: usamos envíos del Excel (si existe),
+    #    porque es lo que te da el universo (nombre/cuil/wpp/period).
+    envios_rows = load_envios_rows(tenant, force=False) or []
+
+    # Filtramos por período si viene
+    if period_q:
+        envios_rows = [r for r in envios_rows if period_to_label(str(r.get("period", ""))) == period_q]
+
+    # 4) Armamos XLSX
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Recibos"
+
+    headers = [
+        "tenant", "period",
+        "cuil", "nombre", "whatsapp",
+        "verificado", "verificado_at",
+        "estado_recibo", "estado_at",
+        "template_status", "template_delivered_at", "template_read_at", "template_failed_at",
+        "pdf_status", "pdf_delivered_at", "pdf_read_at", "pdf_failed_at",
+        "error_code", "error_message",
+    ]
+    ws.append(headers)
+
+    for r in envios_rows:
+        cuil = (str(r.get("cuil") or r.get("archivo_norm") or r.get("archivo") or "")).strip()
+        nombre = (str(r.get("nombre") or r.get("name") or "")).strip()
+        wpp = normalize_whatsapp(str(r.get("whatsapp") or r.get("telefono") or r.get("tel") or r.get("celular") or r.get("numero") or ""))
+
+        period_lbl = period_to_label(str(r.get("period") or ""))
+
+        # fallback nombre desde verifications si el excel no lo trae
+        v = verif_by_key.get((cuil, wpp), {})
+        if not nombre:
+            nombre = (v.get("nombre") or "").strip()
+
+        is_verif = "SI" if v else ""
+        verif_at = ts_str(v.get("verified_at")) if v else ""
+
+        est = estado_by_key.get((cuil, period_lbl), {})
+        estado = est.get("estado") or ""
+        estado_at = ts_str(est.get("updated_at")) if est else ""
+
+        # template y pdf desde message_status
+        mt = msg_by_key.get((cuil, period_lbl, "template"), {})
+        mp = msg_by_key.get((cuil, period_lbl, "pdf"), {})
+
+        template_status = mt.get("last_status") or ""
+        template_del = ts_str(mt.get("delivered_at"))
+        template_read = ts_str(mt.get("read_at"))
+        template_fail = ts_str(mt.get("failed_at"))
+
+        pdf_status = mp.get("last_status") or ""
+        pdf_del = ts_str(mp.get("delivered_at"))
+        pdf_read = ts_str(mp.get("read_at"))
+        pdf_fail = ts_str(mp.get("failed_at"))
+
+        error_code = mp.get("error_code") or mt.get("error_code") or ""
+        error_msg  = mp.get("error_message") or mt.get("error_message") or ""
+
+        ws.append([
+            tenant, period_lbl,
+            cuil, nombre, wpp,
+            is_verif, verif_at,
+            estado, estado_at,
+            template_status, template_del, template_read, template_fail,
+            pdf_status, pdf_del, pdf_read, pdf_fail,
+            error_code, error_msg
+        ])
+
+    _autosize_ws(ws)
+
+    # 5) Devolvemos archivo
+    bio = BytesIO()
+    wb.save(bio)
+    bio.seek(0)
+
+    fname_period = period_q.replace("/", "-") if period_q else "todos"
+    filename = f"reporte_recibos_{tenant}_{fname_period}.xlsx"
+
+    return send_file(
+        bio,
+        as_attachment=True,
+        download_name=filename,
+        mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    )
+
+
 def set_verified_contact(tenant: str, cuil: str, to_whatsapp: str, dni: str):
     nombre = get_nombre_for_cuil(tenant, cuil)
 
@@ -1567,7 +1774,7 @@ def admin_panel():
     period_folders = list_tenant_period_folders(tenant)   # ['01-2026','12-2025',...]
     period_labels = [period_folder_to_label(p) for p in period_folders if period_folder_to_label(p)]
 
-    selected_period = (request.args.get("period") or "").strip()
+
     if not selected_period and period_labels:
         selected_period = period_labels[0]   # default al más nuevo
 
@@ -1579,7 +1786,7 @@ def admin_panel():
         html.append(f"<option value='{esc(lbl)}' {sel}>{esc(lbl)}</option>")
     html.append("</select> ")
 
-    selected_period = (request.args.get("period") or "").strip()
+
     period_q = quote(selected_period, safe="")  # <-- IMPORTANTE
 
     html.append(
@@ -1939,34 +2146,52 @@ def normalize_period_label(s: str) -> str:
     yyyy = int(m.group(2))
     return f"{mm:02d}/{yyyy:04d}"
 
-def list_tenant_period_folders(service, tenant: str) -> list[str]:
+import re
+
+import re
+
+FOLDER_MIME = "application/vnd.google-apps.folder"
+
+def list_tenant_period_folders(tenant_slug: str) -> list[str]:
     """
-    Devuelve carpetas de período existentes en el root del tenant con formato 'MM-AAAA',
-    ordenadas de más nueva a más vieja.
+    Devuelve nombres de carpetas período existentes en Drive para el tenant.
+    Formato carpeta esperado: 'MM-AAAA'
     """
-    t = get_tenant(tenant)
+    t = get_tenant(tenant_slug)
     if not t:
         return []
 
-    root_id = t.get("root_id") or t.get("ROOT_ID") or t.get("drive_root_id")
+    root_id = (t.get("drive_root_id") or t.get("recibos_root_id") or "").strip()
     if not root_id:
         return []
 
-    children = _drive_list_children(service, root_id, mime_type=FOLDER_MIME, page_size=500)
+    service = drive_service()
 
-    folders = []
-    for ch in children or []:
-        name = (ch.get("name") or "").strip()
-        if re.match(r"^\d{2}-\d{4}$", name):
-            folders.append(name)
+    children = _drive_list_children(
+        service,
+        parent_id=root_id,
+        mime_type=FOLDER_MIME,
+        page_size=500
+    )
 
-    # ordenar desc por (YYYY, MM)
-    folders.sort(key=lambda s: (int(s.split("-")[1]), int(s.split("-")[0])), reverse=True)
-    return folders
+    names = [
+        c.get("name", "")
+        for c in children
+        if re.match(r"^\d{2}-\d{4}$", (c.get("name", "") or "").strip())
+    ]
+
+    # ordenar desc por (yyyy, mm)
+    def key(name: str):
+        mm, yyyy = name.split("-")
+        return (int(yyyy), int(mm))
+
+    names.sort(key=key, reverse=True)
+    return names
+
 
 def list_tenant_period_labels(service, tenant: str) -> list[str]:
     # ['01-2026', '12-2025'] -> ['01/2026','12/2025']
-    folders = list_tenant_period_folders(service, tenant)
+    folders = list_tenant_period_folders(tenant)
     labels = []
     for f in folders:
         lbl = period_folder_to_label(f)
