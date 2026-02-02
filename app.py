@@ -728,7 +728,7 @@ def init_db():
     cur.execute("PRAGMA synchronous=NORMAL;")
 
     # =========
-    # pending_views (ahora con step + intentos)
+    # pending_views
     # =========
     cur.execute("""
       CREATE TABLE IF NOT EXISTS pending_views (
@@ -738,7 +738,7 @@ def init_db():
         cuil TEXT NOT NULL,
         period TEXT NOT NULL,
         created_at INTEGER NOT NULL,
-        step TEXT DEFAULT 'READY',          -- READY | AWAIT_DNI
+        step TEXT DEFAULT 'READY',
         dni_attempts INTEGER DEFAULT 0,
         UNIQUE(to_whatsapp, tenant, cuil, period)
       );
@@ -747,7 +747,7 @@ def init_db():
     _try_alter(cur, "ALTER TABLE pending_views ADD COLUMN dni_attempts INTEGER;")
 
     # =========
-    # recibo_estado (FIRMADO/OBSERVADO/NO_NEED)
+    # recibo_estado
     # =========
     cur.execute("""
       CREATE TABLE IF NOT EXISTS recibo_estado (
@@ -762,7 +762,7 @@ def init_db():
     """)
 
     # =========
-    # message_status (status template/pdf)
+    # message_status
     # =========
     cur.execute("""
       CREATE TABLE IF NOT EXISTS message_status (
@@ -773,7 +773,7 @@ def init_db():
         cuil TEXT,
         period TEXT,
         nombre TEXT,
-        kind TEXT,                -- 'template' | 'pdf'
+        kind TEXT,
         created_at INTEGER,
         last_status TEXT,
         last_status_at INTEGER,
@@ -784,7 +784,6 @@ def init_db():
         error_message TEXT
       );
     """)
-    # migraciones safe
     for col, typ in [
         ("to_whatsapp","TEXT"),("tenant","TEXT"),("cuil","TEXT"),("period","TEXT"),
         ("nombre","TEXT"),("kind","TEXT"),("created_at","INTEGER"),
@@ -795,7 +794,7 @@ def init_db():
         _try_alter(cur, f"ALTER TABLE message_status ADD COLUMN {col} {typ};")
 
     # =========
-    # sent_pdfs (para mandar SIGN después del delivered)
+    # sent_pdfs
     # =========
     cur.execute("""
       CREATE TABLE IF NOT EXISTS sent_pdfs (
@@ -812,79 +811,76 @@ def init_db():
     _try_alter(cur, "ALTER TABLE sent_pdfs ADD COLUMN sign_sent_at INTEGER;")
 
     # =========
-    # ✅ NUEVO: verified_contacts (verificación DNI por número)
+    # ✅ verifications (ÚNICA tabla de verificación)
     # =========
     cur.execute("""
-      CREATE TABLE IF NOT EXISTS verified_contacts (
+      CREATE TABLE IF NOT EXISTS verifications (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         tenant TEXT NOT NULL,
         cuil TEXT NOT NULL,
         to_whatsapp TEXT NOT NULL,
-        dni_hash TEXT NOT NULL,
-        dni_last4 TEXT,
-        verified_at INTEGER NOT NULL,
-        UNIQUE(tenant, cuil, to_whatsapp)
-      );
-    """)
-
-    # índices útiles
-    _try_alter(cur, "CREATE INDEX IF NOT EXISTS idx_pending_to_created ON pending_views(to_whatsapp, created_at);")
-    _try_alter(cur, "CREATE INDEX IF NOT EXISTS idx_estado_key ON recibo_estado(tenant, cuil, period);")
-    _try_alter(cur, "CREATE INDEX IF NOT EXISTS idx_msg_key ON message_status(tenant, cuil, period, kind);")
-    _try_alter(cur, "CREATE INDEX IF NOT EXISTS idx_msg_sid ON message_status(message_sid);")
-    _try_alter(cur, "CREATE INDEX IF NOT EXISTS idx_sentpdfs_sid ON sent_pdfs(message_sid);")
-    _try_alter(cur, "CREATE INDEX IF NOT EXISTS idx_verified_key ON verified_contacts(tenant, cuil, to_whatsapp);")
-
-    # =========
-    # verifications: vincula WhatsApp <-> CUIL (y opcional DNI hash)
-    # =========
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS verifications (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        tenant TEXT NOT NULL,
-        cuil TEXT NOT NULL,
-        to_whatsapp TEXT NOT NULL,
+        nombre TEXT,
         dni_hash TEXT,
         dni_last4 TEXT,
         verified_at INTEGER NOT NULL,
         updated_at INTEGER NOT NULL,
         UNIQUE(tenant, cuil, to_whatsapp)
-    );
+      );
     """)
 
+    # migraciones safe si venías con esquema anterior
+    _try_alter(cur, "ALTER TABLE verifications ADD COLUMN nombre TEXT;")
     _try_alter(cur, "ALTER TABLE verifications ADD COLUMN dni_hash TEXT;")
     _try_alter(cur, "ALTER TABLE verifications ADD COLUMN dni_last4 TEXT;")
     _try_alter(cur, "ALTER TABLE verifications ADD COLUMN verified_at INTEGER;")
     _try_alter(cur, "ALTER TABLE verifications ADD COLUMN updated_at INTEGER;")
 
+    _try_alter(cur, "CREATE INDEX IF NOT EXISTS idx_pending_to_created ON pending_views(to_whatsapp, created_at);")
+    _try_alter(cur, "CREATE INDEX IF NOT EXISTS idx_estado_key ON recibo_estado(tenant, cuil, period);")
+    _try_alter(cur, "CREATE INDEX IF NOT EXISTS idx_msg_key ON message_status(tenant, cuil, period, kind);")
+    _try_alter(cur, "CREATE INDEX IF NOT EXISTS idx_msg_sid ON message_status(message_sid);")
+    _try_alter(cur, "CREATE INDEX IF NOT EXISTS idx_sentpdfs_sid ON sent_pdfs(message_sid);")
+
     _try_alter(cur, "CREATE INDEX IF NOT EXISTS idx_verif_tenant_cuil ON verifications(tenant, cuil);")
     _try_alter(cur, "CREATE INDEX IF NOT EXISTS idx_verif_tenant_wa ON verifications(tenant, to_whatsapp);")
-
-    cur.execute("""
-      CREATE TABLE IF NOT EXISTS verified_contacts (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        tenant TEXT NOT NULL,
-        cuil TEXT NOT NULL,
-        to_whatsapp TEXT NOT NULL,
-        dni TEXT NOT NULL,
-        nombre TEXT,
-        verified_at INTEGER NOT NULL,
-        UNIQUE(tenant, cuil, to_whatsapp)
-      );
-    """)
-
-    _try_alter(cur, "ALTER TABLE verified_contacts ADD COLUMN nombre TEXT;")
-    _try_alter(cur, "ALTER TABLE verified_contacts ADD COLUMN verified_at INTEGER;")
-
-    _try_alter(cur, "CREATE INDEX IF NOT EXISTS idx_verif_tenant ON verified_contacts(tenant);")
-    _try_alter(cur, "CREATE INDEX IF NOT EXISTS idx_verif_key ON verified_contacts(tenant, cuil, to_whatsapp);")
-
 
     conn.commit()
     conn.close()
 
 
 init_db()
+
+def ensure_verified_contacts_schema(cur):
+    # si la tabla no existe, la creamos completa
+    cur.execute("""
+      CREATE TABLE IF NOT EXISTS verified_contacts (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        tenant TEXT NOT NULL,
+        cuil TEXT NOT NULL,
+        to_whatsapp TEXT NOT NULL,
+        dni TEXT,
+        nombre TEXT,
+        verified_at INTEGER NOT NULL,
+        UNIQUE(tenant, cuil, to_whatsapp)
+      );
+    """)
+
+    # si ya existía vieja, agregamos columnas que falten
+    _try_alter(cur, "ALTER TABLE verified_contacts ADD COLUMN dni TEXT;")
+    _try_alter(cur, "ALTER TABLE verified_contacts ADD COLUMN nombre TEXT;")
+    _try_alter(cur, "ALTER TABLE verified_contacts ADD COLUMN verified_at INTEGER;")
+
+    # MUY IMPORTANTE:
+    # si la tabla vieja no tenía UNIQUE(tenant,cuil,to_whatsapp),
+    # ON CONFLICT(...) no va a funcionar. Creamos unique index equivalente.
+    _try_alter(cur, """
+      CREATE UNIQUE INDEX IF NOT EXISTS ux_verified_contacts_key
+      ON verified_contacts(tenant, cuil, to_whatsapp);
+    """)
+
+    _try_alter(cur, "CREATE INDEX IF NOT EXISTS idx_verified_tenant ON verified_contacts(tenant);")
+    _try_alter(cur, "CREATE INDEX IF NOT EXISTS idx_verified_cuil ON verified_contacts(tenant, cuil);")
+
 
 def save_pdf_sid(tenant: str, cuil: str, period: str, to_whatsapp: str, sid: str):
     now = int(time.time())
