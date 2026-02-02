@@ -1564,19 +1564,29 @@ def admin_panel():
     html.append("<form method='get' action='/admin/panel'>")
     html.append(f"<input type='hidden' name='token' value='{esc(token)}'>")
     html.append(f"<input type='hidden' name='tenant' value='{esc(tenant)}'>")
-    html.append("<label>Período para reportes (mm/aaaa):</label> ")
-    html.append(f"<input type='text' name='period' value='{esc(selected_period)}' placeholder='01/2026'> ")
-    html.append("<button type='submit'>Aplicar</button>")
-    html.append("</form>")
-    html.append(
-  f"<a href='/admin/verifications_template.xlsx?token={esc(token)}'>"
-  "⬇️ Descargar template de verificaciones</a>"
-    )
+    period_folders = list_tenant_period_folders(tenant)   # ['01-2026','12-2025',...]
+    period_labels = [period_folder_to_label(p) for p in period_folders if period_folder_to_label(p)]
+
+    selected_period = (request.args.get("period") or "").strip()
+    if not selected_period and period_labels:
+        selected_period = period_labels[0]   # default al más nuevo
+
+    html.append("<label>Período para reportes:</label> ")
+    html.append("<select name='period'>")
+    html.append("<option value=''>-- Todos / Sin filtro --</option>")
+    for lbl in period_labels:
+        sel = "selected" if lbl == selected_period else ""
+        html.append(f"<option value='{esc(lbl)}' {sel}>{esc(lbl)}</option>")
+    html.append("</select> ")
+
+    selected_period = (request.args.get("period") or "").strip()
+    period_q = quote(selected_period, safe="")  # <-- IMPORTANTE
 
     html.append(
-    f"<p><a href='/admin/report_recibos.xlsx?tenant={esc(tenant)}&period={esc(selected_period)}&token={esc(token)}'>"
-    "📄 Descargar reporte de recibos</a></p>"
+        f"<p><a href='/admin/report_recibos.xlsx?tenant={esc(tenant)}&period={period_q}&token={esc(token)}'>"
+        "📄 Descargar reporte de recibos</a></p>"
     )
+
     html.append(
     f"<p><a href='/admin/report_envios.csv?tenant={esc(tenant)}&token={esc(token)}'>"
     "📄 Envíos realizados (CSV)</a></p>"
@@ -1908,19 +1918,62 @@ def _period_variants(period: str) -> list[str]:
     ]
 
 
-def _find_period_folder_id(service, root_id: str, period: str) -> str | None:
-    # Busca una carpeta del período DIRECTAMENTE bajo root_id
-    for name in _period_variants(period):
-        q = (
-            f"'{root_id}' in parents and trashed=false "
-            f"and mimeType='application/vnd.google-apps.folder' "
-            f"and name='{name}'"
-        )
-        res = service.files().list(q=q, fields="files(id,name)", pageSize=1).execute()
-        files = res.get("files", [])
-        if files:
-            return files[0]["id"]
-    return None
+import re
+from urllib.parse import quote
+
+FOLDER_MIME = "application/vnd.google-apps.folder"
+
+def period_folder_to_label(folder_name: str) -> str:
+    # '01-2026' -> '01/2026'
+    m = re.match(r"^(\d{2})-(\d{4})$", (folder_name or "").strip())
+    if not m:
+        return ""
+    return f"{m.group(1)}/{m.group(2)}"
+
+def normalize_period_label(s: str) -> str:
+    # '1/2026' -> '01/2026' ; '01/2026' queda igual
+    m = re.match(r"^\s*(\d{1,2})\s*/\s*(\d{4})\s*$", (s or "").strip())
+    if not m:
+        return (s or "").strip()
+    mm = int(m.group(1))
+    yyyy = int(m.group(2))
+    return f"{mm:02d}/{yyyy:04d}"
+
+def list_tenant_period_folders(service, tenant: str) -> list[str]:
+    """
+    Devuelve carpetas de período existentes en el root del tenant con formato 'MM-AAAA',
+    ordenadas de más nueva a más vieja.
+    """
+    t = get_tenant(tenant)
+    if not t:
+        return []
+
+    root_id = t.get("root_id") or t.get("ROOT_ID") or t.get("drive_root_id")
+    if not root_id:
+        return []
+
+    children = _drive_list_children(service, root_id, mime_type=FOLDER_MIME, page_size=500)
+
+    folders = []
+    for ch in children or []:
+        name = (ch.get("name") or "").strip()
+        if re.match(r"^\d{2}-\d{4}$", name):
+            folders.append(name)
+
+    # ordenar desc por (YYYY, MM)
+    folders.sort(key=lambda s: (int(s.split("-")[1]), int(s.split("-")[0])), reverse=True)
+    return folders
+
+def list_tenant_period_labels(service, tenant: str) -> list[str]:
+    # ['01-2026', '12-2025'] -> ['01/2026','12/2025']
+    folders = list_tenant_period_folders(service, tenant)
+    labels = []
+    for f in folders:
+        lbl = period_folder_to_label(f)
+        if lbl:
+            labels.append(lbl)
+    return labels
+
 
 
 def find_pdf_file_id(tenant: str, cuil: str, period: str) -> str | None:
@@ -2018,15 +2071,6 @@ def admin_reset():
 
     return redirect(f"/admin/panel?tenant={tenant}&token={token}&msg=reset_ok&period={period}")
 
-def _drive_list_children(parent_id: str, page_size: int = 30):
-    service = drive_service()
-    q = f"'{parent_id}' in parents and trashed=false"
-    res = service.files().list(
-        q=q,
-        fields="files(id,name,mimeType)",
-        pageSize=page_size
-    ).execute()
-    return res.get("files", [])
 
 def _drive_find_folder_by_name(parent_id: str, name: str) -> str | None:
     service = drive_service()
