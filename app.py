@@ -1199,123 +1199,102 @@ def _autosize_ws(ws):
         ws.column_dimensions[col_letter].width = min(max_len + 2, 55)
 
 
+from io import BytesIO
+import time
+import pandas as pd
+from flask import request, Response, send_file
+
 @app.get("/admin/report_recibos.xlsx")
+@admin_required
 def admin_report_recibos_xlsx():
-    token = (request.args.get("token") or "").strip()
+    token = _get_admin_token_from_request()
     tenant = (request.args.get("tenant") or "").strip().lower()
-    period_q = period_to_label(request.args.get("period") or "")
+    period = (request.args.get("period") or "").strip()   # "MM/AAAA" o "" (todos)
 
     if not tenant:
         return Response("Falta tenant", status=400)
 
-    # 1) Datos base desde DB
-    estados = get_recibo_estado_rows(tenant, period_q)
-    verifs = get_verifications_rows_for_report(tenant)
-    msgs   = get_message_status_rows(tenant, period_q)
+    # Forzamos lectura real del excel (NO cache)
+    envios_rows = load_envios_rows(tenant, force=True) or []
 
-    # 2) Indexamos para lookup rápido
-    # verifications: (cuil,to_whatsapp)->{nombre,verified_at}
-    verif_by_key = {}
-    for v in verifs:
-        key = (v.get("cuil") or "", v.get("to_whatsapp") or "")
-        verif_by_key[key] = v
-
-    # message_status: (cuil,period,kind)->último registro (si hay varios, nos quedamos con el más nuevo)
-    msg_by_key = {}
-    for m in msgs:
-        key = (m.get("cuil") or "", m.get("period") or "", m.get("kind") or "")
-        prev = msg_by_key.get(key)
-        if not prev or int(m.get("created_at") or 0) >= int(prev.get("created_at") or 0):
-            msg_by_key[key] = m
-
-    # estados: (cuil,period)->estado
-    estado_by_key = {(e.get("cuil") or "", e.get("period") or ""): e for e in estados}
-
-    # 3) Fuente de “personas”: usamos envíos del Excel (si existe),
-    #    porque es lo que te da el universo (nombre/cuil/wpp/period).
-    envios_rows = load_envios_rows(tenant, force=False) or []
-
-    # Filtramos por período si viene
-    if period_q:
-        envios_rows = [r for r in envios_rows if period_to_label(str(r.get("period", ""))) == period_q]
-
-    # 4) Armamos XLSX
-    wb = Workbook()
-    ws = wb.active
-    ws.title = "Recibos"
-
-    headers = [
-        "tenant", "period",
-        "cuil", "nombre", "whatsapp",
-        "verificado", "verificado_at",
-        "estado_recibo", "estado_at",
-        "template_status", "template_delivered_at", "template_read_at", "template_failed_at",
-        "pdf_status", "pdf_delivered_at", "pdf_read_at", "pdf_failed_at",
-        "error_code", "error_message",
-    ]
-    ws.append(headers)
+    out = []
 
     for r in envios_rows:
-        cuil = (str(r.get("cuil") or r.get("archivo_norm") or r.get("archivo") or "")).strip()
-        nombre = (str(r.get("nombre") or r.get("name") or "")).strip()
-        wpp = normalize_whatsapp(str(r.get("whatsapp") or r.get("telefono") or r.get("tel") or r.get("celular") or r.get("numero") or ""))
+        cuil = (r.get("cuil_norm") or r.get("cuil") or "").strip()
+        nombre_excel = (r.get("nombre") or "").strip()
+        wpp = (r.get("whatsapp_norm") or r.get("whatsapp") or "").strip()
 
-        period_lbl = period_to_label(str(r.get("period") or ""))
+        if not cuil:
+            continue
 
-        # fallback nombre desde verifications si el excel no lo trae
-        v = verif_by_key.get((cuil, wpp), {})
-        if not nombre:
-            nombre = (v.get("nombre") or "").strip()
+        # Normalizar whatsapp si vino sin prefijo
+        if wpp and not wpp.startswith("whatsapp:"):
+            try:
+                wpp = normalize_whatsapp(wpp)
+            except Exception:
+                # si no pudimos normalizar, lo dejamos crudo
+                pass
 
-        is_verif = "SI" if v else ""
-        verif_at = ts_str(v.get("verified_at")) if v else ""
+        # --- Si NO hay periodo elegido: hacemos "todos" pero SOLO los que existan en DB ---
+        periods_to_report = []
+        if period:
+            periods_to_report = [period]
+        else:
+            periods_to_report = list_periods_for_cuil(tenant, cuil)  # lista "MM/AAAA"
+            if not periods_to_report:
+                continue
 
-        est = estado_by_key.get((cuil, period_lbl), {})
-        estado = est.get("estado") or ""
-        estado_at = ts_str(est.get("updated_at")) if est else ""
+        for p in periods_to_report:
+            # Estado del recibo / statuses
+            estado = get_recibo_estado(tenant, cuil, p) or ""
+            tpl = _get_last_msg_status(tenant, cuil, p, "template")
+            pdf = _get_last_msg_status(tenant, cuil, p, "pdf")
 
-        # template y pdf desde message_status
-        mt = msg_by_key.get((cuil, period_lbl, "template"), {})
-        mp = msg_by_key.get((cuil, period_lbl, "pdf"), {})
+            # Si no hay nada en DB para ese período, no incluimos
+            if not any([estado, tpl, pdf]):
+                continue
 
-        template_status = mt.get("last_status") or ""
-        template_del = ts_str(mt.get("delivered_at"))
-        template_read = ts_str(mt.get("read_at"))
-        template_fail = ts_str(mt.get("failed_at"))
+            last_tpl = (tpl.get("last_status") if tpl else "") or ""
+            last_pdf = (pdf.get("last_status") if pdf else "") or ""
 
-        pdf_status = mp.get("last_status") or ""
-        pdf_del = ts_str(mp.get("delivered_at"))
-        pdf_read = ts_str(mp.get("read_at"))
-        pdf_fail = ts_str(mp.get("failed_at"))
+            # Verificación (NO depende del período)
+            verif = False
+            verif_nombre = ""
+            if wpp:
+                verif = _is_verified_link(tenant, cuil, wpp)
+                verif_nombre = _get_verif_nombre(tenant, cuil, wpp)
 
-        error_code = mp.get("error_code") or mt.get("error_code") or ""
-        error_msg  = mp.get("error_message") or mt.get("error_message") or ""
+            nombre_final = nombre_excel or verif_nombre
 
-        ws.append([
-            tenant, period_lbl,
-            cuil, nombre, wpp,
-            is_verif, verif_at,
-            estado, estado_at,
-            template_status, template_del, template_read, template_fail,
-            pdf_status, pdf_del, pdf_read, pdf_fail,
-            error_code, error_msg
-        ])
+            out.append({
+                "tenant": tenant,
+                "period": p,
+                "folder": (p.replace("/", "-") if p else ""),  # "MM-AAAA"
+                "nombre": nombre_final,
+                "cuil": cuil,
+                "whatsapp": wpp,
+                "verificado": "SI" if verif else "NO",
+                "estado_recibo": estado,
+                "template_status": last_tpl,
+                "pdf_status": last_pdf,
+            })
 
-    _autosize_ws(ws)
+    df = pd.DataFrame(out, columns=[
+        "tenant","period","folder","nombre","cuil","whatsapp",
+        "verificado","estado_recibo","template_status","pdf_status"
+    ])
 
-    # 5) Devolvemos archivo
-    bio = BytesIO()
-    wb.save(bio)
-    bio.seek(0)
+    buf = BytesIO()
+    with pd.ExcelWriter(buf, engine="openpyxl") as writer:
+        df.to_excel(writer, index=False, sheet_name="reporte")
+    buf.seek(0)
 
-    fname_period = period_q.replace("/", "-") if period_q else "todos"
-    filename = f"reporte_recibos_{tenant}_{fname_period}.xlsx"
-
+    filename = f"reporte_recibos_{tenant}_{(period.replace('/','-') if period else 'todos')}.xlsx"
     return send_file(
-        bio,
+        buf,
         as_attachment=True,
         download_name=filename,
-        mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
     )
 
 
@@ -2433,6 +2412,65 @@ def debug_list_root_pdfs(tenant: str, limit=20):
     print("\n=== ROOT FILES ===")
     for f in res.get("files", []):
         print(f["name"], f["mimeType"])
+
+from io import BytesIO
+from flask import send_file
+import sqlite3
+import pandas as pd
+import time
+
+def _db_row_to_dict(r):
+    # r puede ser sqlite3.Row o tupla
+    if r is None:
+        return None
+    if isinstance(r, sqlite3.Row):
+        return dict(r)
+    # fallback: si fuera tupla (no debería si usás row_factory)
+    return {str(i): v for i, v in enumerate(r)}
+
+def _get_last_msg_status(tenant: str, cuil: str, period: str, kind: str):
+    conn = get_db_connection()
+    conn.row_factory = sqlite3.Row
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT *
+        FROM message_status
+        WHERE tenant=? AND cuil=? AND period=? AND kind=?
+        ORDER BY COALESCE(created_at, 0) DESC, id DESC
+        LIMIT 1
+    """, (tenant, cuil, period, kind))
+    row = cur.fetchone()
+    conn.close()
+    return _db_row_to_dict(row)
+
+def _is_verified_link(tenant: str, cuil: str, to_whatsapp: str) -> bool:
+    # usa tu tabla UNICA verifications
+    conn = get_db_connection()
+    conn.row_factory = sqlite3.Row
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT 1
+        FROM verifications
+        WHERE tenant=? AND cuil=? AND to_whatsapp=?
+        LIMIT 1
+    """, (tenant, cuil, to_whatsapp))
+    ok = cur.fetchone() is not None
+    conn.close()
+    return ok
+
+def _get_verif_nombre(tenant: str, cuil: str, to_whatsapp: str) -> str:
+    conn = get_db_connection()
+    conn.row_factory = sqlite3.Row
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT nombre
+        FROM verifications
+        WHERE tenant=? AND cuil=? AND to_whatsapp=?
+        LIMIT 1
+    """, (tenant, cuil, to_whatsapp))
+    row = cur.fetchone()
+    conn.close()
+    return (row["nombre"] if row and row["nombre"] else "") if row else ""
 
 
 
