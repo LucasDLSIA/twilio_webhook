@@ -860,6 +860,25 @@ def init_db():
     _try_alter(cur, "CREATE INDEX IF NOT EXISTS idx_verif_tenant_cuil ON verifications(tenant, cuil);")
     _try_alter(cur, "CREATE INDEX IF NOT EXISTS idx_verif_tenant_wa ON verifications(tenant, to_whatsapp);")
 
+    cur.execute("""
+      CREATE TABLE IF NOT EXISTS verified_contacts (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        tenant TEXT NOT NULL,
+        cuil TEXT NOT NULL,
+        to_whatsapp TEXT NOT NULL,
+        dni TEXT NOT NULL,
+        nombre TEXT,
+        verified_at INTEGER NOT NULL,
+        UNIQUE(tenant, cuil, to_whatsapp)
+      );
+    """)
+
+    _try_alter(cur, "ALTER TABLE verified_contacts ADD COLUMN nombre TEXT;")
+    _try_alter(cur, "ALTER TABLE verified_contacts ADD COLUMN verified_at INTEGER;")
+
+    _try_alter(cur, "CREATE INDEX IF NOT EXISTS idx_verif_tenant ON verified_contacts(tenant);")
+    _try_alter(cur, "CREATE INDEX IF NOT EXISTS idx_verif_key ON verified_contacts(tenant, cuil, to_whatsapp);")
+
 
     conn.commit()
     conn.close()
@@ -1030,6 +1049,90 @@ def inc_pending_dni_attempts(pending_id: int) -> int:
     conn.commit()
     conn.close()
     return int(n)
+
+def get_nombre_for_cuil(tenant: str, cuil: str) -> str:
+    try:
+        df = get_envios_df_for_tenant(tenant)
+        if df is None or df.empty:
+            return ""
+        df.columns = [str(c).strip().lower() for c in df.columns]
+
+        # columnas posibles
+        c_nombre = None
+        for n in ("nombre", "name", "empleado", "persona"):
+            if n in df.columns:
+                c_nombre = n
+                break
+
+        c_arch = None
+        for n in ("archivo", "cuil", "archivo_norm"):
+            if n in df.columns:
+                c_arch = n
+                break
+
+        if not c_nombre or not c_arch:
+            return ""
+
+        # normalizar cuil en df y comparar
+        def norm(x):
+            s = str(x or "").strip().replace(".pdf","")
+            try:
+                s = strip_pdf(s)
+            except Exception:
+                pass
+            return s
+
+        target = norm(cuil)
+        df["_cuil_norm"] = df[c_arch].apply(norm)
+
+        row = df[df["_cuil_norm"] == target]
+        if row.empty:
+            return ""
+        return str(row.iloc[0][c_nombre] or "").strip()
+    except Exception:
+        return ""
+
+def set_verified_contact(tenant: str, cuil: str, to_whatsapp: str, dni: str):
+    nombre = get_nombre_for_cuil(tenant, cuil)
+
+    conn = get_db_connection()
+    cur = conn.cursor()
+    now = int(time.time())
+
+    cur.execute("""
+      INSERT INTO verified_contacts(tenant, cuil, to_whatsapp, dni, nombre, verified_at)
+      VALUES(?,?,?,?,?,?)
+      ON CONFLICT(tenant, cuil, to_whatsapp)
+      DO UPDATE SET dni=excluded.dni, nombre=excluded.nombre, verified_at=excluded.verified_at
+    """, (tenant, cuil, to_whatsapp, dni, nombre, now))
+
+    conn.commit()
+    conn.close()
+
+def list_verified_contacts(tenant: str, q: str = ""):
+    conn = get_db_connection()
+    cur = conn.cursor()
+
+    q = (q or "").strip().lower()
+    params = [tenant]
+
+    sql = """
+      SELECT id, tenant, cuil, to_whatsapp, nombre, dni, verified_at
+      FROM verified_contacts
+      WHERE tenant = ?
+    """
+
+    if q:
+        sql += " AND (lower(cuil) LIKE ? OR lower(to_whatsapp) LIKE ? OR lower(ifnull(nombre,'')) LIKE ?)"
+        like = f"%{q}%"
+        params += [like, like, like]
+
+    sql += " ORDER BY verified_at DESC LIMIT 200"
+
+    cur.execute(sql, params)
+    rows = [dict(zip([c[0] for c in cur.description], r)) for r in cur.fetchall()]
+    conn.close()
+    return rows
 
 
 def get_pdf_by_sid(sid):
@@ -1234,53 +1337,27 @@ def ts_str(ts: int | None) -> str:
     except Exception:
         return ""
 
-
-@app.get("/admin/verifications.xlsx")
-@admin_required
-def admin_verifications_xlsx():
-    tenant = (request.args.get("tenant") or "").strip().lower()
-    rows = get_verifications_rows(tenant)
-
-    df = pd.DataFrame(rows)
-    # columnas “humanas”
-    if not df.empty:
-        df["verified_at"] = df["verified_at"].apply(ts_str)
-        df["updated_at"] = df["updated_at"].apply(ts_str)
-
-    out = io.BytesIO()
-    with pd.ExcelWriter(out, engine="openpyxl") as writer:
-        df.to_excel(writer, index=False, sheet_name="verificaciones")
-    out.seek(0)
-
-    fname = f"verificaciones_{tenant}.xlsx"
-    return send_file(out, as_attachment=True, download_name=fname,
-                     mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+admin_verifications_xlsx
+from flask import send_file
+import io
 
 @app.get("/admin/verifications_template.xlsx")
 @admin_required
 def admin_verifications_template_xlsx():
-    from openpyxl import Workbook
-    import io
+    output = io.BytesIO()
+    import pandas as pd
 
-    wb = Workbook()
-    ws = wb.active
-    ws.title = "Verificaciones"
+    df = pd.DataFrame(columns=["cuil", "whatsapp", "dni", "nombre"])
+    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+        df.to_excel(writer, index=False, sheet_name="verificaciones")
 
-    ws.append(["tenant", "cuil", "whatsapp", "dni", "verified_at"])
-
-    # fila ejemplo (podés sacarla si no querés)
-    ws.append(["los-robles", "20-28169249-3", "whatsapp:+5491136222572", "28169249", ""])
-
-    buf = io.BytesIO()
-    wb.save(buf)
-    buf.seek(0)
-
-    resp = Response(
-        buf.read(),
+    output.seek(0)
+    return send_file(
+        output,
         mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        as_attachment=True,
+        download_name="verifications_template.xlsx",
     )
-    resp.headers["Content-Disposition"] = 'attachment; filename="verifications_template.xlsx"'
-    return resp
 
 
 @app.post("/admin/verifications_import")
@@ -1288,14 +1365,15 @@ def admin_verifications_template_xlsx():
 def admin_verifications_import():
     token = _get_admin_token_from_request()
     tenant = (request.form.get("tenant") or "").strip().lower()
+    if not tenant:
+        return Response("Falta tenant", status=400)
 
     f = request.files.get("file")
     if not f:
         return Response("Falta archivo", status=400)
 
+    import pandas as pd
     df = pd.read_excel(f)
-    if df is None or df.empty:
-        return Response("Excel vacío", status=400)
 
     df.columns = [str(c).strip().lower() for c in df.columns]
 
@@ -1306,39 +1384,50 @@ def admin_verifications_import():
         return None
 
     c_cuil = pick("cuil", "archivo", "archivo_norm")
-    c_wa = pick("whatsapp", "telefono", "tel", "celular", "numero")
-    c_dni = pick("dni", "documento", "doc")
+    c_wpp  = pick("whatsapp", "telefono", "tel", "celular", "numero")
+    c_dni  = pick("dni", "documento")
+    c_nom  = pick("nombre", "name", "empleado", "persona")
 
-    if not c_cuil or not c_wa:
-        return Response("Columnas requeridas: cuil + whatsapp/telefono", status=400)
+    if not c_cuil or not c_wpp:
+        return Response("El Excel debe tener columnas cuil y whatsapp/telefono.", status=400)
 
-    imported = 0
-    for _, r in df.iterrows():
-        cuil = str(r.get(c_cuil, "")).strip()
-        wa_raw = str(r.get(c_wa, "")).strip()
-        dni = str(r.get(c_dni, "")).strip() if c_dni else ""
+    conn = get_db_connection()
+    cur = conn.cursor()
+    now = int(time.time())
+    n = 0
 
-        if not cuil or not wa_raw:
-            continue
-
-        # normalizar whatsapp
-        tel_digits = "".join(ch for ch in wa_raw if ch.isdigit())
-        if not tel_digits:
-            continue
-        if not tel_digits.startswith("54"):
-            tel_digits = "54" + tel_digits
-        to_whatsapp = f"whatsapp:+{tel_digits}"
-
+    for _, row in df.iterrows():
+        cuil = str(row.get(c_cuil, "") or "").strip().replace(".pdf","")
         try:
-            cuil = strip_pdf(cuil)  # tu normalizador de cuil
+            cuil = strip_pdf(cuil)
         except Exception:
             pass
 
-        upsert_verification(tenant, cuil, to_whatsapp, dni=dni)
-        imported += 1
+        wpp_raw = str(row.get(c_wpp, "") or "").strip()
+        to_whatsapp = normalize_whatsapp(wpp_raw)
+        if not cuil or not to_whatsapp:
+            continue
 
-    return redirect(f"/admin/panel?tenant={tenant}&token={token}&msg=verif_import_ok&n={imported}")
+        dni = ""
+        if c_dni:
+            dni = _digits(str(row.get(c_dni, "") or "").strip())
 
+        nombre = ""
+        if c_nom:
+            nombre = str(row.get(c_nom, "") or "").strip()
+
+        cur.execute("""
+          INSERT INTO verified_contacts(tenant, cuil, to_whatsapp, dni, nombre, verified_at)
+          VALUES(?,?,?,?,?,?)
+          ON CONFLICT(tenant, cuil, to_whatsapp)
+          DO UPDATE SET dni=excluded.dni, nombre=excluded.nombre, verified_at=excluded.verified_at
+        """, (tenant, cuil, to_whatsapp, dni, nombre, now))
+        n += 1
+
+    conn.commit()
+    conn.close()
+
+    return redirect(f"/admin/panel?tenant={tenant}&token={token}&msg=verif_import_ok&n={n}")
 
 @app.post("/admin/verifications_update")
 @admin_required
@@ -1347,13 +1436,27 @@ def admin_verifications_update():
     tenant = (request.form.get("tenant") or "").strip().lower()
     cuil = (request.form.get("cuil") or "").strip()
     to_whatsapp = (request.form.get("to_whatsapp") or "").strip()
-    dni = (request.form.get("dni") or "").strip()
+    dni = _digits((request.form.get("dni") or "").strip())
+    nombre = (request.form.get("nombre") or "").strip()
 
     if not (tenant and cuil and to_whatsapp):
-        return Response("Faltan datos", status=400)
+        return Response("Faltan parámetros", status=400)
 
-    upsert_verification(tenant, cuil, to_whatsapp, dni=dni)
-    return redirect(f"/admin/panel?tenant={tenant}&token={token}&msg=verif_updated")
+    conn = get_db_connection()
+    cur = conn.cursor()
+    now = int(time.time())
+
+    cur.execute("""
+      INSERT INTO verified_contacts(tenant, cuil, to_whatsapp, dni, nombre, verified_at)
+      VALUES(?,?,?,?,?,?)
+      ON CONFLICT(tenant, cuil, to_whatsapp)
+      DO UPDATE SET dni=excluded.dni, nombre=excluded.nombre, verified_at=excluded.verified_at
+    """, (tenant, cuil, to_whatsapp, dni, nombre, now))
+
+    conn.commit()
+    conn.close()
+
+    return redirect(f"/admin/panel?tenant={tenant}&token={token}&msg=verif_saved")
 
 
 @app.post("/admin/verifications_delete")
@@ -1365,9 +1468,17 @@ def admin_verifications_delete():
     to_whatsapp = (request.form.get("to_whatsapp") or "").strip()
 
     if not (tenant and cuil and to_whatsapp):
-        return Response("Faltan datos", status=400)
+        return Response("Faltan parámetros", status=400)
 
-    delete_verification(tenant, cuil, to_whatsapp)
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute("""
+      DELETE FROM verified_contacts
+      WHERE tenant=? AND cuil=? AND to_whatsapp=?
+    """, (tenant, cuil, to_whatsapp))
+    conn.commit()
+    conn.close()
+
     return redirect(f"/admin/panel?tenant={tenant}&token={token}&msg=verif_deleted")
 
 
@@ -1474,9 +1585,10 @@ def admin_panel():
 
     if verifs:
         html.append("<table border='1' cellpadding='6' cellspacing='0'>")
-        html.append("<tr><th>CUIL</th><th>WhatsApp</th><th>DNI (últ 4)</th><th>Verificado</th><th>Acciones</th></tr>")
+        html.append("<tr><th>Nombre</th><th>CUIL</th><th>WhatsApp</th><th>DNI (últ 4)</th><th>Verificado</th><th>Acciones</th></tr>")
         for r in verifs[:200]:
             html.append("<tr>")
+            html.append(f"<td>{esc(r.get('nombre') or '')}</td>")
             html.append(f"<td>{esc(r['cuil'])}</td>")
             html.append(f"<td>{esc(r['to_whatsapp'])}</td>")
             html.append(f"<td>{esc(r['dni_last4'])}</td>")
