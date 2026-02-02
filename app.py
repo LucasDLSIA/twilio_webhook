@@ -1749,19 +1749,24 @@ def admin_panel():
 
     html.append("<hr>")
     # ---- Selector periodo reportes ----
-    selected_period = (request.args.get("period") or "").strip()
-
     html.append("<hr>")
     html.append("<h3>Reportes</h3>")
-    html.append("<form method='get' action='/admin/panel'>")
-    html.append(f"<input type='hidden' name='token' value='{esc(token)}'>")
-    html.append(f"<input type='hidden' name='tenant' value='{esc(tenant)}'>")
-    period_folders = list_tenant_period_folders(tenant)   # ['01-2026','12-2025',...]
-    period_labels = [period_folder_to_label(p) for p in period_folders if period_folder_to_label(p)]
 
+    selected_period = (request.args.get("period") or "").strip()
+
+    period_folders = list_tenant_period_folders(tenant)   # ['01-2026','12-2025',...]
+    period_labels = []
+    for p in period_folders:
+        lbl = period_folder_to_label(p)   # '01/2026'
+        if lbl:
+            period_labels.append(lbl)
 
     if not selected_period and period_labels:
         selected_period = period_labels[0]   # default al más nuevo
+
+    html.append("<form method='get' action='/admin/panel'>")
+    html.append(f"<input type='hidden' name='token' value='{esc(token)}'>")
+    html.append(f"<input type='hidden' name='tenant' value='{esc(tenant)}'>")
 
     html.append("<label>Período para reportes:</label> ")
     html.append("<select name='period'>")
@@ -1770,9 +1775,10 @@ def admin_panel():
         sel = "selected" if lbl == selected_period else ""
         html.append(f"<option value='{esc(lbl)}' {sel}>{esc(lbl)}</option>")
     html.append("</select> ")
+    html.append("<button type='submit'>Aplicar</button>")
+    html.append("</form>")
 
-
-    period_q = quote(selected_period, safe="")  # <-- IMPORTANTE
+    period_q = quote(selected_period, safe="")
 
     html.append(
         f"<p><a href='/admin/report_recibos.xlsx?tenant={esc(tenant)}&period={period_q}&token={esc(token)}'>"
@@ -1780,9 +1786,10 @@ def admin_panel():
     )
 
     html.append(
-    f"<p><a href='/admin/report_envios.csv?tenant={esc(tenant)}&token={esc(token)}'>"
-    "📄 Envíos realizados (CSV)</a></p>"
+        f"<p><a href='/admin/report_envios.csv?tenant={esc(tenant)}&token={esc(token)}'>"
+        "📄 Envíos realizados (CSV)</a></p>"
     )
+
 
     # ---- Verificaciones ----
     verifs = get_verifications_rows(tenant)
