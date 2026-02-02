@@ -368,7 +368,7 @@ def find_pdf_file_id_for_cuil_period(tenant: str, cuil: str, period: str) -> str
     # el root tiene subcarpetas por período tipo "12-2025"
     # si te pasan "12/2025", lo convertimos
     period = period.strip()
-    period_folder_name = period.replace("/", "-")
+    period_folder_name = normalize_period_for_drive(period)
 
     service = drive_service()
 
@@ -1359,6 +1359,19 @@ import time
 
 def _digits(s: str) -> str:
     return "".join(ch for ch in (s or "") if ch.isdigit())
+
+def normalize_period_for_drive(period: str) -> str:
+    """
+    Convierte 'MM/AAAA' -> 'MM-AAAA'
+    Acepta también 'MM-AAAA' y lo deja igual.
+    """
+    if not period:
+        return ""
+    p = period.strip()
+    if "/" in p:
+        return p.replace("/", "-")
+    return p
+
 
 def normalize_whatsapp(raw: str) -> str | None:
     """
