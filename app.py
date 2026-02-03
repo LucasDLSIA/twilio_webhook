@@ -742,7 +742,9 @@ def resolve_best_period_with_pdf(tenant: str, cuil: str) -> str | None:
       - mes actual si existe PDF
       - si no, el último período disponible con PDF
     """
-    now = datetime.now()
+    import datetime as _dt
+    now = _dt.datetime.now()
+
     current = f"{now.month:02d}/{now.year:04d}"
 
     # 1) Mes actual (si existe)
