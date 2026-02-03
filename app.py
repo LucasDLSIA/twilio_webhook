@@ -3197,8 +3197,6 @@ def twilio_inbound():
     return Response("OK", status=200)
 
 def _send_pdf_flow(from_whatsapp: str, tenant: str, cuil: str, period: str) -> str | None:
-    """Envía el PDF del recibo y devuelve Message SID si pudo enviarlo."""
-    # re-chequear que exista PDF antes de enviar
     file_id = find_pdf_file_id_for_cuil_period(tenant, cuil, period)
     if not file_id:
         return None
@@ -3215,17 +3213,15 @@ def _send_pdf_flow(from_whatsapp: str, tenant: str, cuil: str, period: str) -> s
             body=f"Acá tenés tu recibo {period}.",
             status_callback=STATUS_CALLBACK_URL,
         )
-        print("SENT PDF SID:", sid_pdf)
 
-        # estado interno
         set_recibo_estado(tenant, cuil, period, "DISPONIBLE")
-
         save_pdf_sid(tenant, cuil, period, from_whatsapp, sid_pdf)
         return sid_pdf
 
     except Exception as e:
         print("ERROR sending PDF:", e)
         return None
+
 
 
 
