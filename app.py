@@ -1669,17 +1669,31 @@ from openpyxl.utils import get_column_letter
 
 from datetime import datetime, timezone
 
+from datetime import datetime
+
 def ts_to_str(ts) -> str:
     """
-    Unix ts (segundos) -> 'dd/mm/aaaa HH:MM:SS'
+    Convierte timestamp Unix (seg o ms) a 'dd/mm/aaaa HH:MM:SS'.
+    Si no puede convertir, devuelve ''.
     """
-    if ts is None or ts == "" or ts == 0:
+    if ts is None:
         return ""
     try:
-        ts_i = int(float(ts))
-        return datetime.fromtimestamp(ts_i).strftime("%d/%m/%Y %H:%M:%S")
+        # soporta int, float, numpy, strings tipo "1770052979" o "1770052979.0"
+        s = str(ts).strip()
+        if s == "" or s.lower() == "nan":
+            return ""
+
+        ts_f = float(s)
+
+        # si viene en milisegundos, lo pasamos a segundos
+        if ts_f > 10_000_000_000:  # ~año 2286 en segundos
+            ts_f = ts_f / 1000.0
+
+        return datetime.fromtimestamp(int(ts_f)).strftime("%d/%m/%Y %H:%M:%S")
     except Exception:
         return ""
+
 
 
 
