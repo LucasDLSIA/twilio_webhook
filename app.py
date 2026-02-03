@@ -3137,6 +3137,35 @@ def twiml(msg: str):
         status=200
     )
 
+import json
+from twilio.rest import Client
+
+# poné tu Content SID real en una env var
+WHATSAPP_MENU_CONTENT_SID = os.getenv("WHATSAPP_MENU_CONTENT_SID", "")
+
+def send_whatsapp_menu_template(to_whatsapp: str, nombre: str = "") -> str | None:
+    """
+    Envía la plantilla 'asistente recibos' por Content API.
+    Devuelve Message SID o None.
+    """
+    if not WHATSAPP_MENU_CONTENT_SID:
+        print("ERROR: falta WHATSAPP_MENU_CONTENT_SID")
+        return None
+
+    client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
+
+    # variable {{1}} (en Twilio Content API se manda como {"1":"valor"})
+    vars_ = {"1": (nombre or "").strip()}
+
+    msg = client.messages.create(
+        to=to_whatsapp,
+        from_=TWILIO_WHATSAPP_FROM,  # ej: "whatsapp:+14155238886" o tu sender
+        content_sid=WHATSAPP_MENU_CONTENT_SID,
+        content_variables=json.dumps(vars_),
+        status_callback=STATUS_CALLBACK_URL if 'STATUS_CALLBACK_URL' in globals() else None
+    )
+    return msg.sid
+
 
 TWILIO_SIGN_TEMPLATE_SID = os.environ.get("TWILIO_SIGN_TEMPLATE_SID", "").strip()
 
@@ -3163,8 +3192,11 @@ def twilio_inbound():
     # SIN PENDING: o guía o reconstrucción para "RECIBO"
     # =========================
     if not pending:
-        # si NO es pedido de recibo, contestamos con ayuda (TwiML) para que "responda"
         if not _is_receipt_request_text(body) and not button:
+            # 🔥 En vez de contestar texto, mandamos la plantilla menú
+            sid = send_whatsapp_menu_template(from_whatsapp, nombre="")
+            if sid:
+                return twiml("✅ Te envié el menú de recibos.")
             return twiml("👋 Hola. Para recibir tu recibo escribí: *RECIBO*.\nSi no recibiste el mensaje inicial, avisá a RRHH.")
 
         # si es pedido de recibo -> reconstruimos contexto desde último envío
@@ -3206,36 +3238,93 @@ def twilio_inbound():
 
 
     # =========================
-    # PEDIDO MANUAL POR TEXTO: límite 3
+    # BOTONES PLANTILLA: RESEND_LAST / SEE_PREVIOUS / MORE_OPTIONS
     # =========================
-    if (not button) and _is_receipt_request_text(body) and step != "AWAIT_DNI":
+
+    # MORE_OPTIONS (respuesta simple por ahora)
+    if button == "MORE_OPTIONS":
+        return twiml("ℹ️ Esta opción estará disponible próximamente.")
+
+    # RESEND_LAST -> envía el último recibo disponible (mes actual si existe, sino el último real)
+    if button == "RESEND_LAST":
         best_period = resolve_best_period_with_pdf(tenant, cuil)
         if not best_period:
-            _log_receipt_request_event(tenant, cuil, "", from_whatsapp, "USER_TEXT", "NO_PDF")
-            return twiml("⚠️ No encontré ningún recibo disponible. Avisá a RRHH.")
+            _log_receipt_request_event(tenant, cuil, "", from_whatsapp, "RESEND_LAST", "NO_PDF")
+            return twiml("⚠️ No encontré recibos disponibles para tu CUIL. Avisá a RRHH.")
 
-        period = best_period
-        add_pending_view(from_whatsapp, tenant, cuil, period)
-        pending = get_latest_pending_view(from_whatsapp)
-
-        cnt = get_receipt_request_count(tenant, cuil, period, from_whatsapp)
+        cnt = get_receipt_request_count(tenant, cuil, best_period, from_whatsapp)
         if cnt >= 3:
-            _log_receipt_request_event(tenant, cuil, period, from_whatsapp, "USER_TEXT", "BLOCKED_LIMIT")
-            return twiml(f"⚠️ Ya pediste este recibo {cnt}/3 veces para {period}. Si necesitás más, avisá a RRHH.")
+            _log_receipt_request_event(tenant, cuil, best_period, from_whatsapp, "RESEND_LAST", "BLOCKED_LIMIT")
+            return twiml(f"⚠️ Ya pediste este recibo {cnt}/3 veces para {best_period}. Si necesitás más, avisá a RRHH.")
+
+        if not is_verified_contact(tenant, cuil, from_whatsapp):
+            # guardamos el período elegido en el pending
+            add_pending_view(from_whatsapp, tenant, cuil, chosen_period)
+            pending = get_latest_pending_view(from_whatsapp)
+            set_pending_step(pending["id"], "AWAIT_DNI")
+
+            _log_receipt_request_event(tenant, cuil, chosen_period, from_whatsapp, "CHOOSE_PREVIOUS", "ASK_DNI")
+            return twiml("🔐 Para reenviar tu recibo, enviá tu DNI (solo números, sin puntos).")
+
+        sid_pdf = _send_pdf_flow(from_whatsapp, tenant, cuil, best_period)
+        if not sid_pdf:
+            _log_receipt_request_event(tenant, cuil, best_period, from_whatsapp, "RESEND_LAST", "ERROR")
+            return twiml("❌ No pude enviar el PDF en este momento. Probá de nuevo o avisá a RRHH.")
+
+        n = inc_receipt_request_count(tenant, cuil, best_period, from_whatsapp)
+        _log_receipt_request_event(tenant, cuil, best_period, from_whatsapp, "RESEND_LAST", "SENT", message_sid=sid_pdf)
+        return twiml(f"📄 Listo. Te reenvié el recibo {best_period}. (Pedido {n}/3)")
+
+    # SEE_PREVIOUS -> ofrece hasta 3 períodos anteriores (no envía PDF todavía)
+    if button == "SEE_PREVIOUS":
+        periods = list_periods_for_cuil(tenant, strip_pdf(cuil)) or []
+        prev = periods[1:4]  # tres anteriores al último disponible
+
+        if not prev:
+            return twiml("ℹ️ No tengo períodos anteriores disponibles.")
+
+        set_pending_step(pending["id"], "CHOOSE_PREVIOUS")
+
+        msg = "🗂️ Períodos anteriores:\n\n"
+        for i, p in enumerate(prev, start=1):
+            msg += f"{i}. {p}\n"
+        msg += "\nRespondé con 1, 2 o 3 para elegir."
+        return twiml(msg)
+
+    # =========================
+    # SELECCIÓN de período anterior (1/2/3) cuando step=CHOOSE_PREVIOUS
+    # =========================
+    if step == "CHOOSE_PREVIOUS" and (not button) and (body or "").strip() in ("1", "2", "3"):
+        idx = int((body or "").strip()) - 1
+
+        periods = list_periods_for_cuil(tenant, strip_pdf(cuil)) or []
+        prev = periods[1:4]
+        if idx >= len(prev):
+            return twiml("❌ Opción inválida. Respondé con 1, 2 o 3.")
+
+        chosen_period = prev[idx]
+
+        # volvemos a READY para no quedar pegados en modo selección
+        set_pending_step(pending["id"], "READY")
+
+        cnt = get_receipt_request_count(tenant, cuil, chosen_period, from_whatsapp)
+        if cnt >= 3:
+            _log_receipt_request_event(tenant, cuil, chosen_period, from_whatsapp, "CHOOSE_PREVIOUS", "BLOCKED_LIMIT")
+            return twiml(f"⚠️ Ya pediste este recibo {cnt}/3 veces para {chosen_period}. Si necesitás más, avisá a RRHH.")
 
         if not is_verified_contact(tenant, cuil, from_whatsapp):
             set_pending_step(pending["id"], "AWAIT_DNI")
-            _log_receipt_request_event(tenant, cuil, period, from_whatsapp, "USER_TEXT", "ASK_DNI")
+            _log_receipt_request_event(tenant, cuil, chosen_period, from_whatsapp, "CHOOSE_PREVIOUS", "ASK_DNI")
             return twiml("🔐 Para reenviar tu recibo, enviá tu DNI (solo números, sin puntos).")
 
-        sid_pdf = _send_pdf_flow(from_whatsapp, tenant, cuil, period)
+        sid_pdf = _send_pdf_flow(from_whatsapp, tenant, cuil, chosen_period)
         if not sid_pdf:
-            _log_receipt_request_event(tenant, cuil, period, from_whatsapp, "USER_TEXT", "ERROR")
+            _log_receipt_request_event(tenant, cuil, chosen_period, from_whatsapp, "CHOOSE_PREVIOUS", "ERROR")
             return twiml("❌ No pude enviar el PDF en este momento. Probá de nuevo o avisá a RRHH.")
 
-        n = inc_receipt_request_count(tenant, cuil, period, from_whatsapp)
-        _log_receipt_request_event(tenant, cuil, period, from_whatsapp, "USER_TEXT", "SENT", message_sid=sid_pdf)
-        return twiml(f"📄 Listo. Te reenvié el recibo {period}. (Pedido {n}/3)")
+        n = inc_receipt_request_count(tenant, cuil, chosen_period, from_whatsapp)
+        _log_receipt_request_event(tenant, cuil, chosen_period, from_whatsapp, "CHOOSE_PREVIOUS", "SENT", message_sid=sid_pdf)
+        return twiml(f"📄 Listo. Te reenvié el recibo {chosen_period}. (Pedido {n}/3)")
 
     # =========================
     # AWAIT_DNI
