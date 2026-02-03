@@ -4,7 +4,7 @@ import re
 import time
 import sqlite3
 import json
-from datetime import datetime, timedelta
+from datetime import datetime
 from typing import Optional, Dict, List
 
 import pandas as pd
@@ -712,27 +712,52 @@ def get_db_connection():
     conn.row_factory = sqlite3.Row
     return conn
 
-
-# =========================
-# Recibo re-request (hasta 3 por período)
-# =========================
-def current_period_ba() -> str:
-    """Devuelve período actual en Buenos Aires como 'MM/AAAA'."""
-    # Render corre en UTC; BA = UTC-3
-    now_utc = datetime.utcnow()
-    now_ba = now_utc - timedelta(hours=3)
-    return f"{now_ba.month:02d}/{now_ba.year:04d}"
-
-def _log_receipt_request_event(tenant: str, cuil: str, period: str, to_whatsapp: str, source: str, result: str, message_sid: str = ""):
-    now = int(time.time())
+def get_latest_context_for_whatsapp(to_whatsapp: str) -> dict | None:
+    """
+    Devuelve el último contexto conocido (tenant, cuil, period) para ese WhatsApp,
+    mirando message_status (template/pdf).
+    """
     conn = get_db_connection()
+    conn.row_factory = sqlite3.Row
     cur = conn.cursor()
     cur.execute("""
-        INSERT INTO receipt_request_events (tenant, cuil, period, to_whatsapp, requested_at, source, result, message_sid)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-    """, (tenant, cuil, period, to_whatsapp, now, source, result, message_sid or ""))
-    conn.commit()
+        SELECT tenant, cuil, period
+        FROM message_status
+        WHERE to_whatsapp = ?
+          AND COALESCE(tenant,'') != ''
+          AND COALESCE(cuil,'') != ''
+        ORDER BY COALESCE(created_at,0) DESC, id DESC
+        LIMIT 1
+    """, (to_whatsapp,))
+    row = cur.fetchone()
     conn.close()
+    return dict(row) if row else None
+
+
+def resolve_best_period_with_pdf(tenant: str, cuil: str) -> str | None:
+    """
+    Prioridad:
+      1) mes actual (MM/AAAA) si existe PDF
+      2) si no, último período disponible en Drive para ese CUIL
+    """
+    now = datetime.now()
+    current = f"{now.month:02d}/{now.year:04d}"
+
+    # 1) mes actual
+    try:
+        fid = find_pdf_file_id_for_cuil_period(tenant, cuil, current)
+        if fid:
+            return current
+    except Exception:
+        pass
+
+    # 2) último período
+    try:
+        periods = list_periods_for_cuil(tenant, strip_pdf(cuil))
+        return periods[0] if periods else None
+    except Exception:
+        return None
+
 
 def get_receipt_request_count(tenant: str, cuil: str, period: str, to_whatsapp: str) -> int:
     conn = get_db_connection()
@@ -745,16 +770,15 @@ def get_receipt_request_count(tenant: str, cuil: str, period: str, to_whatsapp: 
     """, (tenant, cuil, period, to_whatsapp))
     row = cur.fetchone()
     conn.close()
-    try:
-        return int(row[0]) if row else 0
-    except Exception:
-        return 0
+    return int(row[0]) if row and row[0] is not None else 0
+
 
 def inc_receipt_request_count(tenant: str, cuil: str, period: str, to_whatsapp: str) -> int:
     now = int(time.time())
     conn = get_db_connection()
     cur = conn.cursor()
 
+    # upsert compatible
     cur.execute("""
         SELECT id, request_count, first_requested_at
         FROM receipt_requests
@@ -764,56 +788,47 @@ def inc_receipt_request_count(tenant: str, cuil: str, period: str, to_whatsapp: 
     row = cur.fetchone()
 
     if row:
-        rid, cnt, first_ts = row[0], int(row[1] or 0), row[2]
-        cnt2 = cnt + 1
+        rid, cnt, first_ts = row
+        cnt = int(cnt or 0) + 1
         cur.execute("""
             UPDATE receipt_requests
             SET request_count=?, last_requested_at=?
             WHERE id=?
-        """, (cnt2, now, rid))
+        """, (cnt, now, rid))
     else:
-        cnt2 = 1
+        cnt = 1
         cur.execute("""
-            INSERT INTO receipt_requests (tenant, cuil, period, to_whatsapp, request_count, first_requested_at, last_requested_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-        """, (tenant, cuil, period, to_whatsapp, cnt2, now, now))
+            INSERT INTO receipt_requests
+            (tenant,cuil,period,to_whatsapp,request_count,first_requested_at,last_requested_at)
+            VALUES (?,?,?,?,?,?,?)
+        """, (tenant, cuil, period, to_whatsapp, cnt, now, now))
 
     conn.commit()
     conn.close()
-    return cnt2
+    return cnt
 
-def get_latest_context_for_whatsapp(to_whatsapp: str) -> dict | None:
-    """Intenta resolver tenant/cuil desde el último envío registrado."""
+
+def _log_receipt_request_event(
+    tenant: str,
+    cuil: str,
+    period: str,
+    to_whatsapp: str,
+    source: str,
+    result: str,
+    message_sid: str | None = None
+):
+    now = int(time.time())
     conn = get_db_connection()
-    conn.row_factory = sqlite3.Row
     cur = conn.cursor()
     cur.execute("""
-        SELECT tenant, cuil, period, kind, created_at
-        FROM message_status
-        WHERE to_whatsapp=?
-          AND COALESCE(tenant,'') <> ''
-          AND COALESCE(cuil,'') <> ''
-        ORDER BY COALESCE(created_at,0) DESC, id DESC
-        LIMIT 1
-    """, (to_whatsapp,))
-    row = cur.fetchone()
+        INSERT INTO receipt_request_events
+        (tenant,cuil,period,to_whatsapp,source,result,message_sid,created_at)
+        VALUES (?,?,?,?,?,?,?,?)
+    """, (tenant, cuil, period or "", to_whatsapp, source, result, message_sid or "", now))
+    conn.commit()
     conn.close()
-    return dict(row) if row else None
-
-def resolve_best_period_with_pdf(tenant: str, cuil: str) -> str | None:
-    """Devuelve 'MM/AAAA' del mes actual si existe PDF; si no, el último período disponible."""
-    p_now = current_period_ba()
-    try:
-        if find_pdf_file_id_for_cuil_period(tenant, cuil, p_now):
-            return p_now
-    except Exception:
-        pass
-
-    try:
-        periods = list_periods_for_cuil(tenant, cuil)
-        return periods[0] if periods else None
-    except Exception:
-        return None
+# =========================
+# DB Initialization / Migration
 
 
 import time, hashlib
@@ -915,7 +930,7 @@ def init_db():
     _try_alter(cur, "ALTER TABLE sent_pdfs ADD COLUMN sign_sent_at INTEGER;")
 
     # =========
-    # ✅ verifications (ÚNICA tabla de verificación)
+    # verifications (ya la usás)
     # =========
     cur.execute("""
       CREATE TABLE IF NOT EXISTS verifications (
@@ -931,66 +946,56 @@ def init_db():
         UNIQUE(tenant, cuil, to_whatsapp)
       );
     """)
-
-    # migraciones safe si venías con esquema anterior
     _try_alter(cur, "ALTER TABLE verifications ADD COLUMN nombre TEXT;")
     _try_alter(cur, "ALTER TABLE verifications ADD COLUMN dni_hash TEXT;")
     _try_alter(cur, "ALTER TABLE verifications ADD COLUMN dni_last4 TEXT;")
     _try_alter(cur, "ALTER TABLE verifications ADD COLUMN verified_at INTEGER;")
     _try_alter(cur, "ALTER TABLE verifications ADD COLUMN updated_at INTEGER;")
 
+    # =========
+    # ✅ NUEVO: receipt_requests (contador por período)
+    # =========
+    cur.execute("""
+      CREATE TABLE IF NOT EXISTS receipt_requests (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        tenant TEXT NOT NULL,
+        cuil TEXT NOT NULL,
+        period TEXT NOT NULL,
+        to_whatsapp TEXT NOT NULL,
+        request_count INTEGER NOT NULL DEFAULT 0,
+        first_requested_at INTEGER,
+        last_requested_at INTEGER,
+        UNIQUE(tenant, cuil, period, to_whatsapp)
+      );
+    """)
+
+    # =========
+    # ✅ NUEVO: receipt_request_events (log evento por evento)
+    # =========
+    cur.execute("""
+      CREATE TABLE IF NOT EXISTS receipt_request_events (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        tenant TEXT NOT NULL,
+        cuil TEXT NOT NULL,
+        period TEXT,
+        to_whatsapp TEXT NOT NULL,
+        source TEXT NOT NULL,     -- USER_TEXT / VIEW_NOW / DNI_OK / etc.
+        result TEXT NOT NULL,     -- SENT / BLOCKED_LIMIT / ASK_DNI / NO_PDF / ERROR / NO_CONTEXT
+        message_sid TEXT,
+        created_at INTEGER NOT NULL
+      );
+    """)
+
+    # índices útiles
     _try_alter(cur, "CREATE INDEX IF NOT EXISTS idx_pending_to_created ON pending_views(to_whatsapp, created_at);")
     _try_alter(cur, "CREATE INDEX IF NOT EXISTS idx_estado_key ON recibo_estado(tenant, cuil, period);")
     _try_alter(cur, "CREATE INDEX IF NOT EXISTS idx_msg_key ON message_status(tenant, cuil, period, kind);")
     _try_alter(cur, "CREATE INDEX IF NOT EXISTS idx_msg_sid ON message_status(message_sid);")
     _try_alter(cur, "CREATE INDEX IF NOT EXISTS idx_sentpdfs_sid ON sent_pdfs(message_sid);")
-
     _try_alter(cur, "CREATE INDEX IF NOT EXISTS idx_verif_tenant_cuil ON verifications(tenant, cuil);")
     _try_alter(cur, "CREATE INDEX IF NOT EXISTS idx_verif_tenant_wa ON verifications(tenant, to_whatsapp);")
-
-
-
-# =========
-    # receipt_requests (reenvíos / pedidos de recibo)
-    # =========
-    cur.execute("""
-      CREATE TABLE IF NOT EXISTS receipt_requests (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    tenant TEXT NOT NULL,
-    cuil TEXT NOT NULL,
-    period TEXT NOT NULL,
-    to_whatsapp TEXT NOT NULL,
-    request_count INTEGER NOT NULL DEFAULT 0,
-    first_requested_at INTEGER,
-    last_requested_at INTEGER,
-    UNIQUE(tenant, cuil, period, to_whatsapp)
-      );
-    """)
-    _try_alter(cur, "ALTER TABLE receipt_requests ADD COLUMN request_count INTEGER;")
-    _try_alter(cur, "ALTER TABLE receipt_requests ADD COLUMN first_requested_at INTEGER;")
-    _try_alter(cur, "ALTER TABLE receipt_requests ADD COLUMN last_requested_at INTEGER;")
-
-    cur.execute("""
-      CREATE TABLE IF NOT EXISTS receipt_request_events (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    tenant TEXT,
-    cuil TEXT,
-    period TEXT,
-    to_whatsapp TEXT,
-    requested_at INTEGER NOT NULL,
-    source TEXT,
-    result TEXT,
-    message_sid TEXT
-      );
-    """)
-    _try_alter(cur, "ALTER TABLE receipt_request_events ADD COLUMN source TEXT;")
-    _try_alter(cur, "ALTER TABLE receipt_request_events ADD COLUMN result TEXT;")
-    _try_alter(cur, "ALTER TABLE receipt_request_events ADD COLUMN message_sid TEXT;")
-
     _try_alter(cur, "CREATE INDEX IF NOT EXISTS idx_rr_key ON receipt_requests(tenant, cuil, period, to_whatsapp);")
-    _try_alter(cur, "CREATE INDEX IF NOT EXISTS idx_rre_key ON receipt_request_events(tenant, cuil, period, to_whatsapp);")
-
-
+    _try_alter(cur, "CREATE INDEX IF NOT EXISTS idx_rre_key ON receipt_request_events(tenant, cuil, period, to_whatsapp, created_at);")
 
     conn.commit()
     conn.close()
@@ -1379,6 +1384,198 @@ def norm_period_label(p: str) -> str:
 
     return f"{mm}/{yyyy}"
 
+def generate_pdf_report_v2(tenant: str, period_filter: str = "") -> BytesIO:
+    """
+    Genera un PDF simple con el mismo contenido que el XLSX (incluye pedidos_recibo).
+    """
+    from reportlab.lib.pagesizes import A4, landscape
+    from reportlab.pdfgen import canvas
+    from reportlab.lib.units import cm
+
+    # reutilizamos el armado del XLSX para no duplicar lógica:
+    # acá armamos una "vista" leyendo directamente desde DB similar a generate_excel_report_v2
+    tenant = (tenant or "").strip().lower()
+    period_filter = norm_period_label(period_filter)
+
+    conn = get_db_connection()
+    conn.row_factory = sqlite3.Row
+    cur = conn.cursor()
+
+    cur.execute("""
+        SELECT
+            to_whatsapp, tenant, cuil, period, nombre, kind,
+            created_at, delivered_at, read_at, failed_at
+        FROM message_status
+        WHERE tenant = ?
+    """, (tenant,))
+    msg_rows = cur.fetchall()
+
+    cur.execute("""
+        SELECT tenant, cuil, period, estado, updated_at
+        FROM recibo_estado
+        WHERE tenant = ?
+    """, (tenant,))
+    estado_rows = cur.fetchall()
+
+    cur.execute("""
+        SELECT tenant,cuil,period,to_whatsapp,request_count,last_requested_at
+        FROM receipt_requests
+        WHERE tenant = ?
+    """, (tenant,))
+    rr_rows = cur.fetchall()
+
+    conn.close()
+
+    estado_map = {}
+    for r in estado_rows:
+        c = (r["cuil"] or "").strip()
+        p = norm_period_label(r["period"] or "")
+        if c and p:
+            estado_map[(c, p)] = {"estado": (r["estado"] or "").strip(), "ts": r["updated_at"]}
+
+    rr_map = {}
+    for r in rr_rows:
+        c = (r["cuil"] or "").strip()
+        p = norm_period_label(r["period"] or "")
+        w = (r["to_whatsapp"] or "").strip()
+        if c and p and w:
+            rr_map[(w, c, p)] = {"count": int(r["request_count"] or 0), "last": r["last_requested_at"]}
+
+    # agregación: una fila por (whatsapp,period)
+    agg = {}
+    for row in msg_rows:
+        wpp = (row["to_whatsapp"] or "").strip()
+        if not wpp:
+            continue
+        cuil = (row["cuil"] or "").strip()
+        nombre = (row["nombre"] or "").strip()
+        per = norm_period_label((row["period"] or "").strip())
+        if period_filter and per != period_filter:
+            continue
+        if not per:
+            continue
+
+        k = (wpp, per)
+        if k not in agg:
+            agg[k] = {
+                "Periodo": per,
+                "Nombre": nombre,
+                "CUIL": cuil,
+                "WhatsApp": wpp,
+                "PDF_enviado": "",
+                "PDF_entregado": "",
+                "PDF_leido": "",
+                "Respuesta": "",
+                "Pedidos": 0,
+                "Ultimo_pedido": "",
+            }
+
+        kind = (row["kind"] or "").strip().lower()
+        if kind in ("pdf", "media"):
+            # guardamos los timestamps más útiles
+            if row["created_at"]:
+                agg[k]["PDF_enviado"] = ts_to_str(row["created_at"])
+            if row["delivered_at"]:
+                agg[k]["PDF_entregado"] = ts_to_str(row["delivered_at"])
+            if row["read_at"]:
+                agg[k]["PDF_leido"] = ts_to_str(row["read_at"])
+
+    # mezclar estado + pedidos
+    for k, rec in agg.items():
+        cuil = rec.get("CUIL","")
+        per = rec.get("Periodo","")
+        st = estado_map.get((cuil, per))
+        if st:
+            rec["Respuesta"] = st.get("estado","")
+
+        rr = rr_map.get((rec["WhatsApp"], cuil, per))
+        if rr:
+            rec["Pedidos"] = rr["count"]
+            rec["Ultimo_pedido"] = ts_to_str(rr["last"])
+
+    rows = list(agg.values())
+    rows.sort(key=lambda r: (r.get("Periodo",""), r.get("Nombre",""), r.get("WhatsApp","")))
+
+    # PDF
+    out = BytesIO()
+    c = canvas.Canvas(out, pagesize=landscape(A4))
+    width, height = landscape(A4)
+
+    title = f"Reporte Recibos - {tenant} - {(period_filter if period_filter else 'TODOS')}"
+    c.setFont("Helvetica-Bold", 14)
+    c.drawString(1.2*cm, height - 1.2*cm, title)
+
+    headers = ["Periodo","Nombre","CUIL","WhatsApp","PDF_enviado","PDF_entregado","PDF_leido","Respuesta","Pedidos","Ultimo_pedido"]
+
+    x0 = 1.2*cm
+    y = height - 2.2*cm
+    line_h = 0.6*cm
+
+    # anchos aproximados
+    col_w = [2.2*cm, 5.0*cm, 3.5*cm, 5.2*cm, 3.2*cm, 3.2*cm, 3.0*cm, 3.0*cm, 1.8*cm, 3.5*cm]
+
+    def draw_row(vals, bold=False):
+        nonlocal y
+        if y < 1.2*cm:
+            c.showPage()
+            c.setFont("Helvetica-Bold", 14)
+            c.drawString(1.2*cm, height - 1.2*cm, title)
+            y = height - 2.2*cm
+
+        c.setFont("Helvetica-Bold" if bold else "Helvetica", 8.5)
+        x = x0
+        for i, v in enumerate(vals):
+            txt = str(v or "")
+            c.drawString(x, y, txt[:60])
+            x += col_w[i]
+        y -= line_h
+
+    draw_row(headers, bold=True)
+    c.setLineWidth(0.5)
+    c.line(x0, y + 0.2*cm, width - 1.2*cm, y + 0.2*cm)
+    y -= 0.2*cm
+
+    for r in rows:
+        draw_row([
+            r.get("Periodo",""),
+            r.get("Nombre",""),
+            r.get("CUIL",""),
+            r.get("WhatsApp",""),
+            r.get("PDF_enviado",""),
+            r.get("PDF_entregado",""),
+            r.get("PDF_leido",""),
+            r.get("Respuesta",""),
+            r.get("Pedidos",""),
+            r.get("Ultimo_pedido",""),
+        ])
+
+    c.showPage()
+    c.save()
+
+    out.seek(0)
+    return out
+
+
+@app.get("/admin/report_recibos.pdf")
+def admin_report_recibos_pdf():
+    token = _get_admin_token_from_request()
+    tenant = (request.args.get("tenant") or "").strip().lower()
+    period = (request.args.get("period") or "").strip()
+
+    if not tenant:
+        return Response("Falta tenant", status=400)
+
+    buf = generate_pdf_report_v2(tenant, period_filter=period)
+
+    filename = f"reporte_recibos_{tenant}_{(norm_period_label(period).replace('/','-') if period else 'todos')}.pdf"
+    return send_file(
+        buf,
+        as_attachment=True,
+        download_name=filename,
+        mimetype="application/pdf"
+    )
+
+
 @app.get("/admin/report_recibos.xlsx")
 def admin_report_recibos_xlsx():
     token = _get_admin_token_from_request()
@@ -1397,70 +1594,6 @@ def admin_report_recibos_xlsx():
         download_name=filename,
         mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
     )
-@app.get("/admin/report_recibos.pdf")
-def admin_report_recibos_pdf():
-    token = _get_admin_token_from_request()
-    tenant = (request.args.get("tenant") or "").strip().lower()
-    period = (request.args.get("period") or "").strip()
-
-    if not tenant:
-        return Response("Falta tenant", status=400)
-
-    # Reutilizamos el mismo armado del XLSX y lo convertimos a tabla PDF
-    xbuf = generate_excel_report_v2(tenant, period_filter=period)
-    xbuf.seek(0)
-
-    try:
-        import pandas as pd
-        df = pd.read_excel(xbuf)
-    except Exception as e:
-        return Response(f"Error leyendo reporte para PDF: {str(e)}", status=500)
-
-    from reportlab.lib.pagesizes import A4, landscape
-    from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer
-    from reportlab.lib import colors
-    from reportlab.lib.styles import getSampleStyleSheet
-
-    out = BytesIO()
-    doc = SimpleDocTemplate(out, pagesize=landscape(A4), leftMargin=18, rightMargin=18, topMargin=18, bottomMargin=18)
-    styles = getSampleStyleSheet()
-
-    title = f"Reporte de recibos - {tenant}" + (f" - {norm_period_label(period)}" if period else "")
-    story = [Paragraph(title, styles["Title"]), Spacer(1, 10)]
-
-    if df is None or df.empty:
-        story.append(Paragraph("Sin datos para el filtro seleccionado.", styles["Normal"]))
-    else:
-        # limitar columnas muy largas en PDF
-        df2 = df.copy()
-        for c in df2.columns:
-            df2[c] = df2[c].astype(str).str.slice(0, 60)
-
-        data = [list(df2.columns)] + df2.values.tolist()
-
-        tbl = Table(data, repeatRows=1)
-        tbl.setStyle(TableStyle([
-            ("BACKGROUND", (0,0), (-1,0), colors.lightgrey),
-            ("TEXTCOLOR", (0,0), (-1,0), colors.black),
-            ("GRID", (0,0), (-1,-1), 0.25, colors.grey),
-            ("FONTSIZE", (0,0), (-1,-1), 7),
-            ("VALIGN", (0,0), (-1,-1), "TOP"),
-        ]))
-        story.append(tbl)
-
-    doc.build(story)
-    out.seek(0)
-
-    filename = f"reporte_recibos_{tenant}_{(norm_period_label(period).replace('/','-') if period else 'todos')}.pdf"
-    return send_file(
-        out,
-        as_attachment=True,
-        download_name=filename,
-        mimetype="application/pdf"
-    )
-
-
-
 
 
 
@@ -1903,10 +2036,6 @@ def ts_to_str(ts) -> str:
 
 
 def generate_excel_report_v2(tenant: str, period_filter: str = "") -> BytesIO:
-    """
-    Reporte estilo "tu función": una fila por (WhatsApp, Período)
-    Fuente: message_status + pending_views + recibo_estado
-    """
     tenant = (tenant or "").strip().lower()
     period_filter = norm_period_label(period_filter)
 
@@ -1914,7 +2043,7 @@ def generate_excel_report_v2(tenant: str, period_filter: str = "") -> BytesIO:
     conn.row_factory = sqlite3.Row
     cur = conn.cursor()
 
-    # 1) message_status
+    # message_status
     cur.execute("""
         SELECT
             to_whatsapp, tenant, cuil, period, nombre, kind,
@@ -1924,7 +2053,7 @@ def generate_excel_report_v2(tenant: str, period_filter: str = "") -> BytesIO:
     """, (tenant,))
     msg_rows = cur.fetchall()
 
-    # 2) pending_views (último period por (whatsapp,cuil))
+    # pending_views (último period por (whatsapp,cuil))
     cur.execute("""
         SELECT to_whatsapp, tenant, cuil, period, MAX(created_at) as last_ts
         FROM pending_views
@@ -1939,7 +2068,9 @@ def generate_excel_report_v2(tenant: str, period_filter: str = "") -> BytesIO:
         c = (r["cuil"] or "").strip()
         p = norm_period_label(r["period"] or "")
         if w and c and p:
-                last_period_by_user_cuil[(w, c)] = p# 3) recibo_estado (respuesta final)
+            last_period_by_user_cuil[(w, c)] = p
+
+    # recibo_estado
     cur.execute("""
         SELECT tenant, cuil, period, estado, updated_at
         FROM recibo_estado
@@ -1947,37 +2078,34 @@ def generate_excel_report_v2(tenant: str, period_filter: str = "") -> BytesIO:
     """, (tenant,))
     estado_rows = cur.fetchall()
 
-    # 4) receipt_requests (cuántas veces pidieron reenvío por período)
+    # ✅ NUEVO: requests por período
     cur.execute("""
-        SELECT to_whatsapp, period, request_count, last_requested_at
+        SELECT tenant,cuil,period,to_whatsapp,request_count,last_requested_at
         FROM receipt_requests
         WHERE tenant = ?
     """, (tenant,))
-    req_rows = cur.fetchall()
+    rr_rows = cur.fetchall()
 
     conn.close()
-
-    req_map = {}
-    for r in req_rows:
-        w = (r["to_whatsapp"] or "").strip()
-        p = norm_period_label(r["period"] or "")
-        if w and p:
-            req_map[(w, p)] = {
-                "count": int(r["request_count"] or 0),
-                "last_ts": r["last_requested_at"]
-            }
 
     estado_map = {}
     for r in estado_rows:
         c = (r["cuil"] or "").strip()
         p = norm_period_label(r["period"] or "")
         if c and p:
-            estado_map[(c, p)] = {
-                "estado": (r["estado"] or "").strip(),
-                "ts": r["updated_at"]
+            estado_map[(c, p)] = {"estado": (r["estado"] or "").strip(), "ts": r["updated_at"]}
+
+    rr_map = {}
+    for r in rr_rows:
+        c = (r["cuil"] or "").strip()
+        p = norm_period_label(r["period"] or "")
+        w = (r["to_whatsapp"] or "").strip()
+        if c and p and w:
+            rr_map[(w, c, p)] = {
+                "count": int(r["request_count"] or 0),
+                "last": r["last_requested_at"]
             }
 
-    # 4) Agregación
     def key(whatsapp: str, period_norm: str):
         return ((whatsapp or "").strip(), (period_norm or "").strip())
 
@@ -1994,15 +2122,12 @@ def generate_excel_report_v2(tenant: str, period_filter: str = "") -> BytesIO:
         period_raw = (row["period"] or "").strip()
         period_norm = norm_period_label(period_raw)
 
-        # fallback: si message_status vino sin period, lo resuelvo con pending_views
         if not period_norm and wpp and cuil:
             period_norm = last_period_by_user_cuil.get((wpp, cuil), "")
 
         if period_filter and period_norm != period_filter:
             continue
-
         if not period_norm:
-            # sin período no lo puedo ubicar en el reporte
             continue
 
         k = key(wpp, period_norm)
@@ -2028,7 +2153,6 @@ def generate_excel_report_v2(tenant: str, period_filter: str = "") -> BytesIO:
             }
             agg[k] = rec
 
-        # completar datos tardíos
         if nombre and not rec["nombre"]:
             rec["nombre"] = nombre
         if cuil and not rec["cuil"]:
@@ -2040,7 +2164,6 @@ def generate_excel_report_v2(tenant: str, period_filter: str = "") -> BytesIO:
         read_at = row["read_at"]
         failed_at = row["failed_at"]
 
-        # ⚠️ en tu app el PDF suele ser kind='pdf' (a veces 'media'); cubro ambos
         if kind == "template":
             if created_at and (not rec["plantilla_sent_at"] or created_at < rec["plantilla_sent_at"]):
                 rec["plantilla_sent_at"] = created_at
@@ -2060,8 +2183,8 @@ def generate_excel_report_v2(tenant: str, period_filter: str = "") -> BytesIO:
                 rec["pdf_read_at"] = read_at
             if failed_at:
                 rec["pdf_failed_at"] = failed_at
-    # 5) Mezclar recibo_estado como “respuesta”
-    #    (una respuesta por CUIL+Periodo; se inyecta en la fila WhatsApp+Periodo)
+
+    # mezclar recibo_estado
     for (wpp, per), rec in list(agg.items()):
         cuil = rec.get("cuil", "")
         st = estado_map.get((cuil, per))
@@ -2069,49 +2192,34 @@ def generate_excel_report_v2(tenant: str, period_filter: str = "") -> BytesIO:
             rec["respuesta_usuario"] = st.get("estado", "") or ""
             rec["respuesta_timestamp"] = st.get("ts")
 
-        rq = req_map.get((wpp, per))
-        if rq:
-            rec["pedidos_recibo"] = int(rq.get("count") or 0)
-            rec["ultimo_pedido"] = rq.get("last_ts")
+        rr = rr_map.get((wpp, cuil, per))
+        if rr:
+            rec["pedidos_recibo"] = rr["count"]
+            rec["ultimo_pedido"] = rr["last"]
 
-    # 6) Crear Excel
+    # Excel
     wb = Workbook()
     ws = wb.active
     ws.title = "Recibos"
 
     headers = [
-        "Periodo",
-        "Nombre",
-        "CUIL",
-        "WhatsApp",
-        "Plantilla_enviada",
-        "Plantilla_entregada",
-        "Plantilla_leida",
-        "Plantilla_fallida",
-        "PDF_enviado",
-        "PDF_entregado",
-        "PDF_leido",
-        "PDF_fallido",
-        "Respuesta_usuario",
-        "Respuesta_timestamp",
-        "Pedidos_recibo",
-        "Ultimo_pedido",
+        "Periodo","Nombre","CUIL","WhatsApp",
+        "Plantilla_enviada","Plantilla_entregada","Plantilla_leida","Plantilla_fallida",
+        "PDF_enviado","PDF_entregado","PDF_leido","PDF_fallido",
+        "Respuesta_usuario","Respuesta_timestamp",
+        "Pedidos_recibo","Ultimo_pedido"
     ]
     ws.append(headers)
 
     items = list(agg.values())
     items.sort(key=lambda r: (r.get("periodo") or "", r.get("nombre") or "", r.get("whatsapp") or ""))
-    print("TS_STR TEST:",
-        ts_to_str(rec.get("plantilla_sent_at")),
-        ts_to_str(rec.get("pdf_sent_at")),
-        ts_to_str(rec.get("respuesta_timestamp")))
 
     for rec in items:
         ws.append([
-            rec.get("periodo", ""),
-            rec.get("nombre", ""),
-            rec.get("cuil", ""),
-            rec.get("whatsapp", ""),
+            rec.get("periodo",""),
+            rec.get("nombre",""),
+            rec.get("cuil",""),
+            rec.get("whatsapp",""),
             ts_to_str(rec.get("plantilla_sent_at")),
             ts_to_str(rec.get("plantilla_delivered_at")),
             ts_to_str(rec.get("plantilla_read_at")),
@@ -2120,13 +2228,12 @@ def generate_excel_report_v2(tenant: str, period_filter: str = "") -> BytesIO:
             ts_to_str(rec.get("pdf_delivered_at")),
             ts_to_str(rec.get("pdf_read_at")),
             ts_to_str(rec.get("pdf_failed_at")),
-            rec.get("respuesta_usuario", ""),
+            rec.get("respuesta_usuario",""),
             ts_to_str(rec.get("respuesta_timestamp")),
-            rec.get("pedidos_recibo", 0),
+            int(rec.get("pedidos_recibo") or 0),
             ts_to_str(rec.get("ultimo_pedido")),
         ])
 
-    # auto ancho
     for col in ws.columns:
         max_len = 0
         col_letter = get_column_letter(col[0].column)
@@ -2227,6 +2334,10 @@ def admin_panel():
         "📄 Envíos realizados (CSV)</a></p>"
     )
 
+    html.append(
+    f"<p><a href='/admin/report_recibos.pdf?tenant={esc(tenant)}&period={period_q}&token={esc(token)}'>"
+    "🧾 Descargar informe PDF</a></p>"
+)
 
     # ---- Verificaciones ----
     verifs = get_verifications_rows(tenant)
@@ -2664,6 +2775,9 @@ def find_pdf_file_id(tenant: str, cuil: str, period: str) -> str | None:
 
 
 
+@app.post("/twilio/webhook")
+def twilio_webhook_alias():
+    return twilio_inbound()
 
 @app.post("/admin/reset_tenant")
 @admin_required
@@ -3029,19 +3143,25 @@ def twilio_inbound():
     pending = get_latest_pending_view(from_whatsapp)
     print("PENDING:", pending)
 
-    # 1) Si no hay pending, tratamos de reconstruir contexto desde el último envío
-    #    (permite que escriba "RECIBO" sin tener el pending vivo).
+    # Si no hay pending: permitimos que escriba "RECIBO" y reconstruimos contexto.
     if not pending:
-        ctx = get_latest_context_for_whatsapp(from_whatsapp)  # debe existir en tu código
+        text_norm = (body or "").strip().lower()
+        wants = (text_norm.startswith("recibo") or text_norm in ("pdf","reenviar","reenviar recibo","reenvio","reenvío","quiero mi recibo","pedir recibo"))
+        if not wants:
+            return Response("OK", status=200)
+
+        ctx = get_latest_context_for_whatsapp(from_whatsapp)
         if not ctx:
+            _log_receipt_request_event("", "", "", from_whatsapp, "USER_TEXT", "NO_CONTEXT")
             return twiml("👋 Para enviarte tu recibo, primero necesitás el mensaje inicial de RRHH. Si no lo tenés, avisá a RRHH.")
 
         tenant_ctx = (ctx.get("tenant") or "").strip().lower()
         cuil_ctx = (ctx.get("cuil") or "").strip()
         if not (tenant_ctx and cuil_ctx):
+            _log_receipt_request_event(tenant_ctx, cuil_ctx, "", from_whatsapp, "USER_TEXT", "NO_CONTEXT")
             return twiml("👋 No pude identificar tu recibo. Avisá a RRHH.")
 
-        period_ctx = resolve_best_period_with_pdf(tenant_ctx, cuil_ctx)  # mes actual si existe, si no último
+        period_ctx = resolve_best_period_with_pdf(tenant_ctx, cuil_ctx)
         if not period_ctx:
             _log_receipt_request_event(tenant_ctx, cuil_ctx, "", from_whatsapp, "USER_TEXT", "NO_PDF")
             return twiml("⚠️ No encontré ningún recibo disponible para tu CUIL. Avisá a RRHH.")
@@ -3052,22 +3172,19 @@ def twilio_inbound():
     if not pending:
         return Response("OK", status=200)
 
-    # 2) Contexto normal desde pending
-    tenant = (pending.get("tenant") or "").strip().lower()
-    cuil = (pending.get("cuil") or "").strip()
-    period = (pending.get("period") or "").strip()
+    tenant = pending["tenant"]
+    cuil = pending["cuil"]
+    period = pending["period"]
     step = (pending.get("step") or "READY").upper()
 
-    print("STEP:", step, "BODY_DIGITS:", _digits(body))
-
-    # 3) Si ya cerró por firma/observación, no hacer nada más
+    # 🔒 Si ya cerró, no hacer nada más
     estado = get_recibo_estado(tenant, cuil, period)
     if estado in ("FIRMADO", "OBSERVADO"):
         msg = "✅ Este recibo ya fue firmado." if estado == "FIRMADO" else "📝 Este recibo quedó como observado."
         return twiml(msg)
 
     # =========================
-    # ✅ Pedido manual por texto (hasta 3 por período)
+    # ✅ Pedido manual de recibo por texto (hasta 3 veces por período)
     # =========================
     text_norm = (body or "").strip().lower()
 
@@ -3076,7 +3193,7 @@ def twilio_inbound():
             return False
         if t.startswith("recibo"):
             return True
-        return t in ("pdf", "reenviar", "reenviar recibo", "reenvio", "reenvío", "pedir recibo", "quiero mi recibo")
+        return t in ("pdf","reenviar","reenviar recibo","reenvio","reenvío","pedir recibo","quiero mi recibo")
 
     if (not button) and _is_receipt_request_text(text_norm) and step != "AWAIT_DNI":
         best_period = resolve_best_period_with_pdf(tenant, cuil)
@@ -3084,24 +3201,21 @@ def twilio_inbound():
             _log_receipt_request_event(tenant, cuil, "", from_whatsapp, "USER_TEXT", "NO_PDF")
             return twiml("⚠️ No encontré ningún recibo disponible. Avisá a RRHH.")
 
-        # fijamos pending al período elegido
         period = best_period
         add_pending_view(from_whatsapp, tenant, cuil, period)
         pending = get_latest_pending_view(from_whatsapp)
 
-        # límite 3
         cnt = get_receipt_request_count(tenant, cuil, period, from_whatsapp)
         if cnt >= 3:
             _log_receipt_request_event(tenant, cuil, period, from_whatsapp, "USER_TEXT", "BLOCKED_LIMIT")
             return twiml(f"⚠️ Ya pediste este recibo {cnt}/3 veces para {period}. Si necesitás más reenvíos, avisá a RRHH.")
 
-        # verificación DNI
         if not is_verified_contact(tenant, cuil, from_whatsapp):
             set_pending_step(pending["id"], "AWAIT_DNI")
             _log_receipt_request_event(tenant, cuil, period, from_whatsapp, "USER_TEXT", "ASK_DNI")
             return twiml("🔐 Para reenviar tu recibo, enviá tu DNI (solo números, sin puntos).")
 
-        sid_pdf = _send_pdf_flow(from_whatsapp, tenant, cuil, period)  # debe devolver SID o None
+        sid_pdf = _send_pdf_flow(from_whatsapp, tenant, cuil, period)
         if not sid_pdf:
             _log_receipt_request_event(tenant, cuil, period, from_whatsapp, "USER_TEXT", "ERROR")
             return twiml("❌ No pude enviar el PDF en este momento. Probá de nuevo en un rato o avisá a RRHH.")
@@ -3131,11 +3245,9 @@ def twilio_inbound():
                 return twiml("❌ DNI incorrecto (3 intentos). Volvé a solicitar el recibo desde el mensaje inicial.")
             return twiml(f"❌ DNI incorrecto. Intento {tries}/3. Probá de nuevo (solo números).")
 
-        # DNI OK
-        set_verified_contact(tenant, cuil, from_whatsapp, dni_user, nombre=pending.get("nombre", ""))
+        set_verified_contact(tenant, cuil, from_whatsapp, dni_user, nombre=pending.get("nombre",""))
         set_pending_step(pending["id"], "READY")
 
-        # límite 3 también acá
         cnt = get_receipt_request_count(tenant, cuil, period, from_whatsapp)
         if cnt >= 3:
             _log_receipt_request_event(tenant, cuil, period, from_whatsapp, "DNI_OK", "BLOCKED_LIMIT")
@@ -3221,10 +3333,6 @@ def _send_pdf_flow(from_whatsapp: str, tenant: str, cuil: str, period: str) -> s
     except Exception as e:
         print("ERROR sending PDF:", e)
         return None
-
-
-
-
 
 
 @app.get("/health")
