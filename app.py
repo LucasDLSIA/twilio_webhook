@@ -3329,7 +3329,6 @@ def twilio_inbound():
                 from_whatsapp,
                 nombre=(pending.get("nombre","") if isinstance(pending, dict) else "")
             )
-            return twiml("✅ Te envié el menú de recibos.")
 
     # =========================
     # SIN PENDING: o guía o reconstrucción para "RECIBO"
