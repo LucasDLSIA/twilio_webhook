@@ -1667,19 +1667,20 @@ from io import BytesIO
 from openpyxl import Workbook
 from openpyxl.utils import get_column_letter
 
-from datetime import datetime
+from datetime import datetime, timezone
 
 def ts_to_str(ts) -> str:
     """
-    Convierte unix timestamp (segundos) a 'dd/mm/aaaa HH:MM:SS'
-    Devuelve '' si ts es None/0/vacío.
+    Unix ts (segundos) -> 'dd/mm/aaaa HH:MM:SS'
     """
-    if not ts:
+    if ts is None or ts == "" or ts == 0:
         return ""
     try:
-        return datetime.fromtimestamp(int(ts)).strftime("%d/%m/%Y %H:%M:%S")
+        ts_i = int(float(ts))
+        return datetime.fromtimestamp(ts_i).strftime("%d/%m/%Y %H:%M:%S")
     except Exception:
-        return str(ts)
+        return ""
+
 
 
 def generate_excel_report_v2(tenant: str, period_filter: str = "") -> BytesIO:
