@@ -3339,7 +3339,7 @@ def twilio_inbound():
             sid = send_whatsapp_menu_template(from_whatsapp, nombre="")
             if sid:
                 return twiml("✅ Te envié el menú de recibos.")
-            return twiml("👋 Hola. Para recibir tu recibo escribí: *RECIBO*.\nSi no recibiste el mensaje inicial, avisá a RRHH.")
+            return twiml("👋 Hola. \nPara recibir tu recibo escribí: *RECIBO*.\nSi no recibiste el mensaje inicial, avisá a RRHH.")
 
         # si es pedido de recibo -> reconstruimos contexto desde último envío
         ctx = get_latest_context_for_whatsapp(from_whatsapp)
