@@ -54,6 +54,8 @@ CACHE_TTL = int(os.environ.get("CACHE_TTL", "120"))
 # =========================
 app = Flask(__name__)
 
+
+
 # =========================
 # Helpers
 # =========================
@@ -651,24 +653,38 @@ def twilio_status():
 
         if row:
             tenant, cuil, period, to_whatsapp, sign_sent_at = row
-            if not sign_sent_at and TWILIO_SIGN_TEMPLATE_SID:
-                try:
-                    sid_sign = send_whatsapp_template(
-                        to_whatsapp,
-                        content_vars={"1": period},
-                        template_sid=TWILIO_SIGN_TEMPLATE_SID
-                    )
-                    # opcional: trackear el SIGN en message_status también
-                    cur.execute("""
-                        INSERT OR IGNORE INTO message_status
-                        (message_sid, to_whatsapp, tenant, cuil, period, kind, created_at, last_status, last_status_at)
-                        VALUES (?, ?, ?, ?, ?, 'sign', ?, 'sent', ?)
-                    """, (sid_sign, to_whatsapp, tenant, cuil, period, now, now))
 
+            # ✅ NUEVO: si este PDF fue un reenvío (RESEND_LAST), NO mandamos SIGN
+            try:
+                origin = get_receipt_event_origin_by_sid(sid)
+            except Exception as e:
+                origin = None
+                print("WARN: could not resolve origin by sid:", e)
+
+            if origin == "RESEND_LAST":
+                # marcamos sign_sent_at para no reintentar (opcional pero recomendable)
+                if not sign_sent_at:
                     cur.execute("UPDATE sent_pdfs SET sign_sent_at = ? WHERE message_sid = ?", (now, sid))
-                    print("SENT SIGN AFTER PDF DELIVERED:", sid_sign)
-                except Exception as e:
-                    print("WARN: could not send SIGN:", e)
+                print("SKIP SIGN AFTER PDF (RESEND_LAST):", sid)
+            else:
+                if not sign_sent_at and TWILIO_SIGN_TEMPLATE_SID:
+                    try:
+                        sid_sign = send_whatsapp_template(
+                            to_whatsapp,
+                            content_vars={"1": period},
+                            template_sid=TWILIO_SIGN_TEMPLATE_SID
+                        )
+                        # opcional: trackear el SIGN en message_status también
+                        cur.execute("""
+                            INSERT OR IGNORE INTO message_status
+                            (message_sid, to_whatsapp, tenant, cuil, period, kind, created_at, last_status, last_status_at)
+                            VALUES (?, ?, ?, ?, ?, 'sign', ?, 'sent', ?)
+                        """, (sid_sign, to_whatsapp, tenant, cuil, period, now, now))
+
+                        cur.execute("UPDATE sent_pdfs SET sign_sent_at = ? WHERE message_sid = ?", (now, sid))
+                        print("SENT SIGN AFTER PDF DELIVERED:", sid_sign)
+                    except Exception as e:
+                        print("WARN: could not send SIGN:", e)
 
     conn.commit()
     conn.close()
@@ -708,6 +724,7 @@ def mark_sign_sent(pdf_sid: str):
 # DB: pending view + estado firma
 # =========================
 DB_PATH = os.environ.get("DB_PATH", "/data/app.db")
+
 
 def get_db_connection():
     conn = sqlite3.connect(DB_PATH)
@@ -817,6 +834,48 @@ def inc_receipt_request_count(tenant: str, cuil: str, period: str, to_whatsapp: 
     conn.close()
     return cnt
 
+def ensure_receipt_request_events_schema():
+    with sqlite3.connect(DB_PATH) as conn:
+        cur = conn.cursor()
+
+        # Tabla base (si no existe)
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS receipt_request_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            tenant TEXT,
+            cuil TEXT,
+            period TEXT,
+            whatsapp TEXT,
+            trigger TEXT,
+            outcome TEXT,
+            message_sid TEXT
+        )
+        """)
+
+        # Agregar created_at si falta
+        cols = [r[1] for r in cur.execute("PRAGMA table_info(receipt_request_events)").fetchall()]
+        if "created_at" not in cols:
+            cur.execute("ALTER TABLE receipt_request_events ADD COLUMN created_at INTEGER")
+
+        # (opcional, para el punto 1) origin si falta
+        if "origin" not in cols:
+            cur.execute("ALTER TABLE receipt_request_events ADD COLUMN origin TEXT")
+
+        conn.commit()
+
+ensure_receipt_request_events_schema()
+
+def get_origin_by_message_sid(message_sid: str) -> str | None:
+    with sqlite3.connect(DB_PATH) as conn:
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT origin FROM receipt_request_events
+            WHERE message_sid = ?
+            ORDER BY id DESC LIMIT 1
+        """, (message_sid,))
+        row = cur.fetchone()
+    return row[0] if row and row[0] else None
+
 
 def _log_receipt_request_event(
     tenant: str,
@@ -825,20 +884,78 @@ def _log_receipt_request_event(
     to_whatsapp: str,
     source: str,
     result: str,
-    message_sid: str | None = None
+    message_sid: str | None = None,
+    origin: str | None = None,
 ):
-    now = int(time.time())
-    conn = get_db_connection()
-    cur = conn.cursor()
-    cur.execute("""
-        INSERT INTO receipt_request_events
-        (tenant,cuil,period,to_whatsapp,source,result,message_sid,created_at)
-        VALUES (?,?,?,?,?,?,?,?)
-    """, (tenant, cuil, period or "", to_whatsapp, source, result, message_sid or "", now))
-    conn.commit()
-    conn.close()
+    """
+    Loggea eventos de pedidos/envíos.
+    Asegura schema (created_at + origin) para evitar OperationalError en SQLite.
+    """
+    created_at = int(time.time())
+    origin = origin or source
+
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        cur = conn.cursor()
+
+        # 1) Crear tabla si no existe (base)
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS receipt_request_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            tenant TEXT,
+            cuil TEXT,
+            period TEXT,
+            whatsapp TEXT,
+            source TEXT,
+            result TEXT,
+            message_sid TEXT
+        )
+        """)
+
+        # 2) Migración suave: agregar columnas si faltan
+        cols = [r[1] for r in cur.execute("PRAGMA table_info(receipt_request_events)").fetchall()]
+        if "created_at" not in cols:
+            cur.execute("ALTER TABLE receipt_request_events ADD COLUMN created_at INTEGER")
+            cols.append("created_at")
+        if "origin" not in cols:
+            cur.execute("ALTER TABLE receipt_request_events ADD COLUMN origin TEXT")
+            cols.append("origin")
+
+        # 3) Insert compatible con schema actual
+        cur.execute("""
+            INSERT INTO receipt_request_events
+            (tenant, cuil, period, whatsapp, source, result, message_sid, created_at, origin)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (tenant, cuil, period, to_whatsapp, source, result, message_sid, created_at, origin))
+
+        conn.commit()
+
+    finally:
+        conn.close()
+
 # =========================
 # DB Initialization / Migration
+def get_receipt_event_origin_by_sid(message_sid: str) -> str | None:
+    if not message_sid:
+        return None
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        cur = conn.cursor()
+        # origin puede ser NULL en filas viejas
+        cur.execute("""
+            SELECT origin, source
+            FROM receipt_request_events
+            WHERE message_sid = ?
+            ORDER BY id DESC
+            LIMIT 1
+        """, (message_sid,))
+        row = cur.fetchone()
+        if not row:
+            return None
+        return row[0] or row[1]  # origin si existe, si no source
+    finally:
+        conn.close()
+
 
 
 import time, hashlib
@@ -3299,7 +3416,7 @@ def twilio_inbound():
             return twiml("❌ No pude enviar el PDF en este momento. Probá de nuevo o avisá a RRHH.")
 
         n = inc_receipt_request_count(tenant, cuil, best_period, from_whatsapp)
-        _log_receipt_request_event(tenant, cuil, best_period, from_whatsapp, "RESEND_LAST", "SENT", message_sid=sid_pdf)
+        _log_receipt_request_event(tenant, cuil, best_period, from_whatsapp, "RESEND_LAST", "SENT", message_sid=sid_pdf, origin="RESEND_LAST")
         return twiml(f"📄 Listo. Te reenvié el recibo {best_period}. (Pedido {n}/3)")
 
     # SEE_PREVIOUS -> ofrece hasta 3 períodos anteriores (no envía PDF todavía)
@@ -3340,8 +3457,12 @@ def twilio_inbound():
             return twiml(f"⚠️ Ya pediste este recibo {cnt}/3 veces para {chosen_period}. Si necesitás más, avisá a RRHH.")
 
         if not is_verified_contact(tenant, cuil, from_whatsapp):
+            # guardamos el período elegido antes de pedir DNI
+            add_pending_view(from_whatsapp, tenant, cuil, chosen_period)
+            pending = get_latest_pending_view(from_whatsapp)
             set_pending_step(pending["id"], "AWAIT_DNI")
-            _log_receipt_request_event(tenant, cuil, chosen_period, from_whatsapp, "CHOOSE_PREVIOUS", "ASK_DNI")
+
+            _log_receipt_request_event(tenant, cuil, chosen_period, from_whatsapp, "CHOOSE_PREVIOUS", "ASK_DNI", origin="CHOOSE_PREVIOUS")
             return twiml("🔐 Para reenviar tu recibo, enviá tu DNI (solo números, sin puntos).")
 
         sid_pdf = _send_pdf_flow(from_whatsapp, tenant, cuil, chosen_period)
