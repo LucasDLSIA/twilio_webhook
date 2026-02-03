@@ -2776,7 +2776,7 @@ def find_pdf_file_id(tenant: str, cuil: str, period: str) -> str | None:
 
 
 @app.post("/twilio/webhook")
-def twilio_webhook_alias():
+def twilio_webhook():
     return twilio_inbound()
 
 @app.post("/admin/reset_tenant")
@@ -3140,62 +3140,64 @@ def twilio_inbound():
 
     print("INBOUND:", from_whatsapp, "ButtonPayload:", button, "Body:", body)
 
+    def _is_receipt_request_text(t: str) -> bool:
+        t = (t or "").strip().lower()
+        if not t:
+            return False
+        if t.startswith("recibo"):
+            return True
+        return t in ("pdf", "reenviar", "reenviar recibo", "reenvio", "reenvío", "pedir recibo", "quiero mi recibo")
+
     pending = get_latest_pending_view(from_whatsapp)
     print("PENDING:", pending)
 
-    # Si no hay pending: permitimos que escriba "RECIBO" y reconstruimos contexto.
+    # =========================
+    # SIN PENDING: o guía o reconstrucción para "RECIBO"
+    # =========================
     if not pending:
-        text_norm = (body or "").strip().lower()
-        wants = (text_norm.startswith("recibo") or text_norm in ("pdf","reenviar","reenviar recibo","reenvio","reenvío","quiero mi recibo","pedir recibo"))
-        if not wants:
-            return Response("OK", status=200)
+        # si NO es pedido de recibo, contestamos con ayuda (TwiML) para que "responda"
+        if not _is_receipt_request_text(body) and not button:
+            return twiml("👋 Hola. Para recibir tu recibo escribí: *RECIBO*.\nSi no recibiste el mensaje inicial, avisá a RRHH.")
 
+        # si es pedido de recibo -> reconstruimos contexto desde último envío
         ctx = get_latest_context_for_whatsapp(from_whatsapp)
         if not ctx:
             _log_receipt_request_event("", "", "", from_whatsapp, "USER_TEXT", "NO_CONTEXT")
             return twiml("👋 Para enviarte tu recibo, primero necesitás el mensaje inicial de RRHH. Si no lo tenés, avisá a RRHH.")
 
-        tenant_ctx = (ctx.get("tenant") or "").strip().lower()
-        cuil_ctx = (ctx.get("cuil") or "").strip()
-        if not (tenant_ctx and cuil_ctx):
-            _log_receipt_request_event(tenant_ctx, cuil_ctx, "", from_whatsapp, "USER_TEXT", "NO_CONTEXT")
+        tenant = (ctx.get("tenant") or "").strip().lower()
+        cuil = (ctx.get("cuil") or "").strip()
+
+        if not (tenant and cuil):
+            _log_receipt_request_event(tenant, cuil, "", from_whatsapp, "USER_TEXT", "NO_CONTEXT")
             return twiml("👋 No pude identificar tu recibo. Avisá a RRHH.")
 
-        period_ctx = resolve_best_period_with_pdf(tenant_ctx, cuil_ctx)
-        if not period_ctx:
-            _log_receipt_request_event(tenant_ctx, cuil_ctx, "", from_whatsapp, "USER_TEXT", "NO_PDF")
+        period = resolve_best_period_with_pdf(tenant, cuil)
+        if not period:
+            _log_receipt_request_event(tenant, cuil, "", from_whatsapp, "USER_TEXT", "NO_PDF")
             return twiml("⚠️ No encontré ningún recibo disponible para tu CUIL. Avisá a RRHH.")
 
-        add_pending_view(from_whatsapp, tenant_ctx, strip_pdf(cuil_ctx), period_ctx)
+        add_pending_view(from_whatsapp, tenant, strip_pdf(cuil), period)
         pending = get_latest_pending_view(from_whatsapp)
 
     if not pending:
         return Response("OK", status=200)
 
-    tenant = pending["tenant"]
-    cuil = pending["cuil"]
-    period = pending["period"]
+    tenant = (pending.get("tenant") or "").strip().lower()
+    cuil = (pending.get("cuil") or "").strip()
+    period = (pending.get("period") or "").strip()
     step = (pending.get("step") or "READY").upper()
 
-    # 🔒 Si ya cerró, no hacer nada más
+    # 🔒 Si ya cerró
     estado = get_recibo_estado(tenant, cuil, period)
     if estado in ("FIRMADO", "OBSERVADO"):
         msg = "✅ Este recibo ya fue firmado." if estado == "FIRMADO" else "📝 Este recibo quedó como observado."
         return twiml(msg)
 
     # =========================
-    # ✅ Pedido manual de recibo por texto (hasta 3 veces por período)
+    # PEDIDO MANUAL POR TEXTO: límite 3
     # =========================
-    text_norm = (body or "").strip().lower()
-
-    def _is_receipt_request_text(t: str) -> bool:
-        if not t:
-            return False
-        if t.startswith("recibo"):
-            return True
-        return t in ("pdf","reenviar","reenviar recibo","reenvio","reenvío","pedir recibo","quiero mi recibo")
-
-    if (not button) and _is_receipt_request_text(text_norm) and step != "AWAIT_DNI":
+    if (not button) and _is_receipt_request_text(body) and step != "AWAIT_DNI":
         best_period = resolve_best_period_with_pdf(tenant, cuil)
         if not best_period:
             _log_receipt_request_event(tenant, cuil, "", from_whatsapp, "USER_TEXT", "NO_PDF")
@@ -3208,7 +3210,7 @@ def twilio_inbound():
         cnt = get_receipt_request_count(tenant, cuil, period, from_whatsapp)
         if cnt >= 3:
             _log_receipt_request_event(tenant, cuil, period, from_whatsapp, "USER_TEXT", "BLOCKED_LIMIT")
-            return twiml(f"⚠️ Ya pediste este recibo {cnt}/3 veces para {period}. Si necesitás más reenvíos, avisá a RRHH.")
+            return twiml(f"⚠️ Ya pediste este recibo {cnt}/3 veces para {period}. Si necesitás más, avisá a RRHH.")
 
         if not is_verified_contact(tenant, cuil, from_whatsapp):
             set_pending_step(pending["id"], "AWAIT_DNI")
@@ -3218,22 +3220,22 @@ def twilio_inbound():
         sid_pdf = _send_pdf_flow(from_whatsapp, tenant, cuil, period)
         if not sid_pdf:
             _log_receipt_request_event(tenant, cuil, period, from_whatsapp, "USER_TEXT", "ERROR")
-            return twiml("❌ No pude enviar el PDF en este momento. Probá de nuevo en un rato o avisá a RRHH.")
+            return twiml("❌ No pude enviar el PDF en este momento. Probá de nuevo o avisá a RRHH.")
 
         n = inc_receipt_request_count(tenant, cuil, period, from_whatsapp)
         _log_receipt_request_event(tenant, cuil, period, from_whatsapp, "USER_TEXT", "SENT", message_sid=sid_pdf)
         return twiml(f"📄 Listo. Te reenvié el recibo {period}. (Pedido {n}/3)")
 
     # =========================
-    # 0) Estamos esperando DNI
+    # AWAIT_DNI
     # =========================
     if step == "AWAIT_DNI":
-        dni_user = _digits(body)
-
         if button:
             return twiml("🔐 Para continuar, enviá tu DNI (solo números).")
 
+        dni_user = _digits(body)
         dni_expected = cuil_to_dni(cuil)
+
         if not dni_expected or len(dni_user) < 7:
             inc_pending_dni_attempts(pending["id"])
             return twiml("🔐 Enviá tu DNI (solo números, sin puntos). Ej: 28169249")
@@ -3245,6 +3247,7 @@ def twilio_inbound():
                 return twiml("❌ DNI incorrecto (3 intentos). Volvé a solicitar el recibo desde el mensaje inicial.")
             return twiml(f"❌ DNI incorrecto. Intento {tries}/3. Probá de nuevo (solo números).")
 
+        # DNI OK
         set_verified_contact(tenant, cuil, from_whatsapp, dni_user, nombre=pending.get("nombre",""))
         set_pending_step(pending["id"], "READY")
 
@@ -3264,7 +3267,7 @@ def twilio_inbound():
         return twiml(f"✅ DNI verificado. Te envío el recibo ahora. (Pedido {n}/3)")
 
     # =========================
-    # 1) VIEW_NOW
+    # VIEW_NOW
     # =========================
     if button == "VIEW_NOW" or body == "VIEW_NOW":
         if not is_verified_contact(tenant, cuil, from_whatsapp):
@@ -3274,7 +3277,7 @@ def twilio_inbound():
         cnt = get_receipt_request_count(tenant, cuil, period, from_whatsapp)
         if cnt >= 3:
             _log_receipt_request_event(tenant, cuil, period, from_whatsapp, "VIEW_NOW", "BLOCKED_LIMIT")
-            return twiml(f"⚠️ Ya pediste este recibo {cnt}/3 veces para {period}. Si necesitás más reenvíos, avisá a RRHH.")
+            return twiml(f"⚠️ Ya pediste este recibo {cnt}/3 veces para {period}. Si necesitás más, avisá a RRHH.")
 
         sid_pdf = _send_pdf_flow(from_whatsapp, tenant, cuil, period)
         if not sid_pdf:
@@ -3285,17 +3288,13 @@ def twilio_inbound():
         _log_receipt_request_event(tenant, cuil, period, from_whatsapp, "VIEW_NOW", "SENT", message_sid=sid_pdf)
         return twiml(f"📄 Perfecto. Te envío el recibo ahora. (Pedido {n}/3)")
 
-    # =========================
-    # 2) NO_NEED
-    # =========================
+    # NO_NEED
     if button == "NO_NEED" or body == "NO_NEED":
         set_recibo_estado(tenant, cuil, period, "NO_NEED")
         consume_pending_view(pending["id"])
         return twiml("✅ Perfecto, no hay problema.")
 
-    # =========================
-    # 3) SIGN_OK / SIGN_OBS
-    # =========================
+    # SIGN_OK / SIGN_OBS
     if button in ("SIGN_OK", "SIGN_OBS") or body in ("SIGN_OK", "SIGN_OBS"):
         if button == "SIGN_OK" or body == "SIGN_OK":
             set_recibo_estado(tenant, cuil, period, "FIRMADO")
