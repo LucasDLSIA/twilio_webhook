@@ -3137,15 +3137,14 @@ def twiml(msg: str):
         status=200
     )
 
-import json
+import os, json
 from twilio.rest import Client
 
-# poné tu Content SID real en una env var
 WHATSAPP_MENU_CONTENT_SID = os.getenv("WHATSAPP_MENU_CONTENT_SID", "")
 
 def send_whatsapp_menu_template(to_whatsapp: str, nombre: str = "") -> str | None:
     """
-    Envía la plantilla 'asistente recibos' por Content API.
+    Envía la plantilla del menú (Quick Reply) vía Content API.
     Devuelve Message SID o None.
     """
     if not WHATSAPP_MENU_CONTENT_SID:
@@ -3154,15 +3153,14 @@ def send_whatsapp_menu_template(to_whatsapp: str, nombre: str = "") -> str | Non
 
     client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
 
-    # variable {{1}} (en Twilio Content API se manda como {"1":"valor"})
+    # Variables de plantilla: {{1}} -> "1"
     vars_ = {"1": (nombre or "").strip()}
 
     msg = client.messages.create(
         to=to_whatsapp,
-        from_=TWILIO_WHATSAPP_FROM,  # ej: "whatsapp:+14155238886" o tu sender
+        from_=TWILIO_WHATSAPP_FROM,
         content_sid=WHATSAPP_MENU_CONTENT_SID,
-        content_variables=json.dumps(vars_),
-        status_callback=STATUS_CALLBACK_URL if 'STATUS_CALLBACK_URL' in globals() else None
+        content_variables=json.dumps(vars_)
     )
     return msg.sid
 
@@ -3187,6 +3185,32 @@ def twilio_inbound():
 
     pending = get_latest_pending_view(from_whatsapp)
     print("PENDING:", pending)
+    # =========================
+    # REGLA: cualquier texto (sin botón) dispara menú,
+    # EXCEPTO cuando estamos esperando DNI o selección de períodos
+    # =========================
+    if not button:
+        step_now = (pending.get("step") or "READY").upper() if pending else "READY"
+        body_norm = (body or "").strip()
+
+        # AWAIT_DNI: dejamos pasar para que lo procese el bloque AWAIT_DNI
+        if step_now == "AWAIT_DNI":
+            pass
+
+        # CHOOSE_PREVIOUS: si no es 1/2/3, devolvemos ayuda (no menú)
+        elif step_now == "CHOOSE_PREVIOUS":
+            if body_norm in ("1", "2", "3"):
+                pass  # lo procesa el bloque de selección
+            else:
+                return twiml("🗂️ Respondé con 1, 2 o 3 para elegir un período anterior.")
+
+        else:
+            # Disparar menú ante cualquier texto
+            sid = send_whatsapp_menu_template(
+                from_whatsapp,
+                nombre=(pending.get("nombre","") if isinstance(pending, dict) else "")
+            )
+            return twiml("✅ Te envié el menú de recibos.")
 
     # =========================
     # SIN PENDING: o guía o reconstrucción para "RECIBO"
@@ -3258,13 +3282,14 @@ def twilio_inbound():
             return twiml(f"⚠️ Ya pediste este recibo {cnt}/3 veces para {best_period}. Si necesitás más, avisá a RRHH.")
 
         if not is_verified_contact(tenant, cuil, from_whatsapp):
-            # guardamos el período elegido en el pending
-            add_pending_view(from_whatsapp, tenant, cuil, chosen_period)
+            # guardamos el período que vamos a reenviar
+            add_pending_view(from_whatsapp, tenant, cuil, best_period)
             pending = get_latest_pending_view(from_whatsapp)
             set_pending_step(pending["id"], "AWAIT_DNI")
 
-            _log_receipt_request_event(tenant, cuil, chosen_period, from_whatsapp, "CHOOSE_PREVIOUS", "ASK_DNI")
+            _log_receipt_request_event(tenant, cuil, best_period, from_whatsapp, "RESEND_LAST", "ASK_DNI")
             return twiml("🔐 Para reenviar tu recibo, enviá tu DNI (solo números, sin puntos).")
+
 
         sid_pdf = _send_pdf_flow(from_whatsapp, tenant, cuil, best_period)
         if not sid_pdf:
