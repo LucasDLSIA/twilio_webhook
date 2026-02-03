@@ -1668,7 +1668,7 @@ from openpyxl import Workbook
 from openpyxl.utils import get_column_letter
 
 from datetime import datetime, timezone
-
+import datetime as dt
 
 def ts_to_str(ts) -> str:
     if ts is None:
@@ -1684,10 +1684,11 @@ def ts_to_str(ts) -> str:
         if ts_f > 10_000_000_000:
             ts_f = ts_f / 1000.0
 
-        return datetime.fromtimestamp(int(ts_f)).strftime("%d/%m/%Y %H:%M:%S")
+        return dt.datetime.fromtimestamp(int(ts_f)).strftime("%d/%m/%Y %H:%M:%S")
     except Exception as e:
         print("ts_to_str ERROR:", ts, repr(e))
         return ""
+
 
 
 
