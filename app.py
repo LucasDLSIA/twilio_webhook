@@ -1208,87 +1208,14 @@ from flask import request, Response, send_file
 def admin_report_recibos_xlsx():
     token = _get_admin_token_from_request()
     tenant = (request.args.get("tenant") or "").strip().lower()
-    period = (request.args.get("period") or "").strip()   # "MM/AAAA" o "" (todos)
+    period = (request.args.get("period") or "").strip()  # MM/AAAA desde el panel (o vacío)
 
     if not tenant:
         return Response("Falta tenant", status=400)
 
-    # Forzamos lectura real del excel (NO cache)
-    envios_rows = load_envios_rows(tenant, force=True) or []
+    buf = generate_excel_report_v2(tenant, period_filter=period)
 
-    out = []
-
-    for r in envios_rows:
-        cuil = (r.get("cuil_norm") or r.get("cuil") or "").strip()
-        nombre_excel = (r.get("nombre") or "").strip()
-        wpp = (r.get("whatsapp_norm") or r.get("whatsapp") or "").strip()
-
-        if not cuil:
-            continue
-
-        # Normalizar whatsapp si vino sin prefijo
-        if wpp and not wpp.startswith("whatsapp:"):
-            try:
-                wpp = normalize_whatsapp(wpp)
-            except Exception:
-                # si no pudimos normalizar, lo dejamos crudo
-                pass
-
-        # --- Si NO hay periodo elegido: hacemos "todos" pero SOLO los que existan en DB ---
-        periods_to_report = []
-        if period:
-            periods_to_report = [period]
-        else:
-            periods_to_report = list_periods_for_cuil(tenant, cuil)  # lista "MM/AAAA"
-            if not periods_to_report:
-                continue
-
-        for p in periods_to_report:
-            # Estado del recibo / statuses
-            estado = get_recibo_estado(tenant, cuil, p) or ""
-            tpl = _get_last_msg_status(tenant, cuil, p, "template")
-            pdf = _get_last_msg_status(tenant, cuil, p, "pdf")
-
-            # Si no hay nada en DB para ese período, no incluimos
-            if not any([estado, tpl, pdf]):
-                continue
-
-            last_tpl = (tpl.get("last_status") if tpl else "") or ""
-            last_pdf = (pdf.get("last_status") if pdf else "") or ""
-
-            # Verificación (NO depende del período)
-            verif = False
-            verif_nombre = ""
-            if wpp:
-                verif = _is_verified_link(tenant, cuil, wpp)
-                verif_nombre = _get_verif_nombre(tenant, cuil, wpp)
-
-            nombre_final = nombre_excel or verif_nombre
-
-            out.append({
-                "tenant": tenant,
-                "period": p,
-                "folder": (p.replace("/", "-") if p else ""),  # "MM-AAAA"
-                "nombre": nombre_final,
-                "cuil": cuil,
-                "whatsapp": wpp,
-                "verificado": "SI" if verif else "NO",
-                "estado_recibo": estado,
-                "template_status": last_tpl,
-                "pdf_status": last_pdf,
-            })
-
-    df = pd.DataFrame(out, columns=[
-        "tenant","period","folder","nombre","cuil","whatsapp",
-        "verificado","estado_recibo","template_status","pdf_status"
-    ])
-
-    buf = BytesIO()
-    with pd.ExcelWriter(buf, engine="openpyxl") as writer:
-        df.to_excel(writer, index=False, sheet_name="reporte")
-    buf.seek(0)
-
-    filename = f"reporte_recibos_{tenant}_{(period.replace('/','-') if period else 'todos')}.xlsx"
+    filename = f"reporte_recibos_{tenant}_{(norm_period_label(period).replace('/','-') if period else 'todos')}.xlsx"
     return send_file(
         buf,
         as_attachment=True,
@@ -1704,6 +1631,219 @@ def admin_verifications_delete():
     conn.close()
 
     return redirect(f"/admin/panel?tenant={tenant}&token={token}&msg=verif_deleted")
+
+from io import BytesIO
+from openpyxl import Workbook
+from openpyxl.utils import get_column_letter
+
+def generate_excel_report_v2(tenant: str, period_filter: str = "") -> BytesIO:
+    """
+    Reporte estilo "tu función": una fila por (WhatsApp, Período)
+    Fuente: message_status + pending_views + recibo_estado
+    """
+    tenant = (tenant or "").strip().lower()
+    period_filter = norm_period_label(period_filter)
+
+    conn = get_db_connection()
+    conn.row_factory = sqlite3.Row
+    cur = conn.cursor()
+
+    # 1) message_status
+    cur.execute("""
+        SELECT
+            to_whatsapp, tenant, cuil, period, nombre, kind,
+            created_at, delivered_at, read_at, failed_at
+        FROM message_status
+        WHERE tenant = ?
+    """, (tenant,))
+    msg_rows = cur.fetchall()
+
+    # 2) pending_views (último period por (whatsapp,cuil))
+    cur.execute("""
+        SELECT to_whatsapp, tenant, cuil, period, MAX(created_at) as last_ts
+        FROM pending_views
+        WHERE tenant = ?
+        GROUP BY to_whatsapp, cuil
+    """, (tenant,))
+    pv_rows = cur.fetchall()
+
+    last_period_by_user_cuil = {}
+    for r in pv_rows:
+        w = (r["to_whatsapp"] or "").strip()
+        c = (r["cuil"] or "").strip()
+        p = norm_period_label(r["period"] or "")
+        if w and c and p:
+            last_period_by_user_cuil[(w, c)] = p
+
+    # 3) recibo_estado (respuesta final)
+    cur.execute("""
+        SELECT tenant, cuil, period, estado, updated_at
+        FROM recibo_estado
+        WHERE tenant = ?
+    """, (tenant,))
+    estado_rows = cur.fetchall()
+    conn.close()
+
+    estado_map = {}
+    for r in estado_rows:
+        c = (r["cuil"] or "").strip()
+        p = norm_period_label(r["period"] or "")
+        if c and p:
+            estado_map[(c, p)] = {
+                "estado": (r["estado"] or "").strip(),
+                "ts": r["updated_at"]
+            }
+
+    # 4) Agregación
+    def key(whatsapp: str, period_norm: str):
+        return ((whatsapp or "").strip(), (period_norm or "").strip())
+
+    agg = {}
+
+    for row in msg_rows:
+        wpp = (row["to_whatsapp"] or "").strip()
+        if not wpp:
+            continue
+
+        cuil = (row["cuil"] or "").strip()
+        nombre = (row["nombre"] or "").strip()
+
+        period_raw = (row["period"] or "").strip()
+        period_norm = norm_period_label(period_raw)
+
+        # fallback: si message_status vino sin period, lo resuelvo con pending_views
+        if not period_norm and wpp and cuil:
+            period_norm = last_period_by_user_cuil.get((wpp, cuil), "")
+
+        if period_filter and period_norm != period_filter:
+            continue
+
+        if not period_norm:
+            # sin período no lo puedo ubicar en el reporte
+            continue
+
+        k = key(wpp, period_norm)
+        rec = agg.get(k)
+        if not rec:
+            rec = {
+                "periodo": period_norm,
+                "nombre": nombre,
+                "cuil": cuil,
+                "whatsapp": wpp,
+                "plantilla_sent_at": None,
+                "plantilla_delivered_at": None,
+                "plantilla_read_at": None,
+                "plantilla_failed_at": None,
+                "pdf_sent_at": None,
+                "pdf_delivered_at": None,
+                "pdf_read_at": None,
+                "pdf_failed_at": None,
+                "respuesta_usuario": "",
+                "respuesta_timestamp": None,
+            }
+            agg[k] = rec
+
+        # completar datos tardíos
+        if nombre and not rec["nombre"]:
+            rec["nombre"] = nombre
+        if cuil and not rec["cuil"]:
+            rec["cuil"] = cuil
+
+        kind = (row["kind"] or "").strip().lower()
+        created_at = row["created_at"]
+        delivered_at = row["delivered_at"]
+        read_at = row["read_at"]
+        failed_at = row["failed_at"]
+
+        # ⚠️ en tu app el PDF suele ser kind='pdf' (a veces 'media'); cubro ambos
+        if kind == "template":
+            if created_at and (not rec["plantilla_sent_at"] or created_at < rec["plantilla_sent_at"]):
+                rec["plantilla_sent_at"] = created_at
+            if delivered_at:
+                rec["plantilla_delivered_at"] = delivered_at
+            if read_at:
+                rec["plantilla_read_at"] = read_at
+            if failed_at:
+                rec["plantilla_failed_at"] = failed_at
+
+        elif kind in ("pdf", "media"):
+            if created_at and (not rec["pdf_sent_at"] or created_at < rec["pdf_sent_at"]):
+                rec["pdf_sent_at"] = created_at
+            if delivered_at:
+                rec["pdf_delivered_at"] = delivered_at
+            if read_at:
+                rec["pdf_read_at"] = read_at
+            if failed_at:
+                rec["pdf_failed_at"] = failed_at
+
+    # 5) Mezclar recibo_estado como “respuesta”
+    #    (una respuesta por CUIL+Periodo; se inyecta en la fila WhatsApp+Periodo)
+    for (wpp, per), rec in list(agg.items()):
+        cuil = rec.get("cuil", "")
+        st = estado_map.get((cuil, per))
+        if st:
+            rec["respuesta_usuario"] = st.get("estado", "") or ""
+            rec["respuesta_timestamp"] = st.get("ts")
+
+    # 6) Crear Excel
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Recibos"
+
+    headers = [
+        "Periodo",
+        "Nombre",
+        "CUIL",
+        "WhatsApp",
+        "Plantilla_enviada",
+        "Plantilla_entregada",
+        "Plantilla_leida",
+        "Plantilla_fallida",
+        "PDF_enviado",
+        "PDF_entregado",
+        "PDF_leido",
+        "PDF_fallido",
+        "Respuesta_usuario",
+        "Respuesta_timestamp",
+    ]
+    ws.append(headers)
+
+    items = list(agg.values())
+    items.sort(key=lambda r: (r.get("periodo") or "", r.get("nombre") or "", r.get("whatsapp") or ""))
+
+    for rec in items:
+        ws.append([
+            rec.get("periodo", ""),
+            rec.get("nombre", ""),
+            rec.get("cuil", ""),
+            rec.get("whatsapp", ""),
+            ts_to_str(rec.get("plantilla_sent_at")),
+            ts_to_str(rec.get("plantilla_delivered_at")),
+            ts_to_str(rec.get("plantilla_read_at")),
+            ts_to_str(rec.get("plantilla_failed_at")),
+            ts_to_str(rec.get("pdf_sent_at")),
+            ts_to_str(rec.get("pdf_delivered_at")),
+            ts_to_str(rec.get("pdf_read_at")),
+            ts_to_str(rec.get("pdf_failed_at")),
+            rec.get("respuesta_usuario", ""),
+            ts_to_str(rec.get("respuesta_timestamp")),
+        ])
+
+    # auto ancho
+    for col in ws.columns:
+        max_len = 0
+        col_letter = get_column_letter(col[0].column)
+        for cell in col:
+            try:
+                max_len = max(max_len, len(str(cell.value or "")))
+            except Exception:
+                pass
+        ws.column_dimensions[col_letter].width = max(10, max_len + 2)
+
+    buf = BytesIO()
+    wb.save(buf)
+    buf.seek(0)
+    return buf
 
 
 @app.get("/admin/panel")
