@@ -1204,6 +1204,37 @@ import time
 import pandas as pd
 from flask import request, Response, send_file
 
+def norm_period_label(p: str) -> str:
+    """
+    Normaliza a 'MM/AAAA'
+    Acepta: 'MM/AAAA', 'MM-AAAA', 'AAAA-MM', 'AAAA/MM'
+    """
+    p = (p or "").strip()
+    if not p:
+        return ""
+    p = p.replace("\\", "/").replace("-", "/")
+    parts = [x for x in p.split("/") if x.strip()]
+    if len(parts) != 2:
+        return ""
+
+    a, b = parts[0].zfill(2), parts[1]
+    # si viene AAAA/MM
+    if len(a) == 4:
+        yyyy = a
+        mm = b.zfill(2)
+    else:
+        mm = a.zfill(2)
+        yyyy = b
+
+    if not (mm.isdigit() and yyyy.isdigit()):
+        return ""
+    if not (1 <= int(mm) <= 12):
+        return ""
+    if len(yyyy) != 4:
+        return ""
+
+    return f"{mm}/{yyyy}"
+
 @app.get("/admin/report_recibos.xlsx")
 def admin_report_recibos_xlsx():
     token = _get_admin_token_from_request()
