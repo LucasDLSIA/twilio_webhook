@@ -1669,30 +1669,26 @@ from openpyxl.utils import get_column_letter
 
 from datetime import datetime, timezone
 
-from datetime import datetime
 
 def ts_to_str(ts) -> str:
-    """
-    Convierte timestamp Unix (seg o ms) a 'dd/mm/aaaa HH:MM:SS'.
-    Si no puede convertir, devuelve ''.
-    """
     if ts is None:
         return ""
     try:
-        # soporta int, float, numpy, strings tipo "1770052979" o "1770052979.0"
         s = str(ts).strip()
         if s == "" or s.lower() == "nan":
             return ""
 
         ts_f = float(s)
 
-        # si viene en milisegundos, lo pasamos a segundos
-        if ts_f > 10_000_000_000:  # ~año 2286 en segundos
+        # ms -> s
+        if ts_f > 10_000_000_000:
             ts_f = ts_f / 1000.0
 
         return datetime.fromtimestamp(int(ts_f)).strftime("%d/%m/%Y %H:%M:%S")
-    except Exception:
+    except Exception as e:
+        print("ts_to_str ERROR:", ts, repr(e))
         return ""
+
 
 
 
@@ -1871,7 +1867,10 @@ def generate_excel_report_v2(tenant: str, period_filter: str = "") -> BytesIO:
 
     items = list(agg.values())
     items.sort(key=lambda r: (r.get("periodo") or "", r.get("nombre") or "", r.get("whatsapp") or ""))
-    print("DEBUG TS:", rec.get("plantilla_sent_at"), rec.get("pdf_sent_at"), rec.get("respuesta_timestamp"))
+    print("TS_STR TEST:",
+        ts_to_str(rec.get("plantilla_sent_at")),
+        ts_to_str(rec.get("pdf_sent_at")),
+        ts_to_str(rec.get("respuesta_timestamp")))
 
     for rec in items:
         ws.append([
