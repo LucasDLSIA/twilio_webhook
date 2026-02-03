@@ -1871,6 +1871,7 @@ def generate_excel_report_v2(tenant: str, period_filter: str = "") -> BytesIO:
 
     items = list(agg.values())
     items.sort(key=lambda r: (r.get("periodo") or "", r.get("nombre") or "", r.get("whatsapp") or ""))
+    print("DEBUG TS:", rec.get("plantilla_sent_at"), rec.get("pdf_sent_at"), rec.get("respuesta_timestamp"))
 
     for rec in items:
         ws.append([
