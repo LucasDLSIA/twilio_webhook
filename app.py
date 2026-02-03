@@ -738,28 +738,33 @@ def get_latest_context_for_whatsapp(to_whatsapp: str) -> dict | None:
 
 def resolve_best_period_with_pdf(tenant: str, cuil: str) -> str | None:
     """
-    Prioridad:
-      1) mes actual (MM/AAAA) si existe PDF
-      2) si no, último período disponible en Drive para ese CUIL
+    Devuelve:
+      - mes actual si existe PDF
+      - si no, el último período disponible con PDF
     """
-    import datetime as _dt
-    now = _dt.datetime.now()
+    now = datetime.now()
     current = f"{now.month:02d}/{now.year:04d}"
 
-    # 1) mes actual
+    # 1) Mes actual (si existe)
     try:
         fid = find_pdf_file_id_for_cuil_period(tenant, cuil, current)
         if fid:
             return current
     except Exception:
-        pass
+        pass  # no existe carpeta/periodo -> seguimos
 
-    # 2) último período
+    # 2) Último período disponible
+    periods = []
     try:
-        periods = list_periods_for_cuil(tenant, strip_pdf(cuil))
-        return periods[0] if periods else None
+        periods = list_periods_for_cuil(tenant, strip_pdf(cuil))  # debería devolverte algo tipo ["01/2026","12/2025",...]
     except Exception:
+        periods = []
+
+    if not periods:
         return None
+
+    # normalizamos por si vienen con "-" en vez de "/"
+    return (periods[0] or "").replace("-", "/")
 
 
 def get_receipt_request_count(tenant: str, cuil: str, period: str, to_whatsapp: str) -> int:
@@ -3192,10 +3197,13 @@ def twilio_inbound():
     step = (pending.get("step") or "READY").upper()
 
     # 🔒 Si ya cerró
-    estado = get_recibo_estado(tenant, cuil, period)
-    if estado in ("FIRMADO", "OBSERVADO"):
-        msg = "✅ Este recibo ya fue firmado." if estado == "FIRMADO" else "📝 Este recibo quedó como observado."
-        return twiml(msg)
+    # 🔒 Bloquear SOLO si intenta firmar/observar
+    if button in ("SIGN_OK", "SIGN_OBS") or body in ("SIGN_OK", "SIGN_OBS"):
+        estado = get_recibo_estado(tenant, cuil, period)
+        if estado in ("FIRMADO", "OBSERVADO"):
+            msg = "✅ Este recibo ya fue firmado." if estado == "FIRMADO" else "📝 Este recibo quedó como observado."
+            return twiml(msg)
+
 
     # =========================
     # PEDIDO MANUAL POR TEXTO: límite 3
