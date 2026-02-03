@@ -5,6 +5,8 @@ import time
 import sqlite3
 import json
 from datetime import datetime
+import datetime as _dt
+
 from typing import Optional, Dict, List
 
 import pandas as pd
@@ -740,7 +742,8 @@ def resolve_best_period_with_pdf(tenant: str, cuil: str) -> str | None:
       1) mes actual (MM/AAAA) si existe PDF
       2) si no, último período disponible en Drive para ese CUIL
     """
-    now = datetime.now()
+    import datetime as _dt
+    now = _dt.datetime.now()
     current = f"{now.month:02d}/{now.year:04d}"
 
     # 1) mes actual
