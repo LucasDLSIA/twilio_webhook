@@ -1357,12 +1357,13 @@ def set_verified_contact(tenant: str, cuil: str, to_whatsapp: str, dni: str, nom
 
     conn.commit()
     conn.close()
-@app.get("/admin/reset_user")
-def admin_reset_user():
+
+@app.get("/admin/reset_reenvios")
+def admin_reset_reenvios():
     token = (request.args.get("token") or "").strip()
     tenant = (request.args.get("tenant") or "").strip().lower()
     cuil = (request.args.get("cuil") or "").strip()
-    whatsapp = (request.args.get("whatsapp") or "").strip()  # opcional
+    whatsapp = (request.args.get("whatsapp") or "").strip()
 
     if not token or token != ADMIN_TOKEN:
         return Response("Unauthorized", status=401)
@@ -1372,86 +1373,48 @@ def admin_reset_user():
     conn = get_db_connection()
     cur = conn.cursor()
 
-    def _safe_exec(sql, params=()):
+    def _safe(sql, params=()):
         try:
             cur.execute(sql, params)
             return cur.rowcount
         except Exception as e:
-            print("WARN reset_user:", e, "| SQL:", sql)
+            print("WARN reset_reenvios:", e)
             return 0
 
     deleted = {}
 
-    # 1) pending queue
+    # Borra SOLO eventos de reenvío (RESEND_LAST)
+    # soporta schema viejo/nuevo: origin o source
     if whatsapp:
-        deleted["pending_views"] = _safe_exec(
-            "DELETE FROM pending_views WHERE tenant=? AND cuil=? AND to_whatsapp=?",
-            (tenant, cuil, whatsapp)
-        )
+        deleted["receipt_request_events"] = _safe("""
+            DELETE FROM receipt_request_events
+            WHERE tenant=? AND cuil=? AND (whatsapp=? OR to_whatsapp=?)
+              AND (
+                origin='RESEND_LAST' OR source='RESEND_LAST'
+              )
+        """, (tenant, cuil, whatsapp, whatsapp))
     else:
-        deleted["pending_views"] = _safe_exec(
-            "DELETE FROM pending_views WHERE tenant=? AND cuil=?",
-            (tenant, cuil)
-        )
-
-    # 2) PDFs enviados (para que no dispare SIGN después)
-    if whatsapp:
-        deleted["sent_pdfs"] = _safe_exec(
-            "DELETE FROM sent_pdfs WHERE tenant=? AND cuil=? AND to_whatsapp=?",
-            (tenant, cuil, whatsapp)
-        )
-    else:
-        deleted["sent_pdfs"] = _safe_exec(
-            "DELETE FROM sent_pdfs WHERE tenant=? AND cuil=?",
-            (tenant, cuil)
-        )
-
-    # 3) Tracking general (plantillas/pdf/sign) — acá suele estar todo lo que ves en el Excel
-    if whatsapp:
-        deleted["message_status"] = _safe_exec(
-            "DELETE FROM message_status WHERE tenant=? AND cuil=? AND to_whatsapp=?",
-            (tenant, cuil, whatsapp)
-        )
-    else:
-        deleted["message_status"] = _safe_exec(
-            "DELETE FROM message_status WHERE tenant=? AND cuil=?",
-            (tenant, cuil)
-        )
-
-    # 4) Eventos/contador auxiliar
-    # soporta columnas whatsapp o to_whatsapp según schema viejo/nuevo
-    deleted["receipt_request_events"] = 0
-    if whatsapp:
-        deleted["receipt_request_events"] += _safe_exec(
-            "DELETE FROM receipt_request_events WHERE tenant=? AND cuil=? AND whatsapp=?",
-            (tenant, cuil, whatsapp)
-        )
-        deleted["receipt_request_events"] += _safe_exec(
-            "DELETE FROM receipt_request_events WHERE tenant=? AND cuil=? AND to_whatsapp=?",
-            (tenant, cuil, whatsapp)
-        )
-    else:
-        deleted["receipt_request_events"] += _safe_exec(
-            "DELETE FROM receipt_request_events WHERE tenant=? AND cuil=?",
-            (tenant, cuil)
-        )
-
-    # 5) Estado firmado/observado si existe (opcional pero para testing sirve)
-    deleted["recibo_estado"] = _safe_exec(
-        "DELETE FROM recibo_estado WHERE tenant=? AND cuil=?",
-        (tenant, cuil)
-    )
+        deleted["receipt_request_events"] = _safe("""
+            DELETE FROM receipt_request_events
+            WHERE tenant=? AND cuil=?
+              AND (
+                origin='RESEND_LAST' OR source='RESEND_LAST'
+              )
+        """, (tenant, cuil))
 
     conn.commit()
     conn.close()
 
     return jsonify({
         "ok": True,
+        "mode": "safe_reset_reenvios",
         "tenant": tenant,
         "cuil": cuil,
         "whatsapp": whatsapp or None,
         "deleted": deleted
     })
+
+
 
 def set_pending_step(pending_id: int, step: str):
     conn = get_db_connection()
