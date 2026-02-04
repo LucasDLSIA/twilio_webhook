@@ -3359,16 +3359,22 @@ def send_whatsapp_menu_template(to_whatsapp: str, nombre: str = "") -> str | Non
 
     client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
 
-    # Variables de plantilla: {{1}} -> "1"
-    vars_ = {"1": (nombre or "").strip()}
+    nombre = (nombre or "").strip()
 
-    msg = client.messages.create(
-        to=to_whatsapp,
-        from_=TWILIO_WHATSAPP_FROM,
-        content_sid=WHATSAPP_MENU_CONTENT_SID,
-        content_variables=json.dumps(vars_)
-    )
-    return msg.sid
+    # 🔒 Twilio NO acepta variables vacías -> usamos espacio como fallback
+    vars_ = {"1": nombre if nombre else " "}
+
+    try:
+        msg = client.messages.create(
+            to=to_whatsapp,
+            from_=TWILIO_WHATSAPP_FROM,
+            content_sid=WHATSAPP_MENU_CONTENT_SID,
+            content_variables=json.dumps(vars_)
+        )
+        return msg.sid
+    except Exception as e:
+        print("ERROR send_whatsapp_menu_template:", e, "vars_=", vars_)
+        return None
 
 
 TWILIO_SIGN_TEMPLATE_SID = os.environ.get("TWILIO_SIGN_TEMPLATE_SID", "").strip()
