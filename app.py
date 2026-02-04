@@ -887,10 +887,6 @@ def _log_receipt_request_event(
     message_sid: str | None = None,
     origin: str | None = None,
 ):
-    """
-    Loggea eventos de pedidos/envíos.
-    Asegura schema (created_at + origin) para evitar OperationalError en SQLite.
-    """
     created_at = int(time.time())
     origin = origin or source
 
@@ -898,38 +894,72 @@ def _log_receipt_request_event(
     try:
         cur = conn.cursor()
 
-        # 1) Crear tabla si no existe (base)
+        # 1) Asegurar tabla (forma mínima)
         cur.execute("""
         CREATE TABLE IF NOT EXISTS receipt_request_events (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            tenant TEXT,
-            cuil TEXT,
-            period TEXT,
-            whatsapp TEXT,
-            source TEXT,
-            result TEXT,
-            message_sid TEXT
+            id INTEGER PRIMARY KEY AUTOINCREMENT
         )
         """)
 
-        # 2) Migración suave: agregar columnas si faltan
+        # 2) Ver columnas actuales
         cols = [r[1] for r in cur.execute("PRAGMA table_info(receipt_request_events)").fetchall()]
-        if "created_at" not in cols:
-            cur.execute("ALTER TABLE receipt_request_events ADD COLUMN created_at INTEGER")
-            cols.append("created_at")
-        if "origin" not in cols:
-            cur.execute("ALTER TABLE receipt_request_events ADD COLUMN origin TEXT")
-            cols.append("origin")
 
-        # 3) Insert compatible con schema actual
-        cur.execute("""
-            INSERT INTO receipt_request_events
-            (tenant, cuil, period, whatsapp, source, result, message_sid, created_at, origin)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """, (tenant, cuil, period, to_whatsapp, source, result, message_sid, created_at, origin))
+        # 3) Intentar agregar columnas que usamos (si faltan)
+        #    (SQLite permite ALTER TABLE ADD COLUMN)
+        def _add_col(colname: str, coltype: str):
+            nonlocal cols
+            if colname not in cols:
+                cur.execute(f"ALTER TABLE receipt_request_events ADD COLUMN {colname} {coltype}")
+                cols.append(colname)
 
+        # Nombres que pueden variar según versiones anteriores:
+        # - whatsapp vs to_whatsapp
+        # Vamos a soportar ambos.
+        _add_col("tenant", "TEXT")
+        _add_col("cuil", "TEXT")
+        _add_col("period", "TEXT")
+        _add_col("source", "TEXT")
+        _add_col("result", "TEXT")
+        _add_col("message_sid", "TEXT")
+        _add_col("created_at", "INTEGER")
+        _add_col("origin", "TEXT")
+
+        # columna whatsapp (si tu tabla vieja tenía to_whatsapp, la dejamos también)
+        if "whatsapp" not in cols and "to_whatsapp" not in cols:
+            _add_col("whatsapp", "TEXT")
+
+        # 4) Armar INSERT solo con columnas que existen
+        data = {
+            "tenant": tenant,
+            "cuil": cuil,
+            "period": period,
+            "source": source,
+            "result": result,
+            "message_sid": message_sid,
+            "created_at": created_at,
+            "origin": origin,
+        }
+
+        # elegir columna destino para el whatsapp
+        if "whatsapp" in cols:
+            data["whatsapp"] = to_whatsapp
+        elif "to_whatsapp" in cols:
+            data["to_whatsapp"] = to_whatsapp  # por si tu tabla vieja usa este nombre
+
+        insert_cols = [k for k in data.keys() if k in cols]
+        placeholders = ",".join(["?"] * len(insert_cols))
+        sql = f"INSERT INTO receipt_request_events ({','.join(insert_cols)}) VALUES ({placeholders})"
+
+        cur.execute(sql, tuple(data[k] for k in insert_cols))
         conn.commit()
 
+    except Exception as e:
+        # Fallback ultra defensivo: no romper producción por logging
+        print("WARN: _log_receipt_request_event failed:", e)
+        try:
+            conn.rollback()
+        except Exception:
+            pass
     finally:
         conn.close()
 
@@ -1327,6 +1357,81 @@ def set_verified_contact(tenant: str, cuil: str, to_whatsapp: str, dni: str, nom
 
     conn.commit()
     conn.close()
+
+@app.get("/admin/reset_user")
+def admin_reset_user():
+    token = (request.args.get("token") or "").strip()
+    tenant = (request.args.get("tenant") or "").strip().lower()
+    cuil = (request.args.get("cuil") or "").strip()
+    whatsapp = (request.args.get("whatsapp") or "").strip()  # opcional
+
+    if not token or token != ADMIN_TOKEN:
+        return Response("Unauthorized", status=401)
+
+    if not tenant or not cuil:
+        return Response("Missing tenant/cuil", status=400)
+
+    conn = get_db_connection()
+    cur = conn.cursor()
+
+    # 1) limpiar pending (cola)
+    # si tenés tabla pending_views:
+    try:
+        if whatsapp:
+            cur.execute("DELETE FROM pending_views WHERE tenant=? AND cuil=? AND to_whatsapp=?", (tenant, cuil, whatsapp))
+        else:
+            cur.execute("DELETE FROM pending_views WHERE tenant=? AND cuil=?", (tenant, cuil))
+    except Exception as e:
+        print("WARN reset_user pending_views:", e)
+
+    # 2) limpiar contador de requests (la tabla donde contás 3/3)
+    # 👉 Ajustá el nombre según tu tabla real:
+    # - receipt_requests / receipt_request_counts / receipt_request_limits, etc.
+    # Te dejo 2 intentos comunes (no rompe si no existe).
+    try:
+        if whatsapp:
+            cur.execute("DELETE FROM receipt_request_counts WHERE tenant=? AND cuil=? AND to_whatsapp=?", (tenant, cuil, whatsapp))
+        else:
+            cur.execute("DELETE FROM receipt_request_counts WHERE tenant=? AND cuil=?", (tenant, cuil))
+    except Exception as e:
+        print("WARN reset_user receipt_request_counts:", e)
+
+    # 3) limpiar eventos/logs (opcional)
+    try:
+        if whatsapp:
+            cur.execute("DELETE FROM receipt_request_events WHERE tenant=? AND cuil=? AND whatsapp=?", (tenant, cuil, whatsapp))
+            cur.execute("DELETE FROM receipt_request_events WHERE tenant=? AND cuil=? AND to_whatsapp=?", (tenant, cuil, whatsapp))
+        else:
+            cur.execute("DELETE FROM receipt_request_events WHERE tenant=? AND cuil=?", (tenant, cuil))
+    except Exception as e:
+        print("WARN reset_user receipt_request_events:", e)
+
+    # 4) limpiar “sent_pdfs”/tracking (opcional, para que no dispare cosas raras)
+    try:
+        if whatsapp:
+            cur.execute("DELETE FROM sent_pdfs WHERE tenant=? AND cuil=? AND to_whatsapp=?", (tenant, cuil, whatsapp))
+        else:
+            cur.execute("DELETE FROM sent_pdfs WHERE tenant=? AND cuil=?", (tenant, cuil))
+    except Exception as e:
+        print("WARN reset_user sent_pdfs:", e)
+
+    # 5) limpiar estado de recibo (firmado/observado) si querés
+    # (lo dejo comentado por seguridad; descomentá si lo necesitás)
+    # try:
+    #     cur.execute("DELETE FROM recibo_estado WHERE tenant=? AND cuil=?", (tenant, cuil))
+    # except Exception as e:
+    #     print("WARN reset_user recibo_estado:", e)
+
+    conn.commit()
+    conn.close()
+
+    return jsonify({
+        "ok": True,
+        "tenant": tenant,
+        "cuil": cuil,
+        "whatsapp": whatsapp or None,
+        "msg": "Reset realizado (pending/contadores/logs/tracking)."
+    })
 
 
 def set_pending_step(pending_id: int, step: str):
