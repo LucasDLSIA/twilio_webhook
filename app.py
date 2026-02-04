@@ -1141,7 +1141,12 @@ def init_db():
         message_sid TEXT,
         created_at INTEGER NOT NULL
       );
-    """)
+        """
+            CREATE TABLE IF NOT EXISTS inbound_dedup (
+        message_sid TEXT PRIMARY KEY,
+        created_at INTEGER
+        );)
+
 
     # índices útiles
     _try_alter(cur, "CREATE INDEX IF NOT EXISTS idx_pending_to_created ON pending_views(to_whatsapp, created_at);")
@@ -1159,6 +1164,19 @@ def init_db():
 
 
 init_db()
+
+def inbound_seen(message_sid: str) -> bool:
+    if not message_sid:
+        return False
+    now = int(time.time())
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute("INSERT OR IGNORE INTO inbound_dedup(message_sid, created_at) VALUES (?, ?)", (message_sid, now))
+    conn.commit()
+    inserted = (cur.rowcount == 1)
+    conn.close()
+    return (not inserted)  # True si ya existía
+
 
 def ensure_verified_contacts_schema(cur):
     # si la tabla no existe, la creamos completa
@@ -3384,8 +3402,14 @@ def twilio_inbound():
     from_whatsapp = (request.form.get("From") or "").strip()
     button = (request.form.get("ButtonPayload") or "").strip()
     body = (request.form.get("Body") or "").strip()
+    in_sid = (request.form.get("MessageSid") or "").strip()
 
-    print("INBOUND:", from_whatsapp, "ButtonPayload:", button, "Body:", body)
+    print("INBOUND:", from_whatsapp, "MessageSid:", in_sid, "ButtonPayload:", button, "Body:", body)
+
+    # ✅ DEDUP global: si Twilio reintenta el mismo inbound, no hacemos nada
+    if inbound_seen(in_sid):
+        print("DEDUP inbound:", in_sid)
+        return Response("OK", status=200)
 
     def _is_receipt_request_text(t: str) -> bool:
         t = (t or "").strip().lower()
@@ -3397,12 +3421,13 @@ def twilio_inbound():
 
     pending = get_latest_pending_view(from_whatsapp)
     print("PENDING:", pending)
+
     # =========================
     # REGLA: cualquier texto (sin botón) dispara menú,
     # EXCEPTO cuando estamos esperando DNI o selección de períodos
     # =========================
     if not button:
-        step_now = (pending.get("step") or "READY").upper() if pending else "READY"
+        step_now = (pending.get("step") or "READY").upper() if isinstance(pending, dict) else "READY"
         body_norm = (body or "").strip()
 
         # AWAIT_DNI: dejamos pasar para que lo procese el bloque AWAIT_DNI
@@ -3412,26 +3437,37 @@ def twilio_inbound():
         # CHOOSE_PREVIOUS: si no es 1/2/3, devolvemos ayuda (no menú)
         elif step_now == "CHOOSE_PREVIOUS":
             if body_norm in ("1", "2", "3"):
-                pass  # lo procesa el bloque de selección
+                pass
             else:
                 return twiml("🗂️ Respondé con 1, 2 o 3 para elegir un período anterior.")
 
         else:
-            # Disparar menú ante cualquier texto
-            sid = send_whatsapp_menu_template(
-                from_whatsapp,
-                nombre=(pending.get("nombre","") if isinstance(pending, dict) else "")
-            )
+            # ✅ Enviar menú y terminar (SIN TwiML al usuario)
+            nombre = ""
+            if isinstance(pending, dict):
+                nombre = (pending.get("nombre") or "").strip()
+
+            sid = send_whatsapp_menu_template(from_whatsapp, nombre=nombre)
+            return Response("OK", status=200)
 
     # =========================
     # SIN PENDING: o guía o reconstrucción para "RECIBO"
     # =========================
     if not pending:
         if not _is_receipt_request_text(body) and not button:
+            in_sid = (request.form.get("MessageSid") or "").strip()
+            if inbound_seen(in_sid):
+                print("DEDUP inbound:", in_sid)
+                return Response("OK", status=200)
+
             # 🔥 En vez de contestar texto, mandamos la plantilla menú
-            sid = send_whatsapp_menu_template(from_whatsapp, nombre="")
-            if sid:
-                return twiml("✅ Te envié el menú de recibos.")
+            sid = send_whatsapp_menu_template(
+                from_whatsapp,
+                nombre=(pending.get("nombre","") if isinstance(pending, dict) else "")
+            )
+            # No respondemos con texto al usuario: solo 200 OK
+            return Response("OK", status=200)
+
             return twiml("👋 Hola. \nPara recibir tu recibo escribí: *RECIBO*.\nSi no recibiste el mensaje inicial, avisá a RRHH.")
 
         # si es pedido de recibo -> reconstruimos contexto desde último envío
