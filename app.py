@@ -1357,7 +1357,6 @@ def set_verified_contact(tenant: str, cuil: str, to_whatsapp: str, dni: str, nom
 
     conn.commit()
     conn.close()
-
 @app.get("/admin/reset_user")
 def admin_reset_user():
     token = (request.args.get("token") or "").strip()
@@ -1367,60 +1366,81 @@ def admin_reset_user():
 
     if not token or token != ADMIN_TOKEN:
         return Response("Unauthorized", status=401)
-
     if not tenant or not cuil:
         return Response("Missing tenant/cuil", status=400)
 
     conn = get_db_connection()
     cur = conn.cursor()
 
-    # 1) limpiar pending (cola)
-    # si tenés tabla pending_views:
-    try:
-        if whatsapp:
-            cur.execute("DELETE FROM pending_views WHERE tenant=? AND cuil=? AND to_whatsapp=?", (tenant, cuil, whatsapp))
-        else:
-            cur.execute("DELETE FROM pending_views WHERE tenant=? AND cuil=?", (tenant, cuil))
-    except Exception as e:
-        print("WARN reset_user pending_views:", e)
+    def _safe_exec(sql, params=()):
+        try:
+            cur.execute(sql, params)
+            return cur.rowcount
+        except Exception as e:
+            print("WARN reset_user:", e, "| SQL:", sql)
+            return 0
 
-    # 2) limpiar contador de requests (la tabla donde contás 3/3)
-    # 👉 Ajustá el nombre según tu tabla real:
-    # - receipt_requests / receipt_request_counts / receipt_request_limits, etc.
-    # Te dejo 2 intentos comunes (no rompe si no existe).
-    try:
-        if whatsapp:
-            cur.execute("DELETE FROM receipt_request_counts WHERE tenant=? AND cuil=? AND to_whatsapp=?", (tenant, cuil, whatsapp))
-        else:
-            cur.execute("DELETE FROM receipt_request_counts WHERE tenant=? AND cuil=?", (tenant, cuil))
-    except Exception as e:
-        print("WARN reset_user receipt_request_counts:", e)
+    deleted = {}
 
-    # 3) limpiar eventos/logs (opcional)
-    try:
-        if whatsapp:
-            cur.execute("DELETE FROM receipt_request_events WHERE tenant=? AND cuil=? AND whatsapp=?", (tenant, cuil, whatsapp))
-            cur.execute("DELETE FROM receipt_request_events WHERE tenant=? AND cuil=? AND to_whatsapp=?", (tenant, cuil, whatsapp))
-        else:
-            cur.execute("DELETE FROM receipt_request_events WHERE tenant=? AND cuil=?", (tenant, cuil))
-    except Exception as e:
-        print("WARN reset_user receipt_request_events:", e)
+    # 1) pending queue
+    if whatsapp:
+        deleted["pending_views"] = _safe_exec(
+            "DELETE FROM pending_views WHERE tenant=? AND cuil=? AND to_whatsapp=?",
+            (tenant, cuil, whatsapp)
+        )
+    else:
+        deleted["pending_views"] = _safe_exec(
+            "DELETE FROM pending_views WHERE tenant=? AND cuil=?",
+            (tenant, cuil)
+        )
 
-    # 4) limpiar “sent_pdfs”/tracking (opcional, para que no dispare cosas raras)
-    try:
-        if whatsapp:
-            cur.execute("DELETE FROM sent_pdfs WHERE tenant=? AND cuil=? AND to_whatsapp=?", (tenant, cuil, whatsapp))
-        else:
-            cur.execute("DELETE FROM sent_pdfs WHERE tenant=? AND cuil=?", (tenant, cuil))
-    except Exception as e:
-        print("WARN reset_user sent_pdfs:", e)
+    # 2) PDFs enviados (para que no dispare SIGN después)
+    if whatsapp:
+        deleted["sent_pdfs"] = _safe_exec(
+            "DELETE FROM sent_pdfs WHERE tenant=? AND cuil=? AND to_whatsapp=?",
+            (tenant, cuil, whatsapp)
+        )
+    else:
+        deleted["sent_pdfs"] = _safe_exec(
+            "DELETE FROM sent_pdfs WHERE tenant=? AND cuil=?",
+            (tenant, cuil)
+        )
 
-    # 5) limpiar estado de recibo (firmado/observado) si querés
-    # (lo dejo comentado por seguridad; descomentá si lo necesitás)
-    # try:
-    #     cur.execute("DELETE FROM recibo_estado WHERE tenant=? AND cuil=?", (tenant, cuil))
-    # except Exception as e:
-    #     print("WARN reset_user recibo_estado:", e)
+    # 3) Tracking general (plantillas/pdf/sign) — acá suele estar todo lo que ves en el Excel
+    if whatsapp:
+        deleted["message_status"] = _safe_exec(
+            "DELETE FROM message_status WHERE tenant=? AND cuil=? AND to_whatsapp=?",
+            (tenant, cuil, whatsapp)
+        )
+    else:
+        deleted["message_status"] = _safe_exec(
+            "DELETE FROM message_status WHERE tenant=? AND cuil=?",
+            (tenant, cuil)
+        )
+
+    # 4) Eventos/contador auxiliar
+    # soporta columnas whatsapp o to_whatsapp según schema viejo/nuevo
+    deleted["receipt_request_events"] = 0
+    if whatsapp:
+        deleted["receipt_request_events"] += _safe_exec(
+            "DELETE FROM receipt_request_events WHERE tenant=? AND cuil=? AND whatsapp=?",
+            (tenant, cuil, whatsapp)
+        )
+        deleted["receipt_request_events"] += _safe_exec(
+            "DELETE FROM receipt_request_events WHERE tenant=? AND cuil=? AND to_whatsapp=?",
+            (tenant, cuil, whatsapp)
+        )
+    else:
+        deleted["receipt_request_events"] += _safe_exec(
+            "DELETE FROM receipt_request_events WHERE tenant=? AND cuil=?",
+            (tenant, cuil)
+        )
+
+    # 5) Estado firmado/observado si existe (opcional pero para testing sirve)
+    deleted["recibo_estado"] = _safe_exec(
+        "DELETE FROM recibo_estado WHERE tenant=? AND cuil=?",
+        (tenant, cuil)
+    )
 
     conn.commit()
     conn.close()
@@ -1430,9 +1450,8 @@ def admin_reset_user():
         "tenant": tenant,
         "cuil": cuil,
         "whatsapp": whatsapp or None,
-        "msg": "Reset realizado (pending/contadores/logs/tracking)."
+        "deleted": deleted
     })
-
 
 def set_pending_step(pending_id: int, step: str):
     conn = get_db_connection()
