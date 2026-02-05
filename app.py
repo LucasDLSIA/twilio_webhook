@@ -652,8 +652,9 @@ def twilio_status():
         row = cur.fetchone()
 
 
+
         if row:
-            tenant, cuil, period, to_whatsapp, sign_sent_at = row
+            tenant, cuil, period, to_whatsapp, sign_sent_at, origin = row
 
             # ✅ NUEVO: si este PDF fue un reenvío (RESEND_LAST), NO mandamos SIGN
             try:
@@ -889,34 +890,42 @@ def _log_receipt_request_event(
     message_sid: str | None = None,
     origin: str | None = None,
 ):
-    created_at = int(time.time())
+    ts = int(time.time())
     origin = origin or source
 
     conn = sqlite3.connect(DB_PATH)
     try:
         cur = conn.cursor()
 
-        # 1) Asegurar tabla (forma mínima)
+        # 1) Crear tabla (si no existe) en forma "completa"
+        #    (si ya existe con otra estructura, no la toca)
         cur.execute("""
-        CREATE TABLE IF NOT EXISTS receipt_request_events (
-            id INTEGER PRIMARY KEY AUTOINCREMENT
-        )
+            CREATE TABLE IF NOT EXISTS receipt_request_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                tenant TEXT NOT NULL,
+                cuil TEXT NOT NULL,
+                period TEXT,
+                to_whatsapp TEXT,
+                whatsapp TEXT,
+                source TEXT NOT NULL,
+                result TEXT NOT NULL,
+                message_sid TEXT,
+                created_at INTEGER,
+                requested_at INTEGER,
+                origin TEXT
+            );
         """)
 
         # 2) Ver columnas actuales
-        cols = [r[1] for r in cur.execute("PRAGMA table_info(receipt_request_events)").fetchall()]
+        cols = {r[1] for r in cur.execute("PRAGMA table_info(receipt_request_events)").fetchall()}
 
-        # 3) Intentar agregar columnas que usamos (si faltan)
-        #    (SQLite permite ALTER TABLE ADD COLUMN)
         def _add_col(colname: str, coltype: str):
             nonlocal cols
             if colname not in cols:
                 cur.execute(f"ALTER TABLE receipt_request_events ADD COLUMN {colname} {coltype}")
-                cols.append(colname)
+                cols.add(colname)
 
-        # Nombres que pueden variar según versiones anteriores:
-        # - whatsapp vs to_whatsapp
-        # Vamos a soportar ambos.
+        # 3) Asegurar columnas usadas (compatibilidad)
         _add_col("tenant", "TEXT")
         _add_col("cuil", "TEXT")
         _add_col("period", "TEXT")
@@ -924,13 +933,17 @@ def _log_receipt_request_event(
         _add_col("result", "TEXT")
         _add_col("message_sid", "TEXT")
         _add_col("created_at", "INTEGER")
+        _add_col("requested_at", "INTEGER")   # ✅ clave para tu NOT NULL viejo
         _add_col("origin", "TEXT")
 
-        # columna whatsapp (si tu tabla vieja tenía to_whatsapp, la dejamos también)
-        if "whatsapp" not in cols and "to_whatsapp" not in cols:
+        # compatibilidad con nombres viejos/nuevos
+        if "to_whatsapp" not in cols and "whatsapp" not in cols:
+            _add_col("to_whatsapp", "TEXT")
+        else:
+            _add_col("to_whatsapp", "TEXT")
             _add_col("whatsapp", "TEXT")
 
-        # 4) Armar INSERT solo con columnas que existen
+        # 4) Preparar data
         data = {
             "tenant": tenant,
             "cuil": cuil,
@@ -938,15 +951,16 @@ def _log_receipt_request_event(
             "source": source,
             "result": result,
             "message_sid": message_sid,
-            "created_at": created_at,
+            "created_at": ts,
+            "requested_at": ts,   # ✅ siempre seteamos ambos si existen
             "origin": origin,
         }
 
-        # elegir columna destino para el whatsapp
+        # guardar whatsapp en la columna que exista
+        if "to_whatsapp" in cols:
+            data["to_whatsapp"] = to_whatsapp
         if "whatsapp" in cols:
             data["whatsapp"] = to_whatsapp
-        elif "to_whatsapp" in cols:
-            data["to_whatsapp"] = to_whatsapp  # por si tu tabla vieja usa este nombre
 
         insert_cols = [k for k in data.keys() if k in cols]
         placeholders = ",".join(["?"] * len(insert_cols))
@@ -956,7 +970,6 @@ def _log_receipt_request_event(
         conn.commit()
 
     except Exception as e:
-        # Fallback ultra defensivo: no romper producción por logging
         print("WARN: _log_receipt_request_event failed:", e)
         try:
             conn.rollback()
@@ -1134,18 +1147,20 @@ def init_db():
     # ✅ NUEVO: receipt_request_events (log evento por evento)
     # =========
     cur.execute("""
-      CREATE TABLE IF NOT EXISTS receipt_request_events (
+    CREATE TABLE IF NOT EXISTS receipt_request_events (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         tenant TEXT NOT NULL,
         cuil TEXT NOT NULL,
         period TEXT,
         to_whatsapp TEXT NOT NULL,
-        source TEXT NOT NULL,     -- USER_TEXT / VIEW_NOW / DNI_OK / etc.
-        result TEXT NOT NULL,     -- SENT / BLOCKED_LIMIT / ASK_DNI / NO_PDF / ERROR / NO_CONTEXT
+        source TEXT NOT NULL,
+        result TEXT NOT NULL,
         message_sid TEXT,
-        created_at INTEGER NOT NULL
-      );
+        requested_at INTEGER NOT NULL
+    );
     """)
+    _try_alter(cur, "ALTER TABLE receipt_request_events ADD COLUMN requested_at INTEGER;")
+
 
     # =========
     # ✅ NUEVO: inbound_dedup (para evitar doble procesamiento)
