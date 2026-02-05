@@ -1126,7 +1126,7 @@ def init_db():
       );
     """)
 
-    # =========
+    #    # =========
     # ✅ NUEVO: receipt_request_events (log evento por evento)
     # =========
     cur.execute("""
@@ -1141,11 +1141,18 @@ def init_db():
         message_sid TEXT,
         created_at INTEGER NOT NULL
       );
-        """
-            CREATE TABLE IF NOT EXISTS inbound_dedup (
+    """)
+
+    # =========
+    # ✅ NUEVO: inbound_dedup (para evitar doble procesamiento)
+    # =========
+    cur.execute("""
+      CREATE TABLE IF NOT EXISTS inbound_dedup (
         message_sid TEXT PRIMARY KEY,
         created_at INTEGER
-        );)
+      );
+    """)
+
 
 
     # índices útiles
