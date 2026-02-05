@@ -644,12 +644,13 @@ def twilio_status():
     # si fue delivered y es PDF -> mandar SIGN una sola vez
     if status == "delivered":
         cur.execute("""
-            SELECT tenant, cuil, period, to_whatsapp, sign_sent_at
+            SELECT tenant, cuil, period, to_whatsapp, sign_sent_at, COALESCE(origin, 'INITIAL')
             FROM sent_pdfs
             WHERE message_sid = ?
             LIMIT 1
         """, (sid,))
         row = cur.fetchone()
+
 
         if row:
             tenant, cuil, period, to_whatsapp, sign_sent_at = row
@@ -661,30 +662,31 @@ def twilio_status():
                 origin = None
                 print("WARN: could not resolve origin by sid:", e)
 
-            if origin == "RESEND_LAST":
-                # marcamos sign_sent_at para no reintentar (opcional pero recomendable)
-                if not sign_sent_at:
-                    cur.execute("UPDATE sent_pdfs SET sign_sent_at = ? WHERE message_sid = ?", (now, sid))
-                print("SKIP SIGN AFTER PDF (RESEND_LAST):", sid)
-            else:
-                if not sign_sent_at and TWILIO_SIGN_TEMPLATE_SID:
-                    try:
-                        sid_sign = send_whatsapp_template(
-                            to_whatsapp,
-                            content_vars={"1": period},
-                            template_sid=TWILIO_SIGN_TEMPLATE_SID
-                        )
-                        # opcional: trackear el SIGN en message_status también
-                        cur.execute("""
-                            INSERT OR IGNORE INTO message_status
-                            (message_sid, to_whatsapp, tenant, cuil, period, kind, created_at, last_status, last_status_at)
-                            VALUES (?, ?, ?, ?, ?, 'sign', ?, 'sent', ?)
-                        """, (sid_sign, to_whatsapp, tenant, cuil, period, now, now))
+            if row:
+                tenant, cuil, period, to_whatsapp, sign_sent_at, origin = row
 
-                        cur.execute("UPDATE sent_pdfs SET sign_sent_at = ? WHERE message_sid = ?", (now, sid))
-                        print("SENT SIGN AFTER PDF DELIVERED:", sid_sign)
-                    except Exception as e:
-                        print("WARN: could not send SIGN:", e)
+                # ✅ Si es reenvío, NO firmar nunca
+                if origin != "INITIAL":
+                    print("SKIP SIGN AFTER PDF (origin=", origin, "):", sid)
+                else:
+                    if not sign_sent_at and TWILIO_SIGN_TEMPLATE_SID:
+                        try:
+                            sid_sign = send_whatsapp_template(
+                                to_whatsapp,
+                                content_vars={"1": period},
+                                template_sid=TWILIO_SIGN_TEMPLATE_SID
+                            )
+
+                            cur.execute("""
+                                INSERT OR IGNORE INTO message_status
+                                (message_sid, to_whatsapp, tenant, cuil, period, kind, created_at, last_status, last_status_at)
+                                VALUES (?, ?, ?, ?, ?, 'sign', ?, 'sent', ?)
+                            """, (sid_sign, to_whatsapp, tenant, cuil, period, now, now))
+
+                            cur.execute("UPDATE sent_pdfs SET sign_sent_at = ? WHERE message_sid = ?", (now, sid))
+                            print("SENT SIGN AFTER PDF DELIVERED:", sid_sign)
+                        except Exception as e:
+                            print("WARN: could not send SIGN:", e)
 
     conn.commit()
     conn.close()
@@ -1082,10 +1084,12 @@ def init_db():
         message_sid TEXT NOT NULL UNIQUE,
         created_at INTEGER NOT NULL,
         sign_sent_at INTEGER
+        origin TEXT
+
       );
     """)
     _try_alter(cur, "ALTER TABLE sent_pdfs ADD COLUMN sign_sent_at INTEGER;")
-
+    _try_alter(cur, "ALTER TABLE sent_pdfs ADD COLUMN origin TEXT;")
     # =========
     # verifications (ya la usás)
     # =========
@@ -1217,27 +1221,20 @@ def ensure_verified_contacts_schema(cur):
     _try_alter(cur, "CREATE INDEX IF NOT EXISTS idx_verified_cuil ON verified_contacts(tenant, cuil);")
 
 
-def save_pdf_sid(tenant: str, cuil: str, period: str, to_whatsapp: str, sid: str):
+def save_pdf_sid(tenant: str, cuil: str, period: str, to_whatsapp: str, message_sid: str, origin: str = "INITIAL"):
     now = int(time.time())
     conn = get_db_connection()
     cur = conn.cursor()
-
-    # tracking para reporte
     cur.execute("""
-        INSERT OR IGNORE INTO message_status
-        (message_sid, to_whatsapp, tenant, cuil, period, kind, created_at, last_status, last_status_at)
-        VALUES (?, ?, ?, ?, ?, 'pdf', ?, 'sent', ?)
-    """, (sid, to_whatsapp, tenant, cuil, period, now, now))
-
-    # tracking para enviar SIGN al delivered
-    cur.execute("""
-        INSERT OR IGNORE INTO sent_pdfs
-        (tenant, cuil, period, to_whatsapp, message_sid, created_at)
-        VALUES (?, ?, ?, ?, ?, ?)
-    """, (tenant, cuil, period, to_whatsapp, sid, now))
-
+        INSERT OR REPLACE INTO sent_pdfs
+        (tenant, cuil, period, to_whatsapp, message_sid, created_at, sign_sent_at, origin)
+        VALUES (?, ?, ?, ?, ?, COALESCE((SELECT created_at FROM sent_pdfs WHERE message_sid = ?), ?),
+                COALESCE((SELECT sign_sent_at FROM sent_pdfs WHERE message_sid = ?), NULL),
+                ?)
+    """, (tenant, cuil, period, to_whatsapp, message_sid, message_sid, now, message_sid, origin))
     conn.commit()
     conn.close()
+
 
 def _digits(s: str) -> str:
     return "".join(ch for ch in (s or "") if ch.isdigit())
@@ -3475,7 +3472,6 @@ def twilio_inbound():
             # No respondemos con texto al usuario: solo 200 OK
             return Response("OK", status=200)
 
-            return twiml("👋 Hola. \nPara recibir tu recibo escribí: *RECIBO*.\nSi no recibiste el mensaje inicial, avisá a RRHH.")
 
         # si es pedido de recibo -> reconstruimos contexto desde último envío
         ctx = get_latest_context_for_whatsapp(from_whatsapp)
@@ -3545,14 +3541,14 @@ def twilio_inbound():
             return twiml("🔐 Para reenviar tu recibo, enviá tu DNI (solo números, sin puntos).")
 
 
-        sid_pdf = _send_pdf_flow(from_whatsapp, tenant, cuil, best_period)
+        sid_pdf = _send_pdf_flow(from_whatsapp, tenant, cuil, best_period, origin="RESEND_LAST")
         if not sid_pdf:
             _log_receipt_request_event(tenant, cuil, best_period, from_whatsapp, "RESEND_LAST", "ERROR")
             return twiml("❌ No pude enviar el PDF en este momento. Probá de nuevo o avisá a RRHH.")
 
-        n = inc_receipt_request_count(tenant, cuil, best_period, from_whatsapp)
+        # ✅ no mandamos texto antes del PDF
         _log_receipt_request_event(tenant, cuil, best_period, from_whatsapp, "RESEND_LAST", "SENT", message_sid=sid_pdf, origin="RESEND_LAST")
-        return twiml(f"📄 Listo. Te reenvié el recibo {best_period}. (Pedido {n}/3)")
+        return Response("OK", status=200)
 
     # SEE_PREVIOUS -> ofrece hasta 3 períodos anteriores (no envía PDF todavía)
     if button == "SEE_PREVIOUS":
@@ -3690,7 +3686,12 @@ def twilio_inbound():
 
     return Response("OK", status=200)
 
-def _send_pdf_flow(from_whatsapp: str, tenant: str, cuil: str, period: str) -> str | None:
+def _send_pdf_flow(from_whatsapp: str, tenant: str, cuil: str, period: str, origin: str = "INITIAL") -> str | None:
+    """
+    Envía el PDF del recibo.
+    - origin="INITIAL": envío inicial (RRHH) -> puede disparar firma al entregar.
+    - origin="RESEND": reenvío pedido por el usuario -> NO debe disparar firma.
+    """
     file_id = find_pdf_file_id_for_cuil_period(tenant, cuil, period)
     if not file_id:
         return None
@@ -3701,15 +3702,23 @@ def _send_pdf_flow(from_whatsapp: str, tenant: str, cuil: str, period: str) -> s
     )
 
     try:
+        # ✅ Para controlar el orden:
+        # - En INITIAL podemos incluir body (si querés).
+        # - En RESEND lo mandamos vacío y notificamos después del delivered desde /twilio/status.
+        body_text = f"Acá tenés tu recibo {period}." if origin == "INITIAL" else ""
+
         sid_pdf = send_whatsapp_pdf(
             from_whatsapp,
             pdf_url,
-            body=f"Acá tenés tu recibo {period}.",
+            body=body_text,
             status_callback=STATUS_CALLBACK_URL,
         )
 
         set_recibo_estado(tenant, cuil, period, "DISPONIBLE")
-        save_pdf_sid(tenant, cuil, period, from_whatsapp, sid_pdf)
+
+        # ✅ Guardamos SID + ORIGIN (para decidir si enviar firma o no al delivered)
+        save_pdf_sid(tenant, cuil, period, from_whatsapp, sid_pdf, origin=origin)
+
         return sid_pdf
 
     except Exception as e:
