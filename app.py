@@ -3680,7 +3680,7 @@ def twilio_inbound():
 
         n = inc_receipt_request_count(tenant, cuil, period, from_whatsapp)
         _log_receipt_request_event(tenant, cuil, period, from_whatsapp, "VIEW_NOW", "SENT", message_sid=sid_pdf)
-        
+        return Response("OK", status=200)
 
     # NO_NEED
     if button == "NO_NEED" or body == "NO_NEED":
