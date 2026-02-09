@@ -3571,7 +3571,7 @@ def twilio_inbound():
         prev = periods[1:4]  # tres anteriores al último disponible
 
         if not prev:
-            return twiml("ℹ️ No tengo períodos anteriores disponibles.")
+            return twiml("ℹ️ Esta opción estará disponible próximamente.")
 
         set_pending_step(pending["id"], "CHOOSE_PREVIOUS")
 
@@ -3680,7 +3680,7 @@ def twilio_inbound():
 
         n = inc_receipt_request_count(tenant, cuil, period, from_whatsapp)
         _log_receipt_request_event(tenant, cuil, period, from_whatsapp, "VIEW_NOW", "SENT", message_sid=sid_pdf)
-        return twiml(f"📄 Perfecto. Te envío el recibo ahora. (Pedido {n}/3)")
+        
 
     # NO_NEED
     if button == "NO_NEED" or body == "NO_NEED":
