@@ -2028,6 +2028,21 @@ def save_template_sid(tenant: str, cuil: str, period: str, to_whatsapp: str, sid
     conn.commit()
     conn.close()
 
+def already_sent_template(tenant: str, cuil: str, period: str, to_whatsapp: str) -> bool:
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT 1
+            FROM message_status
+            WHERE tenant=? AND cuil=? AND period=? AND to_whatsapp=? AND kind='template'
+            LIMIT 1
+        """, (tenant, cuil, period, to_whatsapp))
+
+        return cur.fetchone() is not None
+    finally:
+        conn.close()
+
 
 
 @app.get("/admin")
@@ -2500,6 +2515,29 @@ def generate_excel_report_v2(tenant: str, period_filter: str = "") -> BytesIO:
     buf.seek(0)
     return buf
 
+from googleapiclient.errors import HttpError
+import time
+
+def _is_retryable_drive_error(e: HttpError) -> bool:
+    status = getattr(e.resp, "status", None)
+    return status in (429, 500, 502, 503, 504)
+
+def find_pdf_with_retry(tenant, cuil, period, tries=4):
+    last = None
+    for i in range(tries):
+        try:
+            return find_pdf_file_id_for_cuil_period(tenant, cuil, period)
+        except HttpError as e:
+            last = e
+            if _is_retryable_drive_error(e):
+                time.sleep(0.6 * (2 ** i))
+                continue
+            raise
+    # si agotó reintentos, devolvemos None (no tumbamos la cola)
+    print("DRIVE RETRY EXHAUSTED:", tenant, cuil, period, last)
+    return None
+
+
 
 @app.get("/admin/panel")
 def admin_panel():
@@ -2518,7 +2556,8 @@ def admin_panel():
         return Response("Tenant inválido. Volvé a /admin.", status=400)
 
     # Lee envíos (cacheado si tu load_envios_rows cachea)
-    envios_rows = load_envios_rows(tenant, force=False) or []
+    force = (request.args.get("refresh") in ("1", "true", "yes", "on"))
+    envios_rows = load_envios_rows(tenant, force=force) or []
 
     html = []
     html.append("<!doctype html><html><head><meta charset='utf-8'><title>Panel empresa</title></head><body>")
@@ -3140,6 +3179,7 @@ def admin_send_template_queue_start():
 
     sent = 0
     skipped_no_pdf = 0
+    skipped_already = 0
     failed = 0
 
     for r in rows:
@@ -3164,6 +3204,7 @@ def admin_send_template_queue_start():
             cuil = strip_pdf(cuil)
         except Exception:
             continue
+
         print("\n--- ROW DEBUG ---")
         print("tenant:", tenant)
         print("nombre:", nombre)
@@ -3172,14 +3213,19 @@ def admin_send_template_queue_start():
 
         # 🔒 verificar PDF (solo si require_pdf=True)
         if require_pdf:
-            pdf_file_id = find_pdf_file_id_for_cuil_period(tenant, cuil, period)
-
+            pdf_file_id = find_pdf_with_retry(tenant, cuil, period)
             if not pdf_file_id:
                 skipped_no_pdf += 1
-                print("SKIP (no pdf):", tenant, cuil, period)
+                print("SKIP (no pdf / drive error):", tenant, cuil, period)
                 continue
+
         # ✅ Recién ahora mandamos VIEW_NOW
         try:
+            if already_sent_template(tenant, cuil, period, to_whatsapp):
+                skipped_already += 1
+                print("SKIP (already sent):", tenant, cuil, period, to_whatsapp)
+                continue
+
             sid = send_whatsapp_template(
                 to_whatsapp,
                 content_vars={"1": (nombre or "Hola")},
@@ -3199,8 +3245,10 @@ def admin_send_template_queue_start():
 
     return redirect(
         f"/admin/panel?tenant={tenant}&token={token}&msg=mass_send_ok"
-        f"&sent={sent}&failed={failed}&skipped={skipped_no_pdf}&period={period}"
+        f"&sent={sent}&failed={failed}&skipped={skipped_no_pdf}"
+        f"&skipped_already={skipped_already}&period={period}"
     )
+
 
 def debug_list_root_pdfs(tenant: str, limit=20):
     t = get_tenant(tenant)
