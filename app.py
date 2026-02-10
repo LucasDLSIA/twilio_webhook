@@ -1240,6 +1240,8 @@ def save_pdf_sid(tenant: str, cuil: str, period: str, to_whatsapp: str, message_
     now = int(time.time())
     conn = get_db_connection()
     cur = conn.cursor()
+
+    # 1) guardado histórico (como ya tenías)
     cur.execute("""
         INSERT OR REPLACE INTO sent_pdfs
         (tenant, cuil, period, to_whatsapp, message_sid, created_at, sign_sent_at, origin)
@@ -1247,6 +1249,14 @@ def save_pdf_sid(tenant: str, cuil: str, period: str, to_whatsapp: str, message_
                 COALESCE((SELECT sign_sent_at FROM sent_pdfs WHERE message_sid = ?), NULL),
                 ?)
     """, (tenant, cuil, period, to_whatsapp, message_sid, message_sid, now, message_sid, origin))
+
+    # 2) ✅ NUEVO: fila en message_status para que los reportes tengan horarios
+    cur.execute("""
+        INSERT OR IGNORE INTO message_status
+        (message_sid, to_whatsapp, tenant, cuil, period, kind, created_at, last_status, last_status_at)
+        VALUES (?, ?, ?, ?, ?, 'media', ?, 'sent', ?)
+    """, (message_sid, to_whatsapp, tenant, cuil, period, now, now))
+
     conn.commit()
     conn.close()
 
@@ -1635,19 +1645,26 @@ def norm_period_label(p: str) -> str:
 
     return f"{mm}/{yyyy}"
 
+from io import BytesIO
+import sqlite3
+import time
+
 def generate_pdf_report_v2(tenant: str, period_filter: str = "") -> BytesIO:
     """
-    Genera un PDF simple con el mismo contenido que el XLSX (incluye pedidos_recibo).
+    PDF más atractivo: header + KPIs + tabla estilizada (zebra) + footer con página.
     """
     from reportlab.lib.pagesizes import A4, landscape
-    from reportlab.pdfgen import canvas
     from reportlab.lib.units import cm
+    from reportlab.lib import colors
+    from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+    from reportlab.platypus import (
+        SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer
+    )
 
-    # reutilizamos el armado del XLSX para no duplicar lógica:
-    # acá armamos una "vista" leyendo directamente desde DB similar a generate_excel_report_v2
     tenant = (tenant or "").strip().lower()
     period_filter = norm_period_label(period_filter)
 
+    # ========= 1) Leer DB =========
     conn = get_db_connection()
     conn.row_factory = sqlite3.Row
     cur = conn.cursor()
@@ -1677,6 +1694,7 @@ def generate_pdf_report_v2(tenant: str, period_filter: str = "") -> BytesIO:
 
     conn.close()
 
+    # ========= 2) Maps =========
     estado_map = {}
     for r in estado_rows:
         c = (r["cuil"] or "").strip()
@@ -1692,7 +1710,7 @@ def generate_pdf_report_v2(tenant: str, period_filter: str = "") -> BytesIO:
         if c and p and w:
             rr_map[(w, c, p)] = {"count": int(r["request_count"] or 0), "last": r["last_requested_at"]}
 
-    # agregación: una fila por (whatsapp,period)
+    # ========= 3) Agregar por (whatsapp,period) =========
     agg = {}
     for row in msg_rows:
         wpp = (row["to_whatsapp"] or "").strip()
@@ -1710,34 +1728,42 @@ def generate_pdf_report_v2(tenant: str, period_filter: str = "") -> BytesIO:
         if k not in agg:
             agg[k] = {
                 "Periodo": per,
-                "Nombre": nombre,
+                "Nombre": nombre,   # lo vamos “rellenando” con lo que aparezca
                 "CUIL": cuil,
                 "WhatsApp": wpp,
                 "PDF_enviado": "",
                 "PDF_entregado": "",
                 "PDF_leido": "",
+                "PDF_fallido": "",
                 "Respuesta": "",
                 "Pedidos": 0,
                 "Ultimo_pedido": "",
             }
 
+        # ✅ Si viene nombre/cuil en alguna fila, asegurarlo
+        if nombre and not agg[k]["Nombre"]:
+            agg[k]["Nombre"] = nombre
+        if cuil and not agg[k]["CUIL"]:
+            agg[k]["CUIL"] = cuil
+
         kind = (row["kind"] or "").strip().lower()
         if kind in ("pdf", "media"):
-            # guardamos los timestamps más útiles
             if row["created_at"]:
                 agg[k]["PDF_enviado"] = ts_to_str(row["created_at"])
             if row["delivered_at"]:
                 agg[k]["PDF_entregado"] = ts_to_str(row["delivered_at"])
             if row["read_at"]:
                 agg[k]["PDF_leido"] = ts_to_str(row["read_at"])
+            if row["failed_at"]:
+                agg[k]["PDF_fallido"] = ts_to_str(row["failed_at"])
 
-    # mezclar estado + pedidos
-    for k, rec in agg.items():
-        cuil = rec.get("CUIL","")
-        per = rec.get("Periodo","")
+    # Mezclar estado + pedidos
+    for _, rec in agg.items():
+        cuil = rec.get("CUIL", "")
+        per = rec.get("Periodo", "")
         st = estado_map.get((cuil, per))
         if st:
-            rec["Respuesta"] = st.get("estado","")
+            rec["Respuesta"] = st.get("estado", "") or ""
 
         rr = rr_map.get((rec["WhatsApp"], cuil, per))
         if rr:
@@ -1747,62 +1773,144 @@ def generate_pdf_report_v2(tenant: str, period_filter: str = "") -> BytesIO:
     rows = list(agg.values())
     rows.sort(key=lambda r: (r.get("Periodo",""), r.get("Nombre",""), r.get("WhatsApp","")))
 
-    # PDF
+    # ========= 4) KPIs =========
+    def _not_empty(x: str) -> bool:
+        return bool((x or "").strip())
+
+    total = len(rows)
+    enviados = sum(1 for r in rows if _not_empty(r.get("PDF_enviado","")))
+    entregados = sum(1 for r in rows if _not_empty(r.get("PDF_entregado","")))
+    leidos = sum(1 for r in rows if _not_empty(r.get("PDF_leido","")))
+    fallidos = sum(1 for r in rows if _not_empty(r.get("PDF_fallido","")))
+    observados = sum(1 for r in rows if (r.get("Respuesta","") or "").upper() == "OBSERVADO")
+
+    # ========= 5) Construcción PDF (Platypus) =========
     out = BytesIO()
-    c = canvas.Canvas(out, pagesize=landscape(A4))
-    width, height = landscape(A4)
+    page_w, page_h = landscape(A4)
 
-    title = f"Reporte Recibos - {tenant} - {(period_filter if period_filter else 'TODOS')}"
-    c.setFont("Helvetica-Bold", 14)
-    c.drawString(1.2*cm, height - 1.2*cm, title)
+    doc = SimpleDocTemplate(
+        out,
+        pagesize=landscape(A4),
+        leftMargin=1.2*cm,
+        rightMargin=1.2*cm,
+        topMargin=1.0*cm,
+        bottomMargin=1.0*cm,
+        title=f"Reporte Recibos - {tenant}"
+    )
 
-    headers = ["Periodo","Nombre","CUIL","WhatsApp","PDF_enviado","PDF_entregado","PDF_leido","Respuesta","Pedidos","Ultimo_pedido"]
+    styles = getSampleStyleSheet()
+    styles.add(ParagraphStyle(name="Title2", fontSize=16, leading=18, spaceAfter=6))
+    styles.add(ParagraphStyle(name="Meta", fontSize=9, leading=11, textColor=colors.grey))
+    styles.add(ParagraphStyle(name="KPI", fontSize=10, leading=12))
+    styles.add(ParagraphStyle(name="Small", fontSize=8.5, leading=10))
 
-    x0 = 1.2*cm
-    y = height - 2.2*cm
-    line_h = 0.6*cm
+    period_label = period_filter if period_filter else "TODOS"
+    gen_ts = time.strftime("%Y-%m-%d %H:%M")
 
-    # anchos aproximados
-    col_w = [2.2*cm, 5.0*cm, 3.5*cm, 5.2*cm, 3.2*cm, 3.2*cm, 3.0*cm, 3.0*cm, 1.8*cm, 3.5*cm]
+    story = []
 
-    def draw_row(vals, bold=False):
-        nonlocal y
-        if y < 1.2*cm:
-            c.showPage()
-            c.setFont("Helvetica-Bold", 14)
-            c.drawString(1.2*cm, height - 1.2*cm, title)
-            y = height - 2.2*cm
+    # Header visual (título + meta)
+    story.append(Paragraph(f"Reporte de Recibos • <b>{tenant}</b>", styles["Title2"]))
+    story.append(Paragraph(f"Período: <b>{period_label}</b> &nbsp;&nbsp;|&nbsp;&nbsp; Generado: {gen_ts}", styles["Meta"]))
+    story.append(Spacer(1, 0.35*cm))
 
-        c.setFont("Helvetica-Bold" if bold else "Helvetica", 8.5)
-        x = x0
-        for i, v in enumerate(vals):
-            txt = str(v or "")
-            c.drawString(x, y, txt[:60])
-            x += col_w[i]
-        y -= line_h
+    # KPIs como “tarjetas” (tabla de 6 columnas)
+    kpi_data = [
+        ["Total", str(total), "Enviados", str(enviados), "Entregados", str(entregados)],
+        ["Leídos", str(leidos), "Fallidos", str(fallidos), "Observados", str(observados)],
+    ]
+    # Normalizar a 6 columnas en ambas filas
+    if len(kpi_data[1]) < 6:
+        kpi_data[1] += ["", ""] * (3 - len(kpi_data[1])//2)
 
-    draw_row(headers, bold=True)
-    c.setLineWidth(0.5)
-    c.line(x0, y + 0.2*cm, width - 1.2*cm, y + 0.2*cm)
-    y -= 0.2*cm
+    kpi_table = Table(kpi_data, colWidths=[2.1*cm, 1.3*cm, 2.1*cm, 1.3*cm, 2.4*cm, 1.3*cm])
+    kpi_table.setStyle(TableStyle([
+        ("BACKGROUND", (0,0), (-1,-1), colors.whitesmoke),
+        ("BOX", (0,0), (-1,-1), 0.6, colors.lightgrey),
+        ("INNERGRID", (0,0), (-1,-1), 0.4, colors.lightgrey),
+        ("FONTNAME", (0,0), (-1,-1), "Helvetica"),
+        ("FONTSIZE", (0,0), (-1,-1), 10),
+        ("FONTNAME", (0,0), (-1,-1), "Helvetica-Bold"),
+        ("TEXTCOLOR", (0,0), (-1,-1), colors.HexColor("#1f2937")),
+        ("ALIGN", (1,0), (1,-1), "CENTER"),
+        ("ALIGN", (3,0), (3,-1), "CENTER"),
+        ("ALIGN", (5,0), (5,-1), "CENTER"),
+        ("VALIGN", (0,0), (-1,-1), "MIDDLE"),
+        ("LEFTPADDING", (0,0), (-1,-1), 6),
+        ("RIGHTPADDING", (0,0), (-1,-1), 6),
+        ("TOPPADDING", (0,0), (-1,-1), 6),
+        ("BOTTOMPADDING", (0,0), (-1,-1), 6),
+    ]))
+    story.append(kpi_table)
+    story.append(Spacer(1, 0.35*cm))
+
+    # Tabla principal
+    headers = ["Período","Nombre","CUIL","WhatsApp","Enviado","Entregado","Leído","Respuesta","Pedidos","Últ. pedido"]
+    data = [headers]
+
+    def clip(s, n):
+        s = str(s or "")
+        return s if len(s) <= n else s[:n-1] + "…"
 
     for r in rows:
-        draw_row([
+        data.append([
             r.get("Periodo",""),
-            r.get("Nombre",""),
-            r.get("CUIL",""),
-            r.get("WhatsApp",""),
+            clip(r.get("Nombre",""), 28),
+            clip(r.get("CUIL",""), 14),
+            clip(r.get("WhatsApp",""), 22),
             r.get("PDF_enviado",""),
             r.get("PDF_entregado",""),
             r.get("PDF_leido",""),
-            r.get("Respuesta",""),
-            r.get("Pedidos",""),
+            clip(r.get("Respuesta",""), 14),
+            str(r.get("Pedidos","") or ""),
             r.get("Ultimo_pedido",""),
         ])
 
-    c.showPage()
-    c.save()
+    table = Table(
+        data,
+        repeatRows=1,
+        colWidths=[2.0*cm, 5.2*cm, 3.2*cm, 5.0*cm, 3.0*cm, 3.0*cm, 2.6*cm, 2.6*cm, 1.6*cm, 3.2*cm],
+    )
 
+    table_style = TableStyle([
+        # Header
+        ("BACKGROUND", (0,0), (-1,0), colors.HexColor("#111827")),
+        ("TEXTCOLOR", (0,0), (-1,0), colors.white),
+        ("FONTNAME", (0,0), (-1,0), "Helvetica-Bold"),
+        ("FONTSIZE", (0,0), (-1,0), 9.2),
+        ("ALIGN", (0,0), (-1,0), "CENTER"),
+        ("BOTTOMPADDING", (0,0), (-1,0), 8),
+        ("TOPPADDING", (0,0), (-1,0), 8),
+
+        # Body
+        ("FONTNAME", (0,1), (-1,-1), "Helvetica"),
+        ("FONTSIZE", (0,1), (-1,-1), 8.5),
+        ("TEXTCOLOR", (0,1), (-1,-1), colors.HexColor("#111827")),
+        ("GRID", (0,0), (-1,-1), 0.25, colors.lightgrey),
+        ("VALIGN", (0,0), (-1,-1), "MIDDLE"),
+        ("LEFTPADDING", (0,0), (-1,-1), 5),
+        ("RIGHTPADDING", (0,0), (-1,-1), 5),
+        ("TOPPADDING", (0,1), (-1,-1), 4),
+        ("BOTTOMPADDING", (0,1), (-1,-1), 4),
+    ])
+
+    # Zebra rows
+    for i in range(1, len(data)):
+        if i % 2 == 0:
+            table_style.add("BACKGROUND", (0,i), (-1,i), colors.HexColor("#f3f4f6"))
+
+    table.setStyle(table_style)
+    story.append(table)
+
+    # Footer con paginado
+    def on_page(canvas, doc):
+        canvas.saveState()
+        canvas.setFont("Helvetica", 8)
+        canvas.setFillColor(colors.grey)
+        canvas.drawRightString(page_w - 1.2*cm, 0.8*cm, f"Página {doc.page}")
+        canvas.restoreState()
+
+    doc.build(story, onFirstPage=on_page, onLaterPages=on_page)
     out.seek(0)
     return out
 
@@ -3125,19 +3233,6 @@ def admin_reset():
     conn.close()
 
     return redirect(f"/admin/panel?tenant={tenant}&token={token}&msg=reset_ok&period={period}")
-
-
-def _drive_find_folder_by_name(parent_id: str, name: str) -> str | None:
-    service = drive_service()
-    q = (
-        f"'{parent_id}' in parents and trashed=false "
-        f"and mimeType='application/vnd.google-apps.folder' "
-        f"and name='{name}'"
-    )
-    res = service.files().list(q=q, fields="files(id,name)", pageSize=5).execute()
-    files = res.get("files", [])
-    return files[0]["id"] if files else None
-
 
 @app.post("/admin/send_template_queue_start")
 @admin_required
