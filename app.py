@@ -1674,14 +1674,12 @@ import time
 
 def generate_pdf_report_v2(tenant: str, period_filter: str = "") -> BytesIO:
     """
-    PDF operativo (dashboard):
-    - Gráfico de conteos
-    - Resumen de Envíos (enviados / pendientes / fallidos)
-    - Resumen de Respuestas (firmados / observados / pendientes firma / pendientes lectura)
-    - Recuadro Personas a accionar (máx 10) en prioridad:
-      Observados -> Pendientes envío -> Pendientes firma -> Pendientes lectura
+    Diseño "cards + donuts + tarjetas de personas" (menos formal).
+    - 2 donuts (envíos / respuestas)
+    - contadores grandes tipo cards
+    - personas a accionar (máx 10) en tarjetas
+    Prioridad personas: Observados -> Pendientes envío -> Pendientes firma -> Pendientes lectura
     """
-    # --- deps ---
     from reportlab.lib.pagesizes import A4, landscape
     from reportlab.lib.units import cm
     from reportlab.lib import colors
@@ -1741,10 +1739,10 @@ def generate_pdf_report_v2(tenant: str, period_filter: str = "") -> BytesIO:
         if c and p and w:
             rr_map[(w, c, p)] = {"count": int(r["request_count"] or 0), "last": r["last_requested_at"]}
 
-    # ========= agregación por (whatsapp, periodo) =========
     def ne(x: str) -> bool:
         return bool((x or "").strip())
 
+    # ========= agregación por (whatsapp, periodo) =========
     agg = {}
     for row in msg_rows:
         wpp = (row["to_whatsapp"] or "").strip()
@@ -1815,11 +1813,8 @@ def generate_pdf_report_v2(tenant: str, period_filter: str = "") -> BytesIO:
                 rec["_last_ts"] = max(rec["_last_ts"], int(rr["last"]))
 
     rows = list(agg.values())
-    rows.sort(key=lambda r: (r.get("Nombre",""), r.get("WhatsApp","")))
 
-    # ========= categorías / conteos =========
-    total = len(rows)
-
+    # ========= categorías =========
     enviados = [r for r in rows if ne(r.get("PDF_enviado",""))]
     pendientes_envio = [r for r in rows if not ne(r.get("PDF_enviado",""))]
     fallidos = [r for r in rows if ne(r.get("PDF_fallido",""))]
@@ -1827,48 +1822,43 @@ def generate_pdf_report_v2(tenant: str, period_filter: str = "") -> BytesIO:
     firmados = [r for r in rows if (r.get("Respuesta","") or "").strip().upper() == "FIRMADO"]
     observados = [r for r in rows if (r.get("Respuesta","") or "").strip().upper() == "OBSERVADO"]
 
-    # Pendiente firma: leído + respuesta vacía (no firmado/observado)
     pendientes_firma = [
         r for r in rows
         if ne(r.get("PDF_leido",""))
         and (r.get("Respuesta","") or "").strip() == ""
     ]
 
-    # Pendiente lectura: enviado pero no leído (prioridad más baja)
     pendientes_lectura = [
         r for r in rows
         if ne(r.get("PDF_enviado",""))
         and not ne(r.get("PDF_leido",""))
     ]
 
-    # ========= top 10 personas a accionar (prioridad pedida) =========
+    # ========= top 10 personas a accionar =========
     def _label_estado(r: dict) -> str:
         resp = (r.get("Respuesta","") or "").strip().upper()
         if resp == "OBSERVADO":
             return "OBSERVADO"
         if not ne(r.get("PDF_enviado","")):
-            return "PENDIENTE ENVÍO"
+            return "PEND. ENVÍO"
         if ne(r.get("PDF_leido","")) and resp == "":
-            return "PENDIENTE FIRMA"
+            return "PEND. FIRMA"
         if ne(r.get("PDF_enviado","")) and not ne(r.get("PDF_leido","")):
-            return "PENDIENTE LECTURA"
+            return "PEND. LECTURA"
         if resp == "FIRMADO":
             return "FIRMADO"
         return resp or "OK"
 
-    def _pick_top(src, limit):
-        # orden por “última acción” desc
-        s = sorted(src, key=lambda r: int(r.get("_last_ts") or 0), reverse=True)
-        return s[:limit]
+    def _pick_top(src, limit=50):
+        return sorted(src, key=lambda r: int(r.get("_last_ts") or 0), reverse=True)[:limit]
 
     top_people = []
     seen = set()
-
     for bucket in (
-        _pick_top(observados, 50),
-        _pick_top(pendientes_envio, 50),
-        _pick_top(pendientes_firma, 50),
-        _pick_top(pendientes_lectura, 50),
+        _pick_top(observados),
+        _pick_top(pendientes_envio),
+        _pick_top(pendientes_firma),
+        _pick_top(pendientes_lectura),
     ):
         for r in bucket:
             key = (r.get("WhatsApp",""), r.get("Periodo",""))
@@ -1881,30 +1871,30 @@ def generate_pdf_report_v2(tenant: str, period_filter: str = "") -> BytesIO:
         if len(top_people) >= 10:
             break
 
-    # ========= gráfico (barras) =========
-    labels = [
-        "Enviados", "Pend. Envío", "Fallidos",
-        "Firmados", "Observados", "Pend. Firma", "Pend. Lectura"
-    ]
-    values = [
-        len(enviados), len(pendientes_envio), len(fallidos),
-        len(firmados), len(observados), len(pendientes_firma), len(pendientes_lectura)
-    ]
+    # ========= donuts =========
+    def donut_png(labels, values, title):
+        fig = plt.figure(figsize=(3.4, 3.4), dpi=170)
+        ax = fig.add_subplot(111)
+        ax.pie(values, startangle=90, wedgeprops=dict(width=0.42))
+        ax.axis("equal")
+        ax.set_title(title, fontsize=11, pad=8)
+        ax.legend(labels, loc="center left", bbox_to_anchor=(1.0, 0.5), fontsize=8, frameon=False)
+        buf = BytesIO()
+        fig.savefig(buf, format="png", bbox_inches="tight", transparent=True)
+        plt.close(fig)
+        buf.seek(0)
+        return buf
 
-    fig = plt.figure(figsize=(8.2, 2.6), dpi=160)
-    ax = fig.add_subplot(111)
-    ax.bar(range(len(values)), values)
-    ax.set_xticks(range(len(values)))
-    ax.set_xticklabels(labels, rotation=20, ha="right", fontsize=8)
-    ax.set_ylabel("Personas", fontsize=9)
-    ax.set_title("Resumen operativo", fontsize=11)
-    ax.grid(axis="y", alpha=0.25)
-
-    chart_buf = BytesIO()
-    fig.tight_layout()
-    fig.savefig(chart_buf, format="png", bbox_inches="tight", transparent=True)
-    plt.close(fig)
-    chart_buf.seek(0)
+    donut_envios = donut_png(
+        ["Enviados", "Pendientes", "Fallidos"],
+        [len(enviados), len(pendientes_envio), len(fallidos)],
+        "Envíos"
+    )
+    donut_resp = donut_png(
+        ["Firmados", "Observados", "Pend. firma", "Pend. lectura"],
+        [len(firmados), len(observados), len(pendientes_firma), len(pendientes_lectura)],
+        "Respuestas"
+    )
 
     # ========= PDF build =========
     out = BytesIO()
@@ -1917,131 +1907,128 @@ def generate_pdf_report_v2(tenant: str, period_filter: str = "") -> BytesIO:
         rightMargin=1.2*cm,
         topMargin=1.0*cm,
         bottomMargin=1.0*cm,
-        title=f"Operativo Recibos - {tenant}",
+        title=f"Recibos - {tenant}",
     )
 
     styles = getSampleStyleSheet()
-    styles.add(ParagraphStyle(name="H1", fontSize=18, leading=20, spaceAfter=2))
-    styles.add(ParagraphStyle(name="Sub", fontSize=10, leading=12, textColor=colors.HexColor("#6b7280")))
-    styles.add(ParagraphStyle(name="Section", fontSize=12, leading=14, spaceBefore=8, spaceAfter=6))
+    styles.add(ParagraphStyle(name="TitleCool", fontSize=18, leading=20, spaceAfter=2))
+    styles.add(ParagraphStyle(name="SubCool", fontSize=10, leading=12, textColor=colors.HexColor("#6b7280")))
+    styles.add(ParagraphStyle(name="HSection", fontSize=12, leading=14, spaceBefore=6, spaceAfter=6))
 
     period_label = period_filter if period_filter else "TODOS"
     gen_ts = time.strftime("%Y-%m-%d %H:%M")
 
     story = []
-    story.append(Paragraph(f"✅ Operativo Recibos • <b>{tenant}</b>", styles["H1"]))
-    story.append(Paragraph(f"Período: <b>{period_label}</b> • Generado: {gen_ts}", styles["Sub"]))
+    story.append(Paragraph(f"📌 Control de Recibos • <b>{tenant}</b>", styles["TitleCool"]))
+    story.append(Paragraph(f"Período: <b>{period_label}</b> • Generado: {gen_ts}", styles["SubCool"]))
+    story.append(Spacer(1, 0.35*cm))
+
+    # --- Cards (ENVIOS / RESPUESTAS) ---
+    def card_row(items):
+        # items: [("label", value), ...]
+        data = [[lab, str(val)] for (lab, val) in items]
+        t = Table([sum(data, [])], colWidths=[3.0*cm, 2.0*cm]*len(items))
+        t.setStyle(TableStyle([
+            ("BACKGROUND", (0,0), (-1,-1), colors.HexColor("#f6f7fb")),
+            ("BOX", (0,0), (-1,-1), 0.6, colors.HexColor("#e5e7eb")),
+            ("INNERGRID", (0,0), (-1,-1), 0.4, colors.HexColor("#e5e7eb")),
+            ("FONTNAME", (0,0), (-1,-1), "Helvetica"),
+            ("FONTSIZE", (0,0), (-1,-1), 11),
+            ("TEXTCOLOR", (0,0), (-1,-1), colors.HexColor("#111827")),
+            ("TEXTCOLOR", (0,0), (-1,-1), colors.HexColor("#111827")),
+            ("TEXTCOLOR", (0,0), (-1,-1), colors.HexColor("#111827")),
+            ("TEXTCOLOR", (0,0), (-1,-1), colors.HexColor("#111827")),
+            ("TEXTCOLOR", (0,0), (-1,-1), colors.HexColor("#111827")),
+            ("TEXTCOLOR", (0,0), (-1,-1), colors.HexColor("#111827")),
+            ("TEXTCOLOR", (0,0), (-1,-1), colors.HexColor("#111827")),
+            ("LEFTPADDING", (0,0), (-1,-1), 10),
+            ("RIGHTPADDING", (0,0), (-1,-1), 10),
+            ("TOPPADDING", (0,0), (-1,-1), 8),
+            ("BOTTOMPADDING", (0,0), (-1,-1), 8),
+            # labels color
+            ("TEXTCOLOR", (0,0), (-1,0), colors.HexColor("#6b7280")),
+            # values bold: columnas impares (1,3,5,...)
+            ("FONTNAME", (1,0), (1,0), "Helvetica-Bold"),
+        ]))
+        # poner bold en todas las columnas de valor
+        for i in range(len(items)):
+            t.setStyle(TableStyle([("FONTNAME", (i*2+1,0), (i*2+1,0), "Helvetica-Bold"),
+                                   ("FONTSIZE", (i*2+1,0), (i*2+1,0), 16)]))
+        return t
+
+    story.append(Paragraph("📤 Enviados / Pendientes", styles["HSection"]))
+    story.append(card_row([("Enviados", len(enviados)), ("Pendientes", len(pendientes_envio)), ("Fallidos", len(fallidos))]))
     story.append(Spacer(1, 0.25*cm))
 
-    # Gráfico
-    story.append(Image(chart_buf, width=24.5*cm, height=6.0*cm))
-    story.append(Spacer(1, 0.25*cm))
+    story.append(Paragraph("✍️ Firmados / Observados", styles["HSection"]))
+    story.append(card_row([("Firmados", len(firmados)), ("Observados", len(observados)), ("Pend. firma", len(pendientes_firma)), ("Pend. lectura", len(pendientes_lectura))]))
+    story.append(Spacer(1, 0.35*cm))
 
-    # Resumen Envíos
-    story.append(Paragraph("📤 Envíos", styles["Section"]))
-    env_table = Table(
-        [["Enviados", len(enviados), "Pendientes", len(pendientes_envio), "Fallidos", len(fallidos)]],
-        colWidths=[2.5*cm, 1.4*cm, 2.8*cm, 1.4*cm, 2.4*cm, 1.4*cm],
+    # --- Donuts side-by-side ---
+    donuts_grid = Table(
+        [[Image(donut_envios, width=12.0*cm, height=6.3*cm),
+          Image(donut_resp, width=12.0*cm, height=6.3*cm)]],
+        colWidths=[12.6*cm, 12.6*cm]
     )
-    env_table.setStyle(TableStyle([
-        ("BACKGROUND", (0,0), (-1,-1), colors.HexColor("#f8fafc")),
-        ("BOX", (0,0), (-1,-1), 0.6, colors.HexColor("#e5e7eb")),
-        ("INNERGRID", (0,0), (-1,-1), 0.4, colors.HexColor("#e5e7eb")),
-        ("FONTNAME", (0,0), (-1,-1), "Helvetica"),
-        ("FONTSIZE", (0,0), (-1,-1), 11),
-        ("FONTNAME", (1,0), (1,0), "Helvetica-Bold"),
-        ("FONTNAME", (3,0), (3,0), "Helvetica-Bold"),
-        ("FONTNAME", (5,0), (5,0), "Helvetica-Bold"),
-        ("ALIGN", (1,0), (1,0), "CENTER"),
-        ("ALIGN", (3,0), (3,0), "CENTER"),
-        ("ALIGN", (5,0), (5,0), "CENTER"),
-        ("LEFTPADDING", (0,0), (-1,-1), 10),
-        ("RIGHTPADDING", (0,0), (-1,-1), 10),
-        ("TOPPADDING", (0,0), (-1,-1), 8),
-        ("BOTTOMPADDING", (0,0), (-1,-1), 8),
+    donuts_grid.setStyle(TableStyle([
+        ("VALIGN", (0,0), (-1,-1), "TOP"),
+        ("LEFTPADDING", (0,0), (-1,-1), 0),
+        ("RIGHTPADDING", (0,0), (-1,-1), 0),
+        ("TOPPADDING", (0,0), (-1,-1), 0),
+        ("BOTTOMPADDING", (0,0), (-1,-1), 0),
     ]))
-    story.append(env_table)
+    story.append(donuts_grid)
+    story.append(Spacer(1, 0.35*cm))
 
-    # Resumen Respuestas
-    story.append(Paragraph("✍️ Respuestas", styles["Section"]))
-    resp_table = Table(
-        [["Firmados", len(firmados), "Observados", len(observados), "Pend. firma", len(pendientes_firma), "Pend. lectura", len(pendientes_lectura)]],
-        colWidths=[2.6*cm, 1.4*cm, 2.8*cm, 1.4*cm, 3.0*cm, 1.4*cm, 3.0*cm, 1.4*cm],
-    )
-    resp_table.setStyle(TableStyle([
-        ("BACKGROUND", (0,0), (-1,-1), colors.HexColor("#f8fafc")),
-        ("BOX", (0,0), (-1,-1), 0.6, colors.HexColor("#e5e7eb")),
-        ("INNERGRID", (0,0), (-1,-1), 0.4, colors.HexColor("#e5e7eb")),
-        ("FONTNAME", (0,0), (-1,-1), "Helvetica"),
-        ("FONTSIZE", (0,0), (-1,-1), 11),
-        ("FONTNAME", (1,0), (1,0), "Helvetica-Bold"),
-        ("FONTNAME", (3,0), (3,0), "Helvetica-Bold"),
-        ("FONTNAME", (5,0), (5,0), "Helvetica-Bold"),
-        ("FONTNAME", (7,0), (7,0), "Helvetica-Bold"),
-        ("ALIGN", (1,0), (1,0), "CENTER"),
-        ("ALIGN", (3,0), (3,0), "CENTER"),
-        ("ALIGN", (5,0), (5,0), "CENTER"),
-        ("ALIGN", (7,0), (7,0), "CENTER"),
-        ("LEFTPADDING", (0,0), (-1,-1), 10),
-        ("RIGHTPADDING", (0,0), (-1,-1), 10),
-        ("TOPPADDING", (0,0), (-1,-1), 8),
-        ("BOTTOMPADDING", (0,0), (-1,-1), 8),
-    ]))
-    story.append(resp_table)
-    story.append(Spacer(1, 0.25*cm))
-
-    # Recuadro Personas
-    story.append(Paragraph("👥 Personas a accionar (máx 10)", styles["Section"]))
+    # --- Personas (tarjetas 2 columnas x 5 filas) ---
+    story.append(Paragraph("👥 Personas a accionar (máx 10)", styles["HSection"]))
 
     def clip(s, n):
         s = str(s or "")
         return s if len(s) <= n else s[:n-1] + "…"
 
-    people_data = [["Prioridad", "Nombre", "WhatsApp", "Estado", "Período", "Última acción"]]
-    for idx, r in enumerate(top_people, start=1):
-        last_ts = int(r.get("_last_ts") or 0)
-        last_str = ts_to_str(last_ts) if last_ts else ""
-        people_data.append([
-            str(idx),
-            clip(r.get("Nombre","") or "—", 28),
-            clip(r.get("WhatsApp",""), 22),
-            clip(_label_estado(r), 18),
-            r.get("Periodo",""),
-            last_str,
-        ])
+    def fmt_last_ts(r):
+        ts = int(r.get("_last_ts") or 0)
+        return ts_to_str(ts) if ts else ""
 
-    people_table = Table(
-        people_data,
-        repeatRows=1,
-        colWidths=[1.4*cm, 6.2*cm, 5.2*cm, 4.0*cm, 2.5*cm, 3.5*cm],
-    )
-    people_table.setStyle(TableStyle([
-        ("BACKGROUND", (0,0), (-1,0), colors.HexColor("#111827")),
-        ("TEXTCOLOR", (0,0), (-1,0), colors.white),
-        ("FONTNAME", (0,0), (-1,0), "Helvetica-Bold"),
-        ("FONTSIZE", (0,0), (-1,0), 9),
-        ("ALIGN", (0,0), (-1,0), "CENTER"),
-        ("BOTTOMPADDING", (0,0), (-1,0), 8),
-        ("TOPPADDING", (0,0), (-1,0), 8),
+    # armamos tarjetas (cada tarjeta = mini tabla 1x1 con contenido)
+    cards = []
+    for r in top_people:
+        nombre = clip(r.get("Nombre","") or "—", 30)
+        wpp = clip(r.get("WhatsApp",""), 24)
+        est = _label_estado(r)
+        per = r.get("Periodo","")
+        last = fmt_last_ts(r)
 
-        ("GRID", (0,0), (-1,-1), 0.25, colors.HexColor("#e5e7eb")),
-        ("FONTNAME", (0,1), (-1,-1), "Helvetica"),
-        ("FONTSIZE", (0,1), (-1,-1), 9),
-        ("VALIGN", (0,0), (-1,-1), "MIDDLE"),
-        ("LEFTPADDING", (0,0), (-1,-1), 6),
-        ("RIGHTPADDING", (0,0), (-1,-1), 6),
-        ("TOPPADDING", (0,1), (-1,-1), 5),
-        ("BOTTOMPADDING", (0,1), (-1,-1), 5),
+        txt = f"<b>{nombre}</b><br/>{wpp}<br/><b>{est}</b> • {per}<br/><font color='#6b7280'>Últ: {last}</font>"
+        box = Table([[Paragraph(txt, styles["BodyText"])]], colWidths=[12.0*cm])
+        box.setStyle(TableStyle([
+            ("BACKGROUND", (0,0), (-1,-1), colors.HexColor("#ffffff")),
+            ("BOX", (0,0), (-1,-1), 0.8, colors.HexColor("#e5e7eb")),
+            ("LEFTPADDING", (0,0), (-1,-1), 10),
+            ("RIGHTPADDING", (0,0), (-1,-1), 10),
+            ("TOPPADDING", (0,0), (-1,-1), 8),
+            ("BOTTOMPADDING", (0,0), (-1,-1), 8),
+        ]))
+        cards.append(box)
+
+    # completar hasta 10 con vacíos para mantener grilla linda
+    while len(cards) < 10:
+        cards.append(Spacer(1, 0.1*cm))
+
+    grid = []
+    for i in range(0, 10, 2):
+        grid.append([cards[i], cards[i+1]])
+
+    people_grid = Table(grid, colWidths=[12.6*cm, 12.6*cm])
+    people_grid.setStyle(TableStyle([
+        ("VALIGN", (0,0), (-1,-1), "TOP"),
+        ("LEFTPADDING", (0,0), (-1,-1), 0),
+        ("RIGHTPADDING", (0,0), (-1,-1), 0),
+        ("TOPPADDING", (0,0), (-1,-1), 0),
+        ("BOTTOMPADDING", (0,0), (-1,-1), 6),
     ]))
-
-    # zebra
-    for i in range(1, len(people_data)):
-        if i % 2 == 0:
-            people_table.setStyle(TableStyle([
-                ("BACKGROUND", (0,i), (-1,i), colors.HexColor("#f3f4f6"))
-            ]))
-
-    story.append(people_table)
+    story.append(people_grid)
 
     def on_page(canvas, doc_obj):
         canvas.saveState()
