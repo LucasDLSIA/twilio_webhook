@@ -860,36 +860,7 @@ def inc_receipt_request_count(tenant: str, cuil: str, period: str, to_whatsapp: 
     conn.close()
     return cnt
 
-def ensure_receipt_request_events_schema():
-    with sqlite3.connect(DB_PATH) as conn:
-        cur = conn.cursor()
 
-        # Tabla base (si no existe)
-        cur.execute("""
-        CREATE TABLE IF NOT EXISTS receipt_request_events (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            tenant TEXT,
-            cuil TEXT,
-            period TEXT,
-            whatsapp TEXT,
-            trigger TEXT,
-            outcome TEXT,
-            message_sid TEXT
-        )
-        """)
-
-        # Agregar created_at si falta
-        cols = [r[1] for r in cur.execute("PRAGMA table_info(receipt_request_events)").fetchall()]
-        if "created_at" not in cols:
-            cur.execute("ALTER TABLE receipt_request_events ADD COLUMN created_at INTEGER")
-
-        # (opcional, para el punto 1) origin si falta
-        if "origin" not in cols:
-            cur.execute("ALTER TABLE receipt_request_events ADD COLUMN origin TEXT")
-
-        conn.commit()
-
-ensure_receipt_request_events_schema()
 
 def get_origin_by_message_sid(message_sid: str) -> str | None:
     with sqlite3.connect(DB_PATH) as conn:
@@ -919,25 +890,6 @@ def _log_receipt_request_event(
     conn = sqlite3.connect(DB_PATH)
     try:
         cur = conn.cursor()
-
-        # 1) Crear tabla (si no existe) en forma "completa"
-        #    (si ya existe con otra estructura, no la toca)
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS receipt_request_events (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                tenant TEXT NOT NULL,
-                cuil TEXT NOT NULL,
-                period TEXT,
-                to_whatsapp TEXT,
-                whatsapp TEXT,
-                source TEXT NOT NULL,
-                result TEXT NOT NULL,
-                message_sid TEXT,
-                created_at INTEGER,
-                requested_at INTEGER,
-                origin TEXT
-            );
-        """)
 
         # 2) Ver columnas actuales
         cols = {r[1] for r in cur.execute("PRAGMA table_info(receipt_request_events)").fetchall()}
@@ -1045,7 +997,7 @@ def init_db():
     # pending_views
     # =========
     cur.execute("""
-      CREATE TABLE IF NOT EXISTS pending_views (
+    CREATE TABLE IF NOT EXISTS pending_views (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         to_whatsapp TEXT NOT NULL,
         tenant TEXT NOT NULL,
@@ -1055,10 +1007,31 @@ def init_db():
         step TEXT DEFAULT 'READY',
         dni_attempts INTEGER DEFAULT 0,
         UNIQUE(to_whatsapp, tenant, cuil, period)
-      );
+    );
     """)
+
     _try_alter(cur, "ALTER TABLE pending_views ADD COLUMN step TEXT;")
     _try_alter(cur, "ALTER TABLE pending_views ADD COLUMN dni_attempts INTEGER;")
+
+    # (opcional pero recomendado) limpiar duplicados por to_whatsapp antes del índice único
+    _try_alter(cur, """
+    DELETE FROM pending_views
+    WHERE id NOT IN (
+    SELECT pv.id
+    FROM pending_views pv
+    JOIN (
+        SELECT to_whatsapp, MAX(created_at) AS max_created
+        FROM pending_views
+        GROUP BY to_whatsapp
+    ) x
+    ON x.to_whatsapp = pv.to_whatsapp AND x.max_created = pv.created_at
+    );
+    """)
+
+    _try_alter(cur, """
+    CREATE UNIQUE INDEX IF NOT EXISTS ux_pending_views_to_whatsapp
+    ON pending_views(to_whatsapp);
+    """)
 
     # =========
     # recibo_estado
@@ -1119,7 +1092,7 @@ def init_db():
         to_whatsapp TEXT NOT NULL,
         message_sid TEXT NOT NULL UNIQUE,
         created_at INTEGER NOT NULL,
-        sign_sent_at INTEGER
+        sign_sent_at INTEGER,
         origin TEXT
 
       );
@@ -1171,18 +1144,21 @@ def init_db():
     # =========
     cur.execute("""
     CREATE TABLE IF NOT EXISTS receipt_request_events (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        tenant TEXT NOT NULL,
-        cuil TEXT NOT NULL,
-        period TEXT,
-        to_whatsapp TEXT NOT NULL,
-        source TEXT NOT NULL,
-        result TEXT NOT NULL,
-        message_sid TEXT,
-        requested_at INTEGER NOT NULL
-    );
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    tenant TEXT,
+    cuil TEXT,
+    period TEXT,
+    to_whatsapp TEXT,
+    source TEXT,        -- VIEW_NOW, RESEND_LAST, DNI_OK, CHOOSE_PREVIOUS, USER_TEXT...
+    result TEXT,        -- SENT, ERROR, ASK_DNI, NO_CONTEXT, NO_PDF, BLOCKED_LIMIT...
+    message_sid TEXT,
+    created_at INTEGER, -- timestamp evento
+    origin TEXT         -- INITIAL / RESEND_LAST / CHOOSE_PREVIOUS (o el mismo source)
+    )
     """)
-    _try_alter(cur, "ALTER TABLE receipt_request_events ADD COLUMN requested_at INTEGER;")
+    
+    _try_alter(cur, "ALTER TABLE receipt_request_events ADD COLUMN created_at INTEGER;")
+    _try_alter(cur, "CREATE INDEX IF NOT EXISTS idx_rre_key ON receipt_request_events(tenant,cuil,period,to_whatsapp,created_at);")
 
 
     # =========
@@ -1227,36 +1203,9 @@ def inbound_seen(message_sid: str) -> bool:
     return (not inserted)  # True si ya existía
 
 
-def ensure_verified_contacts_schema(cur):
-    # si la tabla no existe, la creamos completa
-    cur.execute("""
-      CREATE TABLE IF NOT EXISTS verified_contacts (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        tenant TEXT NOT NULL,
-        cuil TEXT NOT NULL,
-        to_whatsapp TEXT NOT NULL,
-        dni TEXT,
-        nombre TEXT,
-        verified_at INTEGER NOT NULL,
-        UNIQUE(tenant, cuil, to_whatsapp)
-      );
-    """)
 
-    # si ya existía vieja, agregamos columnas que falten
-    _try_alter(cur, "ALTER TABLE verified_contacts ADD COLUMN dni TEXT;")
-    _try_alter(cur, "ALTER TABLE verified_contacts ADD COLUMN nombre TEXT;")
-    _try_alter(cur, "ALTER TABLE verified_contacts ADD COLUMN verified_at INTEGER;")
 
-    # MUY IMPORTANTE:
-    # si la tabla vieja no tenía UNIQUE(tenant,cuil,to_whatsapp),
-    # ON CONFLICT(...) no va a funcionar. Creamos unique index equivalente.
-    _try_alter(cur, """
-      CREATE UNIQUE INDEX IF NOT EXISTS ux_verified_contacts_key
-      ON verified_contacts(tenant, cuil, to_whatsapp);
-    """)
 
-    _try_alter(cur, "CREATE INDEX IF NOT EXISTS idx_verified_tenant ON verified_contacts(tenant);")
-    _try_alter(cur, "CREATE INDEX IF NOT EXISTS idx_verified_cuil ON verified_contacts(tenant, cuil);")
 
 
 def save_pdf_sid(tenant: str, cuil: str, period: str, to_whatsapp: str, message_sid: str, origin: str = "INITIAL"):
@@ -1283,7 +1232,6 @@ def save_pdf_sid(tenant: str, cuil: str, period: str, to_whatsapp: str, message_
     conn.commit()
     conn.close()
 
-
 def _digits(s: str) -> str:
     return "".join(ch for ch in (s or "") if ch.isdigit())
 
@@ -1306,16 +1254,11 @@ def _hash_dni(dni: str) -> tuple[str, str]:
     return h, last4
 
 def is_verified(tenant: str, cuil: str, to_whatsapp: str) -> bool:
-    conn = get_db_connection()
-    cur = conn.cursor()
-    cur.execute("""
-      SELECT 1 FROM verifications
-      WHERE tenant=? AND cuil=? AND to_whatsapp=?
-      LIMIT 1
-    """, (tenant, cuil, to_whatsapp))
-    ok = cur.fetchone() is not None
-    conn.close()
-    return ok
+    """
+    Wrapper legacy. Mantener por compatibilidad.
+    Usa is_verified_contact como única fuente de verdad.
+    """
+    return is_verified_contact(tenant, cuil, to_whatsapp)
 
 def upsert_verification(tenant: str, cuil: str, to_whatsapp: str, dni: str | None = None):
     now = int(time.time())
@@ -1613,13 +1556,6 @@ def period_to_label(p: str) -> str:
     yyyy = m.group(2)
     return f"{mm:02d}/{yyyy}"
 
-def ts_str(ts):
-    if not ts:
-        return ""
-    try:
-        return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(int(ts)))
-    except Exception:
-        return str(ts)
 
 def _autosize_ws(ws):
     for col in ws.columns:
@@ -2082,8 +2018,7 @@ def admin_report_recibos_xlsx():
     )
 
 
-
-def list_verified_contacts(tenant: str, q: str = ""):
+def list_verifications(tenant: str, q: str = ""):
     conn = get_db_connection()
     cur = conn.cursor()
 
@@ -2091,22 +2026,30 @@ def list_verified_contacts(tenant: str, q: str = ""):
     params = [tenant]
 
     sql = """
-      SELECT id, tenant, cuil, to_whatsapp, nombre, dni, verified_at
-      FROM verified_contacts
+      SELECT id, tenant, cuil, to_whatsapp, nombre, dni_last4, verified_at, updated_at
+      FROM verifications
       WHERE tenant = ?
     """
 
     if q:
-        sql += " AND (lower(cuil) LIKE ? OR lower(to_whatsapp) LIKE ? OR lower(ifnull(nombre,'')) LIKE ?)"
+        sql += """
+          AND (
+            lower(cuil) LIKE ?
+            OR lower(to_whatsapp) LIKE ?
+            OR lower(ifnull(nombre,'')) LIKE ?
+            OR lower(ifnull(dni_last4,'')) LIKE ?
+          )
+        """
         like = f"%{q}%"
-        params += [like, like, like]
+        params += [like, like, like, like]
 
-    sql += " ORDER BY verified_at DESC LIMIT 200"
+    sql += " ORDER BY updated_at DESC, verified_at DESC LIMIT 200"
 
     cur.execute(sql, params)
     rows = [dict(zip([c[0] for c in cur.description], r)) for r in cur.fetchall()]
     conn.close()
     return rows
+
 
 
 def get_pdf_by_sid(sid):
@@ -2121,8 +2064,6 @@ def get_pdf_by_sid(sid):
 
 from functools import wraps
 from flask import request, Response
-
-ADMIN_TOKEN = os.environ.get("ADMIN_TOKEN", "").strip()
 
 def _get_admin_token_from_request() -> str:
     return (request.args.get("token") or request.form.get("token") or "").strip()
@@ -2144,16 +2085,17 @@ def add_pending_view(to_whatsapp: str, tenant: str, cuil: str, period: str):
     conn = get_db_connection()
     cur = conn.cursor()
 
-    # borrar cualquier pending previo para ese 4-tuple (evita duplicados)
     cur.execute("""
-      DELETE FROM pending_views
-      WHERE to_whatsapp=? AND tenant=? AND cuil=? AND period=?
-    """, (to_whatsapp, tenant, cuil, period))
-
-    # insertar nuevo pending
-    cur.execute("""
-      INSERT INTO pending_views (to_whatsapp, tenant, cuil, period, created_at, step, dni_attempts)
+      INSERT INTO pending_views
+        (to_whatsapp, tenant, cuil, period, created_at, step, dni_attempts)
       VALUES (?, ?, ?, ?, ?, 'READY', 0)
+      ON CONFLICT(to_whatsapp) DO UPDATE SET
+        tenant=excluded.tenant,
+        cuil=excluded.cuil,
+        period=excluded.period,
+        created_at=excluded.created_at,
+        step='READY',
+        dni_attempts=0
     """, (to_whatsapp, tenant, cuil, period, now))
 
     conn.commit()
@@ -2317,14 +2259,6 @@ import io
 
 from datetime import datetime, timezone
 
-def ts_str(ts: int | None) -> str:
-    if not ts:
-        return ""
-    try:
-        # Render usa UTC en logs; acá lo mostramos simple en formato legible
-        return datetime.fromtimestamp(int(ts), tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
-    except Exception:
-        return ""
 
 from flask import send_file
 import io
@@ -2349,8 +2283,7 @@ def admin_verifications_template_xlsx():
 
 import time
 
-def _digits(s: str) -> str:
-    return "".join(ch for ch in (s or "") if ch.isdigit())
+
 
 def normalize_period_for_drive(period: str) -> str:
     """
@@ -2497,9 +2430,10 @@ def admin_verifications_delete():
     conn = get_db_connection()
     cur = conn.cursor()
     cur.execute("""
-      DELETE FROM verified_contacts
-      WHERE tenant=? AND cuil=? AND to_whatsapp=?
+    DELETE FROM verifications
+    WHERE tenant=? AND cuil=? AND to_whatsapp=?
     """, (tenant, cuil, to_whatsapp))
+
     conn.commit()
     conn.close()
 
@@ -2559,17 +2493,15 @@ def generate_excel_report_v2(tenant: str, period_filter: str = "") -> BytesIO:
         SELECT to_whatsapp, tenant, cuil, period, MAX(created_at) as last_ts
         FROM pending_views
         WHERE tenant = ?
-        GROUP BY to_whatsapp, cuil
     """, (tenant,))
     pv_rows = cur.fetchall()
 
-    last_period_by_user_cuil = {}
+    last_period_by_whatsapp = {}
     for r in pv_rows:
         w = (r["to_whatsapp"] or "").strip()
-        c = (r["cuil"] or "").strip()
         p = norm_period_label(r["period"] or "")
-        if w and c and p:
-            last_period_by_user_cuil[(w, c)] = p
+        if w and p:
+            last_period_by_whatsapp[w] = p
 
     # recibo_estado
     cur.execute("""
@@ -2623,8 +2555,8 @@ def generate_excel_report_v2(tenant: str, period_filter: str = "") -> BytesIO:
         period_raw = (row["period"] or "").strip()
         period_norm = norm_period_label(period_raw)
 
-        if not period_norm and wpp and cuil:
-            period_norm = last_period_by_user_cuil.get((wpp, cuil), "")
+        if not period_norm and wpp:
+            period_norm = last_period_by_whatsapp.get(wpp, "")
 
         if period_filter and period_norm != period_filter:
             continue
@@ -3368,7 +3300,6 @@ def admin_send_template_queue_start():
 
     tenant = (request.form.get("tenant") or "").strip().lower()
     period = (request.form.get("period") or "").strip()
-    limit = int((request.form.get("limit") or "0") or 0)
     require_pdf = (request.form.get("require_pdf") or "true").lower() in ("1", "true", "yes", "on")
 
     if not tenant:
@@ -3396,8 +3327,16 @@ def admin_send_template_queue_start():
         return Response("El Excel debe tener columnas telefono y archivo (cuil).", status=400)
 
     rows = df.to_dict(orient="records")
+
+    try:
+        limit = int(request.form.get("limit") or "0")
+    except ValueError:
+        limit = 0
+
     if limit > 0:
         rows = rows[:limit]
+
+
 
     sent = 0
     skipped_no_pdf = 0
@@ -3412,20 +3351,22 @@ def admin_send_template_queue_start():
         if not tel_raw or not arch_raw:
             continue
 
-        # Normalizar WhatsApp
-        tel_digits = "".join(ch for ch in tel_raw if ch.isdigit())
-        if not tel_digits:
+        to_whatsapp = normalize_whatsapp(tel_raw)  # o norm_whatsapp(tel_raw)
+        if not to_whatsapp:
             continue
-        if not tel_digits.startswith("54"):
-            tel_digits = "54" + tel_digits
-        to_whatsapp = f"whatsapp:+{tel_digits}"
+
 
         # CUIL desde archivo
-        cuil = arch_raw.replace(".pdf", "").strip()
         try:
-            cuil = strip_pdf(cuil)
+            cuil = strip_pdf(arch_raw)
         except Exception:
             continue
+        cuil_digits = norm_digits(cuil)
+        if len(cuil_digits) != 11:
+            continue
+        cuil = cuil_digits
+
+
 
         print("\n--- ROW DEBUG ---")
         print("tenant:", tenant)
@@ -3517,35 +3458,6 @@ def _get_last_msg_status(tenant: str, cuil: str, period: str, kind: str):
     row = cur.fetchone()
     conn.close()
     return _db_row_to_dict(row)
-
-def _is_verified_link(tenant: str, cuil: str, to_whatsapp: str) -> bool:
-    # usa tu tabla UNICA verifications
-    conn = get_db_connection()
-    conn.row_factory = sqlite3.Row
-    cur = conn.cursor()
-    cur.execute("""
-        SELECT 1
-        FROM verifications
-        WHERE tenant=? AND cuil=? AND to_whatsapp=?
-        LIMIT 1
-    """, (tenant, cuil, to_whatsapp))
-    ok = cur.fetchone() is not None
-    conn.close()
-    return ok
-
-def _get_verif_nombre(tenant: str, cuil: str, to_whatsapp: str) -> str:
-    conn = get_db_connection()
-    conn.row_factory = sqlite3.Row
-    cur = conn.cursor()
-    cur.execute("""
-        SELECT nombre
-        FROM verifications
-        WHERE tenant=? AND cuil=? AND to_whatsapp=?
-        LIMIT 1
-    """, (tenant, cuil, to_whatsapp))
-    row = cur.fetchone()
-    conn.close()
-    return (row["nombre"] if row and row["nombre"] else "") if row else ""
 
 
 
@@ -3734,10 +3646,10 @@ def twilio_inbound():
             # ✅ Enviar menú y terminar (SIN TwiML al usuario)
             nombre = ""
             if isinstance(pending, dict):
-                nombre = (pending.get("nombre") or "").strip()
-
+                nombre = get_nombre_for_cuil(pending["tenant"], pending["cuil"])
             sid = send_whatsapp_menu_template(from_whatsapp, nombre=nombre)
             return Response("OK", status=200)
+
 
     # =========================
     # SIN PENDING: o guía o reconstrucción para "RECIBO"
@@ -3745,16 +3657,9 @@ def twilio_inbound():
     if not pending:
         if not _is_receipt_request_text(body) and not button:
             in_sid = (request.form.get("MessageSid") or "").strip()
-            if inbound_seen(in_sid):
-                print("DEDUP inbound:", in_sid)
-                return Response("OK", status=200)
 
             # 🔥 En vez de contestar texto, mandamos la plantilla menú
-            sid = send_whatsapp_menu_template(
-                from_whatsapp,
-                nombre=(pending.get("nombre","") if isinstance(pending, dict) else "")
-            )
-            # No respondemos con texto al usuario: solo 200 OK
+            sid = send_whatsapp_menu_template(from_whatsapp, nombre="")
             return Response("OK", status=200)
 
 
@@ -3830,7 +3735,8 @@ def twilio_inbound():
         if not sid_pdf:
             _log_receipt_request_event(tenant, cuil, best_period, from_whatsapp, "RESEND_LAST", "ERROR")
             return twiml("❌ No pude enviar el PDF en este momento. Probá de nuevo o avisá a RRHH.")
-
+        # ✅ sumar el pedido (esto es lo que faltaba)
+        n = inc_receipt_request_count(tenant, cuil, best_period, from_whatsapp)
         # ✅ no mandamos texto antes del PDF
         _log_receipt_request_event(tenant, cuil, best_period, from_whatsapp, "RESEND_LAST", "SENT", message_sid=sid_pdf, origin="RESEND_LAST")
         return Response("OK", status=200)
