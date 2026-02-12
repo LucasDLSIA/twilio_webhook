@@ -1081,6 +1081,39 @@ def init_db():
         _try_alter(cur, f"ALTER TABLE message_status ADD COLUMN {col} {typ};")
 
     # =========
+    # template_send_queue (cola de envíos de templates)
+    # =========
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS template_send_queue (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        tenant TEXT NOT NULL,
+        period TEXT NOT NULL,
+        to_whatsapp TEXT NOT NULL,
+        cuil TEXT NOT NULL,
+        nombre TEXT,
+        require_pdf INTEGER DEFAULT 1,
+        status TEXT DEFAULT 'PENDING',     -- PENDING | SENT | SKIPPED | FAILED
+        error TEXT,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER,
+        sent_sid TEXT,
+        sent_at INTEGER,
+        UNIQUE(tenant, period, to_whatsapp, cuil)
+    );
+    """)
+    _try_alter(cur, "ALTER TABLE template_send_queue ADD COLUMN nombre TEXT;")
+    _try_alter(cur, "ALTER TABLE template_send_queue ADD COLUMN require_pdf INTEGER;")
+    _try_alter(cur, "ALTER TABLE template_send_queue ADD COLUMN status TEXT;")
+    _try_alter(cur, "ALTER TABLE template_send_queue ADD COLUMN error TEXT;")
+    _try_alter(cur, "ALTER TABLE template_send_queue ADD COLUMN created_at INTEGER;")
+    _try_alter(cur, "ALTER TABLE template_send_queue ADD COLUMN updated_at INTEGER;")
+    _try_alter(cur, "ALTER TABLE template_send_queue ADD COLUMN sent_sid TEXT;")
+    _try_alter(cur, "ALTER TABLE template_send_queue ADD COLUMN sent_at INTEGER;")
+
+    _try_alter(cur, "CREATE INDEX IF NOT EXISTS idx_ts_queue_pending ON template_send_queue(status, tenant, period, created_at);")
+
+    
+    # =========
     # sent_pdfs
     # =========
     cur.execute("""
@@ -1094,7 +1127,6 @@ def init_db():
         created_at INTEGER NOT NULL,
         sign_sent_at INTEGER,
         origin TEXT
-
       );
     """)
     _try_alter(cur, "ALTER TABLE sent_pdfs ADD COLUMN sign_sent_at INTEGER;")
@@ -2704,6 +2736,21 @@ def find_pdf_with_retry(tenant, cuil, period, tries=4):
     print("DRIVE RETRY EXHAUSTED:", tenant, cuil, period, last)
     return None
 
+def get_queue_stats(tenant: str, period: str) -> dict:
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute("""
+      SELECT status, COUNT(*) as n
+      FROM template_send_queue
+      WHERE tenant=? AND period=?
+      GROUP BY status
+    """, (tenant, period))
+    d = {r[0]: r[1] for r in cur.fetchall()}
+    conn.close()
+    # asegurar claves
+    for k in ("PENDING","SENT","FAILED","SKIPPED"):
+        d.setdefault(k, 0)
+    return d
 
 
 @app.get("/admin/panel")
@@ -2738,6 +2785,38 @@ def admin_panel():
     # ---------- Envío masivo ----------
     html.append("<hr>")
     html.append("<h3>📩 Envío masivo (empresa completa)</h3>")
+    html.append("<hr>")
+    html.append("<h3>⏳ Cola de envíos (templates)</h3>")
+
+    # Mostramos stats si hay period cargado en querystring (recomendado)
+    panel_period = (request.args.get("period") or "").strip()
+    if panel_period:
+        stats = get_queue_stats(tenant, panel_period)
+        html.append(
+            f"<p><b>Período cola:</b> {esc(panel_period)} &nbsp; | "
+            f"PENDING: <b>{stats['PENDING']}</b> · "
+            f"SENT: <b>{stats['SENT']}</b> · "
+            f"SKIPPED: <b>{stats['SKIPPED']}</b> · "
+            f"FAILED: <b>{stats['FAILED']}</b></p>"
+        )
+
+        # Botón tick manual
+        html.append("<form method='post' action='/admin/send_template_queue_tick' style='margin-top:10px;'>")
+        html.append(f"<input type='hidden' name='token' value='{esc(token)}'>")
+        html.append(f"<input type='hidden' name='tenant' value='{esc(tenant)}'>")
+        html.append(f"<input type='hidden' name='period' value='{esc(panel_period)}'>")
+        html.append("<label>Batch size: <input type='number' name='batch_size' min='1' max='50' value='10'></label> ")
+        html.append("<button type='submit'>▶️ Procesar ahora</button>")
+        html.append("</form>")
+
+        # Link para cron (modo json)
+        html.append("<p style='font-size:12px;color:#666;margin-top:8px;'>")
+        html.append("Cron URL (POST) sugerida: ")
+        html.append(f"<code>/admin/send_template_queue_tick?tenant={esc(tenant)}&period={esc(panel_period)}&batch_size=10&token={esc(token)}&mode=json</code>")
+        html.append("</p>")
+    else:
+        html.append("<p style='color:#666'>Elegí un período en el selector de reportes para ver la cola y poder procesarla.</p>")
+
     html.append("<form method='post' action='/admin/send_template_queue_start'>")
     html.append(f"<input type='hidden' name='token' value='{esc(token)}'>")
     html.append(f"<input type='hidden' name='tenant' value='{esc(tenant)}'>")
@@ -3293,6 +3372,47 @@ def admin_reset():
 
     return redirect(f"/admin/panel?tenant={tenant}&token={token}&msg=reset_ok&period={period}")
 
+def queue_template_send(
+    tenant: str,
+    period: str,
+    to_whatsapp: str,
+    cuil: str,
+    nombre: str = "",
+    require_pdf: bool = True
+) -> bool:
+    """
+    Encola un envío si no existe (idempotente por UNIQUE).
+    Devuelve True si insertó, False si ya existía.
+    """
+    now = int(time.time())
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute("""
+      INSERT OR IGNORE INTO template_send_queue
+        (tenant, period, to_whatsapp, cuil, nombre, require_pdf, status, created_at, updated_at)
+      VALUES
+        (?, ?, ?, ?, ?, ?, 'PENDING', ?, ?)
+    """, (tenant, period, to_whatsapp, cuil, (nombre or ""), 1 if require_pdf else 0, now, now))
+    inserted = (cur.rowcount == 1)
+    conn.commit()
+    conn.close()
+    return inserted
+
+
+def count_queue_status(tenant: str, period: str) -> dict:
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute("""
+      SELECT status, COUNT(*) as n
+      FROM template_send_queue
+      WHERE tenant=? AND period=?
+      GROUP BY status
+    """, (tenant, period))
+    d = {r[0]: r[1] for r in cur.fetchall()}
+    conn.close()
+    return d
+
+
 @app.post("/admin/send_template_queue_start")
 @admin_required
 def admin_send_template_queue_start():
@@ -3332,16 +3452,12 @@ def admin_send_template_queue_start():
         limit = int(request.form.get("limit") or "0")
     except ValueError:
         limit = 0
-
     if limit > 0:
         rows = rows[:limit]
 
-
-
-    sent = 0
-    skipped_no_pdf = 0
-    skipped_already = 0
-    failed = 0
+    enqueued = 0
+    skipped_bad = 0
+    skipped_dup = 0
 
     for r in rows:
         nombre = str(r.get(c_nombre, "")).strip() if c_nombre else ""
@@ -3349,46 +3465,128 @@ def admin_send_template_queue_start():
         arch_raw = str(r.get(c_arch, "")).strip()
 
         if not tel_raw or not arch_raw:
+            skipped_bad += 1
             continue
 
-        to_whatsapp = normalize_whatsapp(tel_raw)  # o norm_whatsapp(tel_raw)
+        to_whatsapp = normalize_whatsapp(tel_raw)
         if not to_whatsapp:
+            skipped_bad += 1
             continue
-
 
         # CUIL desde archivo
         try:
             cuil = strip_pdf(arch_raw)
         except Exception:
+            skipped_bad += 1
             continue
+
         cuil_digits = norm_digits(cuil)
         if len(cuil_digits) != 11:
+            skipped_bad += 1
             continue
         cuil = cuil_digits
 
+        ok = queue_template_send(
+            tenant=tenant,
+            period=period,
+            to_whatsapp=to_whatsapp,
+            cuil=cuil,
+            nombre=nombre,
+            require_pdf=require_pdf,
+        )
+        if ok:
+            enqueued += 1
+        else:
+            skipped_dup += 1
+
+    stats = count_queue_status(tenant, period)
+    return redirect(
+        f"/admin/panel?tenant={tenant}&token={token}&msg=queue_enqueued"
+        f"&period={period}&enqueued={enqueued}&dup={skipped_dup}&bad={skipped_bad}"
+        f"&pending={stats.get('PENDING',0)}&sent={stats.get('SENT',0)}"
+        f"&failed={stats.get('FAILED',0)}&skipped={stats.get('SKIPPED',0)}"
+    )
+
+def _fetch_queue_batch(tenant: str, period: str, batch_size: int = 10) -> list[dict]:
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute("""
+      SELECT id, tenant, period, to_whatsapp, cuil, nombre, require_pdf
+      FROM template_send_queue
+      WHERE tenant=? AND period=? AND status='PENDING'
+      ORDER BY id ASC
+      LIMIT ?
+    """, (tenant, period, batch_size))
+    cols = [c[0] for c in cur.description]
+    rows = [dict(zip(cols, r)) for r in cur.fetchall()]
+    conn.close()
+    return rows
 
 
-        print("\n--- ROW DEBUG ---")
-        print("tenant:", tenant)
-        print("nombre:", nombre)
-        print("cuil:", cuil)
-        print("period:", period)
+def _mark_queue_row(row_id: int, status: str, error: str = "", sent_sid: str | None = None):
+    now = int(time.time())
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute("""
+      UPDATE template_send_queue
+      SET status=?, error=?, updated_at=?, sent_sid=COALESCE(?, sent_sid),
+          sent_at=CASE WHEN ? IS NOT NULL THEN ? ELSE sent_at END
+      WHERE id=?
+    """, (status, (error or ""), now, sent_sid, sent_sid, now, row_id))
+    conn.commit()
+    conn.close()
 
-        # 🔒 verificar PDF (solo si require_pdf=True)
-        if require_pdf:
-            pdf_file_id = find_pdf_with_retry(tenant, cuil, period)
-            if not pdf_file_id:
-                skipped_no_pdf += 1
-                print("SKIP (no pdf / drive error):", tenant, cuil, period)
-                continue
 
-        # ✅ Recién ahora mandamos VIEW_NOW
+@app.post("/admin/send_template_queue_tick")
+@admin_required
+def admin_send_template_queue_tick():
+    token = _get_admin_token_from_request()
+
+    tenant = (request.form.get("tenant") or request.args.get("tenant") or "").strip().lower()
+    period = (request.form.get("period") or request.args.get("period") or "").strip()
+
+    try:
+        batch_size = int(request.form.get("batch_size") or request.args.get("batch_size") or "10")
+    except ValueError:
+        batch_size = 10
+    batch_size = max(1, min(batch_size, 50))  # cap de seguridad
+
+    if not tenant:
+        return Response("Falta tenant", status=400)
+    if not period:
+        return Response("Falta period", status=400)
+
+    rows = _fetch_queue_batch(tenant, period, batch_size=batch_size)
+
+    processed = 0
+    sent = 0
+    skipped = 0
+    failed = 0
+
+    for r in rows:
+        processed += 1
+        row_id = r["id"]
+        to_whatsapp = (r["to_whatsapp"] or "").strip()
+        cuil = (r["cuil"] or "").strip()
+        nombre = (r.get("nombre") or "").strip()
+        require_pdf = bool(r.get("require_pdf", 1))
+
         try:
+            # 1) Si require_pdf, validamos que exista PDF
+            if require_pdf:
+                pdf_file_id = find_pdf_with_retry(tenant, cuil, period)
+                if not pdf_file_id:
+                    _mark_queue_row(row_id, "SKIPPED", error="NO_PDF")
+                    skipped += 1
+                    continue
+
+            # 2) Si ya lo mandamos, skip
             if already_sent_template(tenant, cuil, period, to_whatsapp):
-                skipped_already += 1
-                print("SKIP (already sent):", tenant, cuil, period, to_whatsapp)
+                _mark_queue_row(row_id, "SKIPPED", error="ALREADY_SENT")
+                skipped += 1
                 continue
 
+            # 3) Enviar template
             sid = send_whatsapp_template(
                 to_whatsapp,
                 content_vars={"1": (nombre or "Hola")},
@@ -3396,21 +3594,37 @@ def admin_send_template_queue_start():
                 status_callback=STATUS_CALLBACK_URL,
             )
 
-            sent += 1
+            # 4) Persistir
             save_template_sid(tenant, cuil, period, to_whatsapp, sid, nombre=nombre)
-
-            print("SENT VIEW_NOW", sid, tenant, cuil, period)
             add_pending_view(to_whatsapp, tenant, cuil, period)
 
+            _mark_queue_row(row_id, "SENT", sent_sid=sid)
+            sent += 1
+
         except Exception as e:
+            _mark_queue_row(row_id, "FAILED", error=str(e)[:250])
             failed += 1
-            print("ERROR send template:", tenant, cuil, to_whatsapp, e)
+
+    stats = count_queue_status(tenant, period)
+
+    # Si lo llamás desde cron, puede devolverte OK sin redirect:
+    if (request.form.get("mode") or request.args.get("mode") or "").lower() == "json":
+        return {
+            "tenant": tenant,
+            "period": period,
+            "processed": processed,
+            "sent": sent,
+            "skipped": skipped,
+            "failed": failed,
+            "stats": stats,
+        }
 
     return redirect(
-        f"/admin/panel?tenant={tenant}&token={token}&msg=mass_send_ok"
-        f"&sent={sent}&failed={failed}&skipped={skipped_no_pdf}"
-        f"&skipped_already={skipped_already}&period={period}"
+        f"/admin/panel?tenant={tenant}&token={token}&msg=queue_tick"
+        f"&period={period}&processed={processed}&sent={sent}&skipped={skipped}&failed={failed}"
+        f"&pending={stats.get('PENDING',0)}"
     )
+
 
 
 def debug_list_root_pdfs(tenant: str, limit=20):
