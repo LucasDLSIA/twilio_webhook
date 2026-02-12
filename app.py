@@ -705,12 +705,6 @@ def twilio_status():
         if row:
             tenant, cuil, period, to_whatsapp, sign_sent_at, origin = row
 
-            # resolver origin real por sid (si existe log)
-            try:
-                origin = get_receipt_event_origin_by_sid(sid)
-            except Exception as e:
-                print("WARN: could not resolve origin by sid:", e)
-
             # Si es reenvío, NO firmar nunca
             if origin != "INITIAL":
                 print("SKIP SIGN AFTER PDF (origin=", origin, "):", sid)
@@ -1034,6 +1028,8 @@ def init_db():
 
     _try_alter(cur, "ALTER TABLE pending_views ADD COLUMN step TEXT;")
     _try_alter(cur, "ALTER TABLE pending_views ADD COLUMN dni_attempts INTEGER;")
+    _try_alter(cur, "ALTER TABLE pending_views ADD COLUMN origin TEXT;")
+
 
     # (opcional pero recomendado) limpiar duplicados por to_whatsapp antes del índice único
     _try_alter(cur, """
@@ -2136,26 +2132,28 @@ def admin_required(fn):
 
 import sqlite3, time
 
-def add_pending_view(to_whatsapp: str, tenant: str, cuil: str, period: str):
+def add_pending_view(to_whatsapp: str, tenant: str, cuil: str, period: str, origin: str = "INITIAL"):
     now = int(time.time())
     conn = get_db_connection()
     cur = conn.cursor()
 
     cur.execute("""
       INSERT INTO pending_views
-        (to_whatsapp, tenant, cuil, period, created_at, step, dni_attempts)
-      VALUES (?, ?, ?, ?, ?, 'READY', 0)
+        (to_whatsapp, tenant, cuil, period, created_at, step, dni_attempts, origin)
+      VALUES (?, ?, ?, ?, ?, 'READY', 0, ?)
       ON CONFLICT(to_whatsapp) DO UPDATE SET
         tenant=excluded.tenant,
         cuil=excluded.cuil,
         period=excluded.period,
         created_at=excluded.created_at,
         step='READY',
-        dni_attempts=0
-    """, (to_whatsapp, tenant, cuil, period, now))
+        dni_attempts=0,
+        origin=excluded.origin
+    """, (to_whatsapp, tenant, cuil, period, now, origin))
 
     conn.commit()
     conn.close()
+
 
 
 def get_latest_pending_view(to_whatsapp: str):
@@ -2170,7 +2168,8 @@ def get_latest_pending_view(to_whatsapp: str):
         period,
         created_at,
         COALESCE(step, 'READY') AS step,
-        COALESCE(dni_attempts, 0) AS dni_attempts
+        COALESCE(dni_attempts, 0) AS dni_attempts,
+        COALESCE(origin, 'INITIAL') AS origin
       FROM pending_views
       WHERE to_whatsapp=?
       ORDER BY created_at DESC
@@ -3639,7 +3638,7 @@ def admin_send_template_queue_tick():
 
             # 4) Persistir
             save_template_sid(tenant, cuil, period, to_whatsapp, sid, nombre=nombre)
-            add_pending_view(to_whatsapp, tenant, cuil, period)
+            add_pending_view(to_whatsapp, tenant, cuil, period, origin="INITIAL")
 
             _mark_queue_row(row_id, "SENT", sent_sid=sid)
             sent += 1
@@ -3779,7 +3778,8 @@ def admin_send_test():
         html.append(f"<p>📄 PDF disponible para {esc(period)}</p>")
 
         # Guardamos pending view ANTES del click VIEW_NOW
-        add_pending_view(phone, tenant, strip_pdf(cuil), period)
+        add_pending_view(phone, tenant, cuil, period, origin="INITIAL")
+
 
         # Enviamos plantilla con botón VIEW_NOW (abre conversación)
         try:
@@ -3938,7 +3938,8 @@ def twilio_inbound():
             _log_receipt_request_event(tenant, cuil, "", from_whatsapp, "USER_TEXT", "NO_PDF")
             return twiml("⚠️ No encontré ningún recibo disponible para tu CUIL. Avisá a RRHH.")
 
-        add_pending_view(from_whatsapp, tenant, strip_pdf(cuil), period)
+        add_pending_view(from_whatsapp, tenant, cuil, period, origin="RESEND_LAST")
+
         pending = get_latest_pending_view(from_whatsapp)
 
     if not pending:
@@ -3980,7 +3981,7 @@ def twilio_inbound():
 
         if not is_verified_contact(tenant, cuil, from_whatsapp):
             # guardamos el período que vamos a reenviar
-            add_pending_view(from_whatsapp, tenant, cuil, best_period)
+            add_pending_view(from_whatsapp, tenant, cuil, best_period, origin="RESEND_LAST")
             pending = get_latest_pending_view(from_whatsapp)
             set_pending_step(pending["id"], "AWAIT_DNI")
 
@@ -4075,6 +4076,7 @@ def twilio_inbound():
             return twiml(f"❌ DNI incorrecto. Intento {tries}/3. Probá de nuevo (solo números).")
 
         # DNI OK
+        # DNI OK
         set_verified_contact(tenant, cuil, from_whatsapp, dni_user, nombre=pending.get("nombre",""))
         set_pending_step(pending["id"], "READY")
 
@@ -4084,13 +4086,16 @@ def twilio_inbound():
             consume_pending_view(pending["id"])
             return twiml(f"⚠️ Ya pediste este recibo {cnt}/3 veces para {period}. Si necesitás más, avisá a RRHH.")
 
-        sid_pdf = _send_pdf_flow(from_whatsapp, tenant, cuil, period)
+        # ✅ usar origin del pending (INITIAL si vino del admin)
+        origin = (pending.get("origin") or "INITIAL")
+
+        sid_pdf = _send_pdf_flow(from_whatsapp, tenant, cuil, period, origin=origin)
         if not sid_pdf:
-            _log_receipt_request_event(tenant, cuil, period, from_whatsapp, "DNI_OK", "ERROR")
+            _log_receipt_request_event(tenant, cuil, period, from_whatsapp, "DNI_OK", "ERROR", origin=origin)
             return twiml("✅ DNI verificado, pero hubo un error enviando el recibo. Avisá a RRHH.")
 
         n = inc_receipt_request_count(tenant, cuil, period, from_whatsapp)
-        _log_receipt_request_event(tenant, cuil, period, from_whatsapp, "DNI_OK", "SENT", message_sid=sid_pdf)
+        _log_receipt_request_event(tenant, cuil, period, from_whatsapp, "DNI_OK", "SENT", message_sid=sid_pdf, origin=origin)
         return twiml(f"✅ DNI verificado. Te envío el recibo ahora. (Pedido {n}/3)")
 
     # =========================
