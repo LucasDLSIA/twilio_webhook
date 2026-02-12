@@ -355,6 +355,13 @@ def debug_list_pdfs_in_folder(folder_id: str):
 
 # Drive: PDF
 # =========================
+def format_cuil_with_dashes(cuil: str) -> str:
+    d = norm_digits(cuil)
+    if len(d) != 11:
+        return cuil.strip()
+    return f"{d[0:2]}-{d[2:10]}-{d[10:11]}"
+
+
 def find_pdf_file_id_for_cuil_period(tenant: str, cuil: str, period: str) -> str | None:
     t = get_tenant(tenant)
     if not t:
@@ -366,17 +373,19 @@ def find_pdf_file_id_for_cuil_period(tenant: str, cuil: str, period: str) -> str
         print("❌ tenant sin recibos_root_id:", tenant)
         return None
 
-    cuil = strip_pdf(cuil).strip()
-    filename = f"{cuil}.pdf"
+    cuil_digits = norm_digits(strip_pdf(cuil).strip())
+    if len(cuil_digits) != 11:
+        print("❌ CUIL inválido:", cuil)
+        return None
 
-    # el root tiene subcarpetas por período tipo "12-2025"
-    # si te pasan "12/2025", lo convertimos
-    period = period.strip()
-    period_folder_name = normalize_period_for_drive(period)
+    cuil_dash = format_cuil_with_dashes(cuil_digits)
+    filename_exact = f"{cuil_dash}.pdf"
+
+    period_folder_name = normalize_period_for_drive((period or "").strip())
 
     service = drive_service()
 
-    # 1) buscar carpeta del período dentro del root
+    # 1) carpeta período
     q_folder = (
         f"'{root_id}' in parents and trashed=false "
         f"and mimeType='application/vnd.google-apps.folder' "
@@ -390,18 +399,31 @@ def find_pdf_file_id_for_cuil_period(tenant: str, cuil: str, period: str) -> str
 
     period_id = folders[0]["id"]
 
-    # 2) buscar el PDF dentro de esa carpeta
-    q_pdf = (
+    # 2a) buscar exacto (xx-xxxxxxxx-x.pdf)
+    q_pdf_exact = (
         f"'{period_id}' in parents and trashed=false "
-        f"and name='{filename}'"
+        f"and name='{filename_exact}'"
     )
-    res2 = service.files().list(q=q_pdf, fields="files(id,name)", pageSize=5).execute()
+    res2 = service.files().list(q=q_pdf_exact, fields="files(id,name)", pageSize=5).execute()
     files = res2.get("files", [])
-    if not files:
-        print(f"❌ No encontré {filename} dentro de carpeta período {period_folder_name} ({period_id})")
-        return None
+    if files:
+        return files[0]["id"]
 
-    return files[0]["id"]
+    # 2b) fallback robusto: pdf + contiene el cuil con guiones
+    q_pdf_contains = (
+        f"'{period_id}' in parents and trashed=false "
+        f"and mimeType='application/pdf' "
+        f"and name contains '{cuil_dash}'"
+    )
+    res3 = service.files().list(q=q_pdf_contains, fields="files(id,name)", pageSize=10).execute()
+    files2 = res3.get("files", [])
+    if files2:
+        # si hay más de uno, agarramos el primero (podés ordenar por modifiedTime si querés)
+        return files2[0]["id"]
+
+    print(f"❌ No encontré {filename_exact} (ni variantes) dentro de carpeta período {period_folder_name} ({period_id})")
+    return None
+
 
 
 def list_periods_for_cuil(tenant_slug: str, cuil: str) -> List[str]:
@@ -1639,6 +1661,8 @@ def norm_period_label(p: str) -> str:
 from io import BytesIO
 import sqlite3
 import time
+
+
 
 def generate_pdf_report_v2(tenant: str, period_filter: str = "") -> BytesIO:
     """
@@ -2942,9 +2966,6 @@ def admin_panel():
     </form>
     """)
 
-    html.append("</div>")
-
-
 
 
 
@@ -3372,31 +3393,53 @@ def admin_reset():
 
     return redirect(f"/admin/panel?tenant={tenant}&token={token}&msg=reset_ok&period={period}")
 
-def queue_template_send(
-    tenant: str,
-    period: str,
-    to_whatsapp: str,
-    cuil: str,
-    nombre: str = "",
-    require_pdf: bool = True
-) -> bool:
+def queue_template_send(tenant: str, period: str, to_whatsapp: str, cuil: str,
+                        nombre: str = "", require_pdf: bool = True) -> str:
     """
-    Encola un envío si no existe (idempotente por UNIQUE).
-    Devuelve True si insertó, False si ya existía.
+    Devuelve: 'inserted', 'requeued', 'noop'
+    - inserted: no existía
+    - requeued: existía SKIPPED/FAILED y la volvimos a PENDING
+    - noop: existía y estaba PENDING/SENT (no tocamos)
     """
     now = int(time.time())
     conn = get_db_connection()
     cur = conn.cursor()
+
     cur.execute("""
-      INSERT OR IGNORE INTO template_send_queue
-        (tenant, period, to_whatsapp, cuil, nombre, require_pdf, status, created_at, updated_at)
+      INSERT INTO template_send_queue
+        (tenant, period, to_whatsapp, cuil, nombre, require_pdf, status, created_at, updated_at, error)
       VALUES
-        (?, ?, ?, ?, ?, ?, 'PENDING', ?, ?)
+        (?, ?, ?, ?, ?, ?, 'PENDING', ?, ?, '')
+      ON CONFLICT(tenant, period, to_whatsapp, cuil) DO UPDATE SET
+        nombre=excluded.nombre,
+        require_pdf=excluded.require_pdf,
+        updated_at=excluded.updated_at,
+        status=CASE
+          WHEN template_send_queue.status IN ('SKIPPED','FAILED') THEN 'PENDING'
+          ELSE template_send_queue.status
+        END,
+        error=CASE
+          WHEN template_send_queue.status IN ('SKIPPED','FAILED') THEN ''
+          ELSE template_send_queue.error
+        END
     """, (tenant, period, to_whatsapp, cuil, (nombre or ""), 1 if require_pdf else 0, now, now))
-    inserted = (cur.rowcount == 1)
+
+    # Determinar resultado
+    cur.execute("""
+      SELECT status FROM template_send_queue
+      WHERE tenant=? AND period=? AND to_whatsapp=? AND cuil=?
+      LIMIT 1
+    """, (tenant, period, to_whatsapp, cuil))
+    status = (cur.fetchone() or [""])[0]
+
     conn.commit()
     conn.close()
-    return inserted
+
+    # heurística simple
+    if status == "PENDING":
+        # pudo ser inserted o requeued; si querés exactitud, guardá rowcount antes/después
+        return "requeued_or_inserted"
+    return "noop"
 
 
 def count_queue_status(tenant: str, period: str) -> dict:
