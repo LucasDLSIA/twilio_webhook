@@ -1370,21 +1370,35 @@ def get_verifications_rows(tenant: str):
     return rows
 
 
+def norm_cuil_digits(x: str) -> str:
+    return "".join(ch for ch in (x or "") if ch.isdigit())
+
 def is_verified_contact(tenant: str, cuil: str, to_whatsapp: str) -> bool:
+    cuil_d = norm_cuil_digits(cuil)
+    w = normalize_whatsapp(to_whatsapp)
+
     conn = get_db_connection()
-    conn.row_factory = sqlite3.Row
     cur = conn.cursor()
-
     cur.execute("""
-        SELECT 1
-        FROM verifications
-        WHERE tenant=? AND cuil=? AND to_whatsapp=?
-        LIMIT 1
-    """, (tenant, cuil, to_whatsapp))
-
+      SELECT 1
+      FROM verifications
+      WHERE tenant = ?
+        AND (
+          -- match por cuil normalizado (saca guiones, espacios, etc.)
+          replace(replace(cuil, '-', ''), ' ', '') = ?
+        )
+        AND (
+          -- match por whatsapp normalizado
+          to_whatsapp = ?
+          OR replace(replace(replace(to_whatsapp,'whatsapp:',''),'+',''),' ','') =
+             replace(replace(replace(?,'whatsapp:',''),'+',''),' ','')
+        )
+      LIMIT 1
+    """, (tenant, cuil_d, w, w))
     ok = cur.fetchone() is not None
     conn.close()
     return ok
+
 
 import hashlib
 
