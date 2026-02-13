@@ -79,7 +79,8 @@ def norm_digits(s: str) -> str:
     return re.sub(r"\D", "", str(s or ""))
 
 def norm_cuil(s: str) -> str:
-    return norm_digits(s)
+    return re.sub(r"\D+", "", (s or "")).strip()
+
 
 def strip_pdf(name: str) -> str:
     s = str(name or "").strip()
@@ -1521,11 +1522,10 @@ def admin_send_template_preview():
     if auth:
         return auth
 
-    token = (request.args.get("token") or "").strip()
     tenant = (request.args.get("tenant") or "").strip().lower()
-    period = (request.args.get("period") or "").strip()  # "01/2026"
+    period_label = (request.args.get("period") or "").strip()  # "01/2026"
     limit = int((request.args.get("limit") or "0").strip() or 0)
-    require_pdf = (request.args.get("require_pdf") or "true").strip().lower() in ("1","true","yes","on")
+    require_pdf = (request.args.get("require_pdf") or "true").strip().lower() in ("1", "true", "yes", "on")
 
     if not tenant:
         return jsonify({"ok": False, "error": "Falta tenant"}), 400
@@ -1534,18 +1534,6 @@ def admin_send_template_preview():
     if not t:
         return jsonify({"ok": False, "error": "Tenant inválido"}), 400
 
-    # 1) Ubicar carpeta del período (Drive)
-    period_folder_id = ""
-    if period:
-        period_folder_id = get_tenant_period_folder_id(tenant, period)
-        if require_pdf and not period_folder_id:
-            return jsonify({"ok": True, "tenant": tenant, "period": period, "limit": limit,
-                            "total_match": 0, "showing": 0, "recipients": [],
-                            "note": "No existe la carpeta de ese período en Drive."})
-
-    service = drive_service() if (require_pdf and period_folder_id) else None
-
-    # 2) Leer Excel de envíos
     envios_rows = load_envios_rows(tenant, force=False) or []
 
     def pick(r, keys):
@@ -1555,37 +1543,99 @@ def admin_send_template_preview():
                 return str(v).strip()
         return ""
 
+    # --- 1) Si require_pdf: obtener set de CUILs que tienen PDF en ese período ---
+    pdf_cuils = None
+    period_folder_id = ""
+
+    if require_pdf:
+        period_folder_id = get_tenant_period_folder_id(tenant, period_label)  # root -> "MM-YYYY"
+        if not period_folder_id:
+            return jsonify({
+                "ok": True,
+                "tenant": tenant,
+                "period": period_label,
+                "limit": limit,
+                "total_match": 0,
+                "showing": 0,
+                "recipients": [],
+                "note": f"No existe carpeta de período para {period_label} (o get_tenant_period_folder_id no la encontró)."
+            })
+
+        service = drive_service()
+
+        # IMPORTANTE: esto debe listar archivos del folder (no solo subfolders)
+        children = _drive_list_children(service, parent_id=period_folder_id, mime_type=None, page_size=1000) or []
+
+        pdf_cuils = set()
+        pdf_names_sample = []
+
+        for c in children:
+            name = (c.get("name") or "").strip()
+            if not name:
+                continue
+            if name.lower().endswith(".pdf"):
+                base = name[:-4].strip()
+                nc = norm_cuil(base)
+                if nc:
+                    pdf_cuils.add(nc)
+                    if len(pdf_names_sample) < 5:
+                        pdf_names_sample.append(name)
+
+        # Si no encontró ningún pdf, te devolvemos note con diagnóstico
+        if not pdf_cuils:
+            return jsonify({
+                "ok": True,
+                "tenant": tenant,
+                "period": period_label,
+                "limit": limit,
+                "total_match": 0,
+                "showing": 0,
+                "recipients": [],
+                "note": "Encontré la carpeta del período pero no vi PDFs adentro (o _drive_list_children no está listando archivos)."
+            })
+
+    # --- 2) Construir recipients desde Excel y filtrar por PDF ---
     recipients = []
+    excel_cuil_sample = []
+
     for r in envios_rows:
-        cuil = pick(r, ["cuil", "CUIL"])
+        cuil_raw = pick(r, ["cuil", "CUIL"])
+        cuil = norm_cuil(cuil_raw)
         nombre = pick(r, ["nombre", "Nombre", "NOMBRE", "name"])
         whatsapp = pick(r, ["to_whatsapp", "whatsapp", "telefono", "tel", "phone"])
 
-        # si no hay cuil, no podemos mapear a PDF
+        if len(excel_cuil_sample) < 5 and cuil_raw:
+            excel_cuil_sample.append(cuil_raw)
+
         if require_pdf:
-            if not (period_folder_id and cuil):
+            if not cuil:
                 continue
-            filename = f"{cuil}.pdf"
-            if not _drive_child_file_exists(service, period_folder_id, filename):
+            if cuil not in pdf_cuils:
                 continue
 
         recipients.append({"nombre": nombre, "whatsapp": whatsapp, "cuil": cuil})
 
     total = len(recipients)
-
-    # 3) aplicar limit (0=todo)
     if limit and limit > 0:
         recipients = recipients[:limit]
 
-    return jsonify({
+    resp = {
         "ok": True,
         "tenant": tenant,
-        "period": period,
+        "period": period_label,
         "limit": limit,
         "total_match": total,
         "showing": len(recipients),
         "recipients": recipients,
-    })
+    }
+
+    # Debug suave (te ayuda si vuelve a quedar en 0)
+    if require_pdf and total == 0:
+        resp["note"] = "0 match. Revisar formato CUIL. Muestras:"
+        resp["excel_cuil_sample"] = excel_cuil_sample
+        resp["pdf_cuil_sample"] = list(sorted(list(pdf_cuils)))[:5]
+
+    return jsonify(resp)
 
 
 
