@@ -1515,6 +1515,79 @@ def admin_reset_reenvios():
         "deleted": deleted
     })
 
+@app.get("/admin/send_template_preview")
+def admin_send_template_preview():
+    auth = require_admin()
+    if auth:
+        return auth
+
+    token = (request.args.get("token") or "").strip()
+    tenant = (request.args.get("tenant") or "").strip().lower()
+    period = (request.args.get("period") or "").strip()  # "01/2026"
+    limit = int((request.args.get("limit") or "0").strip() or 0)
+    require_pdf = (request.args.get("require_pdf") or "true").strip().lower() in ("1","true","yes","on")
+
+    if not tenant:
+        return jsonify({"ok": False, "error": "Falta tenant"}), 400
+
+    t = get_tenant(tenant)
+    if not t:
+        return jsonify({"ok": False, "error": "Tenant inválido"}), 400
+
+    # 1) Ubicar carpeta del período (Drive)
+    period_folder_id = ""
+    if period:
+        period_folder_id = get_tenant_period_folder_id(tenant, period)
+        if require_pdf and not period_folder_id:
+            return jsonify({"ok": True, "tenant": tenant, "period": period, "limit": limit,
+                            "total_match": 0, "showing": 0, "recipients": [],
+                            "note": "No existe la carpeta de ese período en Drive."})
+
+    service = drive_service() if (require_pdf and period_folder_id) else None
+
+    # 2) Leer Excel de envíos
+    envios_rows = load_envios_rows(tenant, force=False) or []
+
+    def pick(r, keys):
+        for k in keys:
+            v = r.get(k)
+            if v is not None and str(v).strip():
+                return str(v).strip()
+        return ""
+
+    recipients = []
+    for r in envios_rows:
+        cuil = pick(r, ["cuil", "CUIL"])
+        nombre = pick(r, ["nombre", "Nombre", "NOMBRE", "name"])
+        whatsapp = pick(r, ["to_whatsapp", "whatsapp", "telefono", "tel", "phone"])
+
+        # si no hay cuil, no podemos mapear a PDF
+        if require_pdf:
+            if not (period_folder_id and cuil):
+                continue
+            filename = f"{cuil}.pdf"
+            if not _drive_child_file_exists(service, period_folder_id, filename):
+                continue
+
+        recipients.append({"nombre": nombre, "whatsapp": whatsapp, "cuil": cuil})
+
+    total = len(recipients)
+
+    # 3) aplicar limit (0=todo)
+    if limit and limit > 0:
+        recipients = recipients[:limit]
+
+    return jsonify({
+        "ok": True,
+        "tenant": tenant,
+        "period": period,
+        "limit": limit,
+        "total_match": total,
+        "showing": len(recipients),
+        "recipients": recipients,
+    })
+
+
 
 
 def set_pending_step(pending_id: int, step: str):
@@ -2333,30 +2406,52 @@ def admin_home():
     if auth:
         return auth
 
-    token = request.args.get("token", "")
-    tenants = load_tenants(force=True)
+    token = (request.args.get("token") or "").strip()
+
+    tenants = list_all_tenants()  # implementá: devuelve [{slug, display_name}, ...]
 
     html = []
-    html.append("<h2>Panel Admin</h2>")
-    if not EMPRESAS_FILE_ID:
-        html.append("<p style='color:red'>Falta EMPRESAS_FILE_ID en ENV.</p>")
-    if not tenants:
-        html.append("<p>No hay empresas detectadas en el Excel maestro.</p>")
-        html.append("<p>Encabezados esperados: Empresa | Envios_File_ID | Drive_Root_ID</p>")
-    else:
-        html.append("<p>Elegí la empresa:</p><ul>")
-        for t in tenants:
-            panel_url = f"/admin/panel?tenant={esc(t['slug'])}&token={esc(token)}"
-            test_url = f"/admin/send_test?tenant={esc(t['slug'])}&token={esc(token)}"
-            html.append(
-                f"<li>"
-                f"<a href='{panel_url}'><b>{esc(t['display_name'])}</b></a>"
-                f" &nbsp;|&nbsp; "
-                f"<a href='{test_url}'>🧪 Prueba</a>"
-                f"</li>"
-            )
-        html.append("</ul>")
+    html.append("<!doctype html><html><head><meta charset='utf-8'>")
+    html.append("<meta name='viewport' content='width=device-width, initial-scale=1'>")
+    html.append("<title>Admin</title>")
+    html.append("""
+    <style>
+      body{font-family:system-ui;margin:0;background:#0b1220;color:#eaf0ff}
+      .wrap{max-width:980px;margin:0 auto;padding:22px}
+      .top{display:flex;justify-content:space-between;align-items:center;gap:10px}
+      .grid{display:grid;grid-template-columns:repeat(3,1fr);gap:12px;margin-top:14px}
+      @media(max-width:900px){.grid{grid-template-columns:1fr}}
+      .card{border:1px solid rgba(255,255,255,.12);border-radius:14px;padding:14px;background:rgba(255,255,255,.03)}
+      .card h3{margin:0 0 6px 0;font-size:15px}
+      .muted{color:#9fb2d0;font-size:13px}
+      a.btn{display:inline-block;margin-top:10px;padding:9px 12px;border-radius:12px;border:1px solid rgba(255,255,255,.12);text-decoration:none;color:#eaf0ff;background:rgba(255,255,255,.04);font-weight:600}
+      code{background:rgba(255,255,255,.06);padding:2px 6px;border-radius:8px}
+    </style>
+    """)
+    html.append("</head><body><div class='wrap'>")
+
+    html.append("<div class='top'>")
+    html.append("<div>")
+    html.append("<h2 style='margin:0'>Admin</h2>")
+    html.append("<div class='muted'>Elegí la empresa (tenant) para abrir el panel.</div>")
+    html.append("</div>")
+    html.append(f"<div class='muted'>Token: <code>{esc(token)}</code></div>")
+    html.append("</div>")
+
+    html.append("<div class='grid'>")
+    for t in tenants:
+        slug = (t.get("slug") or "").strip().lower()
+        name = t.get("display_name") or slug
+        html.append("<div class='card'>")
+        html.append(f"<h3>{esc(name)}</h3>")
+        html.append(f"<div class='muted'>tenant: <code>{esc(slug)}</code></div>")
+        html.append(f"<a class='btn' href='/admin/panel?tenant={esc(slug)}&token={esc(token)}'>Abrir panel →</a>")
+        html.append("</div>")
+    html.append("</div>")
+
+    html.append("</div></body></html>")
     return Response("".join(html), mimetype="text/html")
+
 
 from flask import send_file
 import pandas as pd
@@ -3020,11 +3115,15 @@ def admin_panel():
     html.append("<div class='row'>")
     html.append("<div>")
     html.append("<label>Período (mm/aaaa)</label><br>")
-    html.append("<input type='text' name='period' placeholder='01/2026' required>")
+    html.append("<select name='period' id='massPeriod' required>")
+    for lbl in period_labels:
+        sel = "selected" if lbl == (selected_period or "") else ""
+        html.append(f"<option value='{esc(lbl)}' {sel}>{esc(lbl)}</option>")
+    html.append("</select>")
     html.append("</div>")
     html.append("<div>")
     html.append("<label>Límite (0 = todos)</label><br>")
-    html.append("<input type='number' name='limit' min='0' value='0'>")
+    html.append("<input type='number' name='limit' id='massLimit' min='0' value='0'>")
     html.append("</div>")
     html.append("</div>")
     html.append("<input type='hidden' name='require_pdf' value='true'>")
@@ -3032,6 +3131,93 @@ def admin_panel():
     html.append("<button class='btn' type='submit'>🚀 Encolar envío a toda la empresa</button>")
     html.append("</div>")
     html.append("</form>")
+    html.append("""
+    <div class="sep"></div>
+    <h3>👀 Preview de destinatarios</h3>
+    <div id="previewMeta" class="muted">Cargando...</div>
+
+    <div class="table-wrap" style="margin-top:10px">
+    <table>
+        <thead>
+        <tr><th>Nombre</th><th>WhatsApp</th><th>CUIL</th></tr>
+        </thead>
+        <tbody id="previewBody">
+        <tr><td colspan="3" class="muted">Cargando...</td></tr>
+        </tbody>
+    </table>
+    </div>
+
+    <div class="hint">Se actualiza al cambiar Período o Límite.</div>
+
+    <script>
+    (async function(){
+    const tenant = %s;
+    const token  = %s;
+
+    const elPeriod = document.getElementById('massPeriod');
+    const elLimit  = document.getElementById('massLimit');
+    const meta = document.getElementById('previewMeta');
+    const body = document.getElementById('previewBody');
+
+    function escapeHtml(s){
+        return String(s ?? '')
+        .replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('>','&gt;')
+        .replaceAll('"','&quot;').replaceAll("'","&#39;");
+    }
+
+    async function refresh(){
+        const period = (elPeriod.value || '').trim();
+        const limit  = (elLimit.value || '0').trim();
+
+        meta.textContent = "Cargando preview...";
+        body.innerHTML = "<tr><td colspan='3' class='muted'>Cargando...</td></tr>";
+
+        const qs = new URLSearchParams({tenant, token, period, limit, require_pdf:'true'});
+
+        try{
+        const r = await fetch('/admin/send_template_preview?' + qs.toString(), {
+            headers: {'Accept': 'application/json'}
+        });
+        const j = await r.json();
+        if(!j.ok){
+            meta.textContent = "Error: " + (j.error || "preview");
+            body.innerHTML = "<tr><td colspan='3' class='muted'>No disponible</td></tr>";
+            return;
+        }
+
+        meta.textContent = `Coinciden: ${j.total_match} · Mostrando: ${j.showing}` +
+            ((j.limit && j.limit > 0) ? ` · Limit: ${j.limit}` : "");
+
+        const rows = j.recipients || [];
+        if(rows.length === 0){
+            body.innerHTML = "<tr><td colspan='3' class='muted'>No hay destinatarios.</td></tr>";
+            return;
+        }
+
+        body.innerHTML = rows.map(x => (
+            `<tr>
+            <td>${escapeHtml(x.nombre)}</td>
+            <td>${escapeHtml(x.whatsapp)}</td>
+            <td>${escapeHtml(x.cuil)}</td>
+            </tr>`
+        )).join('');
+
+        }catch(e){
+        meta.textContent = "Error cargando preview";
+        body.innerHTML = "<tr><td colspan='3' class='muted'>Error</td></tr>";
+        }
+    }
+
+    elPeriod.addEventListener('change', refresh);
+    elLimit.addEventListener('input', () => {
+        clearTimeout(window.__pv_t);
+        window.__pv_t = setTimeout(refresh, 250);
+    });
+
+    refresh();
+    })();
+    </script>
+    """ % (repr(tenant), repr(token)))
 
     # Queue section
     html.append("<div class='sep'></div>")
@@ -3483,9 +3669,73 @@ def normalize_period_label(s: str) -> str:
 
 import re
 
+def label_to_period_folder(label: str) -> str:
+    # "01/2026" -> "01-2026"
+    label = (label or "").strip()
+    m = re.match(r"^(\d{2})/(\d{4})$", label)
+    if not m:
+        return ""
+    return f"{m.group(1)}-{m.group(2)}"
+
+
+def _drive_find_child_folder_id(service, parent_id: str, folder_name: str) -> str:
+    """
+    Busca una carpeta hija por nombre exacto y devuelve su id (o "").
+    Usa tu helper _drive_list_children.
+    """
+    children = _drive_list_children(
+        service,
+        parent_id=parent_id,
+        mime_type=FOLDER_MIME,
+        page_size=500
+    )
+    for c in children:
+        if (c.get("name") or "").strip() == folder_name:
+            return (c.get("id") or "").strip()
+    return ""
+
+
+def _drive_child_file_exists(service, parent_id: str, filename: str) -> bool:
+    """
+    True si existe un archivo con nombre exacto dentro de parent_id.
+    Para no listar 500 siempre, podés implementar query directa,
+    pero con tus helpers lo hacemos por listado.
+    """
+    children = _drive_list_children(
+        service,
+        parent_id=parent_id,
+        mime_type=None,   # archivos (no filtramos por mime)
+        page_size=500
+    )
+    for c in children:
+        if (c.get("name") or "").strip() == filename:
+            return True
+    return False
+
+
+def get_tenant_period_folder_id(tenant_slug: str, period_label: str) -> str:
+    """
+    Devuelve el folder_id del período dentro del root del tenant.
+    period_label esperado: "MM/YYYY"
+    """
+    t = get_tenant(tenant_slug)
+    if not t:
+        return ""
+
+    root_id = (t.get("drive_root_id") or t.get("recibos_root_id") or "").strip()
+    if not root_id:
+        return ""
+
+    period_folder_name = label_to_period_folder(period_label)  # "MM-YYYY"
+    if not period_folder_name:
+        return ""
+
+    service = drive_service()
+    return _drive_find_child_folder_id(service, root_id, period_folder_name)
+
+
 import re
 
-FOLDER_MIME = "application/vnd.google-apps.folder"
 
 def list_tenant_period_folders(tenant_slug: str) -> list[str]:
     """
