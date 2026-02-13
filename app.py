@@ -693,6 +693,7 @@ def twilio_status():
         """, (now, error_code, error_message, sid))
 
     # 4) SIGN después de delivered (solo INITIAL)
+        # 4) SIGN después de delivered (solo INITIAL) + estado A_FINALIZAR
     if status == "delivered":
         cur.execute("""
             SELECT tenant, cuil, period, to_whatsapp, sign_sent_at, COALESCE(origin, 'INITIAL')
@@ -705,9 +706,31 @@ def twilio_status():
         if row:
             tenant, cuil, period, to_whatsapp, sign_sent_at, origin = row
 
+            # ✅ Marcar A_FINALIZAR al entregar (pero NO pisar si ya está FIRMADO/OBSERVADO)
+            cur.execute("""
+                INSERT INTO recibo_estado (tenant, cuil, period, estado, updated_at)
+                VALUES (?, ?, ?, 'A_FINALIZAR', ?)
+                ON CONFLICT(tenant, cuil, period) DO UPDATE SET
+                  estado='A_FINALIZAR',
+                  updated_at=excluded.updated_at
+                WHERE recibo_estado.estado NOT IN ('FIRMADO','OBSERVADO');
+            """, (tenant, cuil, period, now))
+
+            # 🔒 Si ya está cerrado, no mandes firma
+            cur.execute("""
+                SELECT estado FROM recibo_estado
+                WHERE tenant=? AND cuil=? AND period=?
+                LIMIT 1
+            """, (tenant, cuil, period))
+            est = (cur.fetchone() or [None])[0]
+
             # Si es reenvío, NO firmar nunca
             if origin != "INITIAL":
                 print("SKIP SIGN AFTER PDF (origin=", origin, "):", sid)
+
+            elif est in ("FIRMADO", "OBSERVADO"):
+                print("SKIP SIGN (already closed):", tenant, cuil, period, est)
+
             else:
                 if not sign_sent_at and TWILIO_SIGN_TEMPLATE_SID:
                     try:
@@ -727,6 +750,7 @@ def twilio_status():
                         print("SENT SIGN AFTER PDF DELIVERED:", sid_sign)
                     except Exception as e:
                         print("WARN: could not send SIGN:", e)
+
 
     conn.commit()
     conn.close()
@@ -2213,6 +2237,17 @@ def set_recibo_estado(tenant: str, cuil: str, period: str, estado: str):
     conn = get_db_connection()
     cur = conn.cursor()
     now = int(time.time())
+
+    # Si ya está FIRMADO, no se cambia nunca más
+    cur.execute("""
+        SELECT estado FROM recibo_estado
+        WHERE tenant=? AND cuil=? AND period=?
+    """, (tenant, cuil, period))
+    row = cur.fetchone()
+    if row and row[0] == "FIRMADO":
+        conn.close()
+        return
+
     cur.execute("""
       INSERT INTO recibo_estado (tenant, cuil, period, estado, updated_at)
       VALUES (?, ?, ?, ?, ?)
@@ -2222,6 +2257,7 @@ def set_recibo_estado(tenant: str, cuil: str, period: str, estado: str):
     """, (tenant, cuil, period, estado, now))
     conn.commit()
     conn.close()
+
 
 def get_recibo_estado(tenant: str, cuil: str, period: str):
     conn = get_db_connection()
@@ -2806,222 +2842,411 @@ def admin_panel():
     if not t:
         return Response("Tenant inválido. Volvé a /admin.", status=400)
 
-    # Lee envíos (cacheado si tu load_envios_rows cachea)
     force = (request.args.get("refresh") in ("1", "true", "yes", "on"))
     envios_rows = load_envios_rows(tenant, force=force) or []
 
-    html = []
-    html.append("<!doctype html><html><head><meta charset='utf-8'><title>Panel empresa</title></head><body>")
-    html.append("<h2>Panel empresa</h2>")
-    html.append(f"<p><b>Empresa:</b> {esc(t.get('display_name',''))} &nbsp; (<code>{esc(t.get('slug',''))}</code>)</p>")
-    html.append(f"<p><a href='/admin?token={esc(token)}'>← volver</a></p>")
-
-    # Botón prueba
-    html.append(f"<p><a href='/admin/send_test?tenant={esc(tenant)}&token={esc(token)}'>🧪 Envío de prueba (1 persona)</a></p>")
-
-    # ---------- Envío masivo ----------
-    html.append("<hr>")
-    html.append("<h3>📩 Envío masivo (empresa completa)</h3>")
-    html.append("<hr>")
-    html.append("<h3>⏳ Cola de envíos (templates)</h3>")
-
-    # Mostramos stats si hay period cargado en querystring (recomendado)
     panel_period = (request.args.get("period") or "").strip()
+
+    # Reportes: periodos disponibles
+    selected_period = panel_period
+    period_folders = list_tenant_period_folders(tenant)  # ['01-2026','12-2025',...]
+    period_labels = []
+    for p in period_folders:
+        lbl = period_folder_to_label(p)  # '01/2026'
+        if lbl:
+            period_labels.append(lbl)
+    if not selected_period and period_labels:
+        selected_period = period_labels[0]
+
+    period_q = quote(selected_period or "", safe="")
+
+    # Cola stats
+    stats = None
     if panel_period:
         stats = get_queue_stats(tenant, panel_period)
-        html.append(
-            f"<p><b>Período cola:</b> {esc(panel_period)} &nbsp; | "
-            f"PENDING: <b>{stats['PENDING']}</b> · "
-            f"SENT: <b>{stats['SENT']}</b> · "
-            f"SKIPPED: <b>{stats['SKIPPED']}</b> · "
-            f"FAILED: <b>{stats['FAILED']}</b></p>"
-        )
 
-        # Botón tick manual
+    # Verificaciones
+    verifs = get_verifications_rows(tenant)
+
+    html = []
+    html.append("""<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Panel empresa</title>
+  <style>
+    :root{
+      --bg:#0b1220;
+      --card:#0f1b33;
+      --muted:#9fb2d0;
+      --text:#eaf0ff;
+      --line:rgba(255,255,255,.08);
+      --accent:#5aa7ff;
+      --ok:#34d399;
+      --warn:#fbbf24;
+      --bad:#fb7185;
+      --btn:#14264a;
+      --btn2:#1a2f5a;
+      --shadow: 0 10px 25px rgba(0,0,0,.25);
+      --radius:14px;
+      --mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+      --sans: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, "Apple Color Emoji","Segoe UI Emoji";
+    }
+    *{box-sizing:border-box}
+    body{
+      margin:0;
+      font-family:var(--sans);
+      background: radial-gradient(1200px 700px at 20% -20%, rgba(90,167,255,.25), transparent 60%),
+                  radial-gradient(1200px 700px at 90% 0%, rgba(52,211,153,.18), transparent 55%),
+                  var(--bg);
+      color:var(--text);
+    }
+    a{color:inherit;text-decoration:none}
+    .wrap{max-width:1100px;margin:0 auto;padding:22px}
+    .topbar{
+      display:flex;gap:14px;align-items:center;justify-content:space-between;
+      padding:16px 18px;border:1px solid var(--line);border-radius:var(--radius);
+      background:rgba(255,255,255,.03);box-shadow:var(--shadow);
+      position:sticky;top:12px;backdrop-filter: blur(8px); z-index:10;
+    }
+    .title{display:flex;flex-direction:column;gap:4px}
+    .title h2{margin:0;font-size:18px;letter-spacing:.2px}
+    .subtitle{font-size:13px;color:var(--muted)}
+    .pill{
+      display:inline-flex;align-items:center;gap:8px;
+      font-size:12px;color:var(--muted)
+    }
+    code{font-family:var(--mono);font-size:12px;background:rgba(255,255,255,.06);padding:2px 6px;border-radius:8px;border:1px solid var(--line)}
+    .grid{
+      margin-top:16px;
+      display:grid;
+      grid-template-columns: 1.2fr .8fr;
+      gap:14px;
+    }
+    @media(max-width:960px){ .grid{grid-template-columns:1fr} .topbar{flex-direction:column;align-items:flex-start}}
+    .card{
+      border:1px solid var(--line);
+      background:rgba(255,255,255,.03);
+      border-radius:var(--radius);
+      padding:16px;
+      box-shadow:var(--shadow);
+    }
+    .card h3{margin:0 0 10px 0;font-size:15px}
+    .muted{color:var(--muted);font-size:13px}
+    .row{display:flex;gap:10px;flex-wrap:wrap;align-items:center}
+    .btn{
+      display:inline-flex;align-items:center;justify-content:center;
+      gap:8px;
+      padding:10px 12px;
+      border-radius:12px;
+      border:1px solid var(--line);
+      background:linear-gradient(180deg, rgba(255,255,255,.06), rgba(255,255,255,.02));
+      cursor:pointer;
+      font-weight:600;
+      font-size:13px;
+      transition:transform .05s ease, background .2s ease;
+    }
+    .btn:hover{transform:translateY(-1px);background:linear-gradient(180deg, rgba(255,255,255,.08), rgba(255,255,255,.03))}
+    .btn.secondary{background:rgba(255,255,255,.02)}
+    .btn.danger{border-color:rgba(251,113,133,.35); background:rgba(251,113,133,.10)}
+    .btn.small{padding:7px 10px;font-size:12px;border-radius:10px}
+    input[type="text"], input[type="number"], select{
+      background:rgba(0,0,0,.25);
+      border:1px solid var(--line);
+      color:var(--text);
+      padding:10px 10px;
+      border-radius:12px;
+      outline:none;
+      min-width: 180px;
+    }
+    label{font-size:12px;color:var(--muted)}
+    .badge{
+      display:inline-flex;align-items:center;gap:6px;
+      padding:6px 10px;border-radius:999px;
+      border:1px solid var(--line);
+      background:rgba(255,255,255,.03);
+      font-size:12px;color:var(--muted);
+    }
+    .badge b{color:var(--text)}
+    .badge.ok{border-color:rgba(52,211,153,.35)}
+    .badge.warn{border-color:rgba(251,191,36,.35)}
+    .badge.bad{border-color:rgba(251,113,133,.35)}
+    .sep{height:1px;background:var(--line);margin:12px 0}
+    table{width:100%;border-collapse:separate;border-spacing:0}
+    th, td{
+      padding:10px 10px;
+      border-bottom:1px solid var(--line);
+      font-size:13px;
+      vertical-align:middle;
+    }
+    th{font-size:12px;color:var(--muted);text-align:left}
+    tr:hover td{background:rgba(255,255,255,.02)}
+    .table-wrap{overflow:auto;border:1px solid var(--line);border-radius:14px}
+    .right{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
+    .hint{font-size:12px;color:var(--muted);margin-top:6px}
+    .kpi{display:flex;gap:8px;flex-wrap:wrap;margin-top:8px}
+    .mono{font-family:var(--mono)}
+  </style>
+</head>
+<body>
+""")
+
+    html.append("<div class='wrap'>")
+
+    html.append("<div class='topbar'>")
+    html.append("<div class='title'>")
+    html.append("<h2>Panel empresa</h2>")
+    html.append(f"<div class='subtitle'><b>Empresa:</b> {esc(t.get('display_name',''))} · <span class='pill'>slug <code>{esc(t.get('slug',''))}</code></span></div>")
+    html.append("</div>")
+    html.append("<div class='right'>")
+    html.append(f"<a class='btn secondary' href='/admin?token={esc(token)}'>← Volver</a>")
+    html.append(f"<a class='btn' href='/admin/send_test?tenant={esc(tenant)}&token={esc(token)}'>🧪 Envío de prueba</a>")
+    html.append("</div>")
+    html.append("</div>")
+
+    html.append("<div class='grid'>")
+
+    # Columna izquierda: acciones principales
+    html.append("<div class='card'>")
+    html.append("<h3>📩 Envío masivo</h3>")
+    html.append("<div class='muted'>Enviá la plantilla a toda la empresa y gestioná la cola por período.</div>")
+    html.append("<div class='sep'></div>")
+
+    # Start queue
+    html.append("<form method='post' action='/admin/send_template_queue_start'>")
+    html.append(f"<input type='hidden' name='token' value='{esc(token)}'>")
+    html.append(f"<input type='hidden' name='tenant' value='{esc(tenant)}'>")
+    html.append("<div class='row'>")
+    html.append("<div>")
+    html.append("<label>Período (mm/aaaa)</label><br>")
+    html.append("<input type='text' name='period' placeholder='01/2026' required>")
+    html.append("</div>")
+    html.append("<div>")
+    html.append("<label>Límite (0 = todos)</label><br>")
+    html.append("<input type='number' name='limit' min='0' value='0'>")
+    html.append("</div>")
+    html.append("</div>")
+    html.append("<input type='hidden' name='require_pdf' value='true'>")
+    html.append("<div style='margin-top:10px'>")
+    html.append("<button class='btn' type='submit'>🚀 Encolar envío a toda la empresa</button>")
+    html.append("</div>")
+    html.append("</form>")
+
+    # Queue section
+    html.append("<div class='sep'></div>")
+    html.append("<h3>⏳ Cola de envíos</h3>")
+
+    if panel_period and stats:
+        html.append(f"<div class='muted'>Período cola: <b>{esc(panel_period)}</b></div>")
+        html.append("<div class='kpi'>")
+        html.append(f"<span class='badge warn'>PENDING <b>{stats['PENDING']}</b></span>")
+        html.append(f"<span class='badge ok'>SENT <b>{stats['SENT']}</b></span>")
+        html.append(f"<span class='badge'>SKIPPED <b>{stats['SKIPPED']}</b></span>")
+        html.append(f"<span class='badge bad'>FAILED <b>{stats['FAILED']}</b></span>")
+        html.append("</div>")
+
         html.append("<form method='post' action='/admin/send_template_queue_tick' style='margin-top:10px;'>")
         html.append(f"<input type='hidden' name='token' value='{esc(token)}'>")
         html.append(f"<input type='hidden' name='tenant' value='{esc(tenant)}'>")
         html.append(f"<input type='hidden' name='period' value='{esc(panel_period)}'>")
-        html.append("<label>Batch size: <input type='number' name='batch_size' min='1' max='50' value='10'></label> ")
-        html.append("<button type='submit'>▶️ Procesar ahora</button>")
+        html.append("<div class='row'>")
+        html.append("<div>")
+        html.append("<label>Batch size</label><br>")
+        html.append("<input type='number' name='batch_size' min='1' max='50' value='10'>")
+        html.append("</div>")
+        html.append("<div style='margin-top:18px'>")
+        html.append("<button class='btn' type='submit'>▶️ Procesar ahora</button>")
+        html.append("</div>")
+        html.append("</div>")
         html.append("</form>")
 
-        # Link para cron (modo json)
-        html.append("<p style='font-size:12px;color:#666;margin-top:8px;'>")
-        html.append("Cron URL (POST) sugerida: ")
-        html.append(f"<code>/admin/send_template_queue_tick?tenant={esc(tenant)}&period={esc(panel_period)}&batch_size=10&token={esc(token)}&mode=json</code>")
-        html.append("</p>")
+        html.append("<div class='hint'>Cron URL (POST) sugerida:</div>")
+        html.append(f"<div class='hint mono'><code>/admin/send_template_queue_tick?tenant={esc(tenant)}&period={esc(panel_period)}&batch_size=10&token={esc(token)}&mode=json</code></div>")
     else:
-        html.append("<p style='color:#666'>Elegí un período en el selector de reportes para ver la cola y poder procesarla.</p>")
+        html.append("<div class='muted'>Elegí un período en Reportes para ver la cola y poder procesarla.</div>")
 
-    html.append("<form method='post' action='/admin/send_template_queue_start'>")
-    html.append(f"<input type='hidden' name='token' value='{esc(token)}'>")
-    html.append(f"<input type='hidden' name='tenant' value='{esc(tenant)}'>")
-    html.append("<label>Período (mm/aaaa): <input type='text' name='period' placeholder='01/2026' required></label><br><br>")
-    html.append("<label>Límite (0 = todos): <input type='number' name='limit' min='0' value='0'></label><br><br>")
-    # si querés que sea opción, cambiá a checkbox. Por ahora lo dejo fijo en true como venías usando.
-    html.append("<input type='hidden' name='require_pdf' value='true'>")
-    html.append("<button type='submit'>Enviar plantilla a toda la empresa</button>")
-    html.append("</form>")
+    html.append("</div>")  # fin card izquierda
 
-    html.append("<hr>")
-    # ---- Selector periodo reportes ----
-    html.append("<hr>")
-    html.append("<h3>Reportes</h3>")
-
-    selected_period = (request.args.get("period") or "").strip()
-
-    period_folders = list_tenant_period_folders(tenant)   # ['01-2026','12-2025',...]
-    period_labels = []
-    for p in period_folders:
-        lbl = period_folder_to_label(p)   # '01/2026'
-        if lbl:
-            period_labels.append(lbl)
-
-    if not selected_period and period_labels:
-        selected_period = period_labels[0]   # default al más nuevo
+    # Columna derecha: reportes + herramientas rápidas
+    html.append("<div class='card'>")
+    html.append("<h3>📊 Reportes</h3>")
+    html.append("<div class='muted'>Descargá reportes filtrando por período.</div>")
+    html.append("<div class='sep'></div>")
 
     html.append("<form method='get' action='/admin/panel'>")
     html.append(f"<input type='hidden' name='token' value='{esc(token)}'>")
     html.append(f"<input type='hidden' name='tenant' value='{esc(tenant)}'>")
-
-    html.append("<label>Período para reportes:</label> ")
+    html.append("<label>Período</label><br>")
+    html.append("<div class='row' style='margin-top:6px'>")
     html.append("<select name='period'>")
     html.append("<option value=''>-- Todos / Sin filtro --</option>")
     for lbl in period_labels:
         sel = "selected" if lbl == selected_period else ""
         html.append(f"<option value='{esc(lbl)}' {sel}>{esc(lbl)}</option>")
-    html.append("</select> ")
-    html.append("<button type='submit'>Aplicar</button>")
+    html.append("</select>")
+    html.append("<button class='btn secondary' type='submit'>Aplicar</button>")
+    html.append("</div>")
     html.append("</form>")
 
-    period_q = quote(selected_period, safe="")
-
+    html.append("<div class='sep'></div>")
+    html.append("<div class='row'>")
     html.append(
-        f"<p><a href='/admin/report_recibos.xlsx?tenant={esc(tenant)}&period={period_q}&token={esc(token)}'>"
-        "📄 Descargar reporte de recibos</a></p>"
+        f"<a class='btn' href='/admin/report_recibos.xlsx?tenant={esc(tenant)}&period={period_q}&token={esc(token)}'>📄 Reporte recibos (XLSX)</a>"
     )
-
     html.append(
-        f"<p><a href='/admin/report_envios.csv?tenant={esc(tenant)}&token={esc(token)}'>"
-        "📄 Envíos realizados (CSV)</a></p>"
+        f"<a class='btn' href='/admin/report_recibos.pdf?tenant={esc(tenant)}&period={period_q}&token={esc(token)}'>🧾 Informe (PDF)</a>"
     )
-
     html.append(
-    f"<p><a href='/admin/report_recibos.pdf?tenant={esc(tenant)}&period={period_q}&token={esc(token)}'>"
-    "🧾 Descargar informe PDF</a></p>"
-)
+        f"<a class='btn secondary' href='/admin/report_envios.csv?tenant={esc(tenant)}&token={esc(token)}'>📤 Envíos (CSV)</a>"
+    )
+    html.append("</div>")
 
-    # ---- Verificaciones ----
-    verifs = get_verifications_rows(tenant)
-    html.append(f"<p>Registros: {len(verifs)}</p>")
+    html.append("<div class='sep'></div>")
+    html.append("<h3>🔎 Buscar períodos por CUIL</h3>")
+    html.append(f"""
+      <form method="get" action="/admin/periodos">
+        <input type="hidden" name="token" value="{esc(token)}">
+        <input type="hidden" name="tenant" value="{esc(tenant)}">
+        <label>CUIL</label><br>
+        <div class="row" style="margin-top:6px">
+          <input type="text" name="cuil" placeholder="xx-xxxxxxxx-x" required>
+          <button class="btn secondary" type="submit">Buscar</button>
+        </div>
+      </form>
+    """)
+
+    html.append("<div class='sep'></div>")
+    html.append("<h3>🧹 Reset</h3>")
+    html.append("<div class='muted'>Borra <code>pending_views</code> y <code>recibo_estado</code> para esta empresa (y período si lo completás).</div>")
+    html.append(f"""
+      <form method="post" action="/admin/reset" onsubmit="return confirm('¿Seguro? Esto borra pending y estados.');" style="margin-top:10px">
+        <input type="hidden" name="token" value="{esc(token)}">
+        <input type="hidden" name="tenant" value="{esc(tenant)}">
+        <label>Período (opcional, mm/aaaa)</label><br>
+        <div class="row" style="margin-top:6px">
+          <input type="text" name="period" placeholder="01/2026">
+          <button class="btn danger" type="submit">Resetear</button>
+        </div>
+      </form>
+    """)
+
+    html.append("</div>")  # fin card derecha
+
+    html.append("</div>")  # fin grid
+
+    # Verificaciones
+    html.append("<div class='card' style='margin-top:14px'>")
+    html.append("<div class='row' style='justify-content:space-between'>")
+    html.append("<div>")
+    html.append("<h3>✅ Verificaciones</h3>")
+    html.append(f"<div class='muted'>Registros: <b>{len(verifs)}</b></div>")
+    html.append("</div>")
+    html.append("</div>")
+    html.append("<div class='sep'></div>")
 
     if verifs:
         html.append(f"""
-        <form method="post" action="/admin/verifications_delete_bulk" onsubmit="return confirm('¿Borrar verificaciones seleccionadas?');">
-        <input type="hidden" name="token" value="{esc(token)}">
-        <input type="hidden" name="tenant" value="{esc(tenant)}">
+          <form id="bulkForm" method="post" action="/admin/verifications_delete_bulk"
+                onsubmit="return confirm('¿Borrar verificaciones seleccionadas?');">
+            <input type="hidden" name="token" value="{esc(token)}">
+            <input type="hidden" name="tenant" value="{esc(tenant)}">
+          </form>
+        """)
 
-        <table border='1' cellpadding='6' cellspacing='0'>
+        html.append("<div class='table-wrap'>")
+        html.append("<table>")
+        html.append("""
+          <thead>
             <tr>
-            <th></th>
-            <th>CUIL</th>
-            <th>Nombre</th>
-            <th>WhatsApp</th>
-            <th>Verificado</th>
-            <th>Acción</th>
+              <th></th>
+              <th>CUIL</th>
+              <th>Nombre</th>
+              <th>WhatsApp</th>
+              <th>Verificado</th>
+              <th>Acciones</th>
             </tr>
+          </thead>
+          <tbody>
         """)
 
         for r in verifs[:500]:
             key = f"{r['cuil']}|{r['to_whatsapp']}"
             html.append("<tr>")
-            html.append(f"<td><input type='checkbox' name='keys' value='{esc(key)}'></td>")
+            # checkbox asociado al bulkForm sin anidarlo
+            html.append(f"<td><input form='bulkForm' type='checkbox' name='keys' value='{esc(key)}'></td>")
             html.append(f"<td>{esc(r['cuil'])}</td>")
             html.append(f"<td>{esc(r.get('nombre','') or '')}</td>")
             html.append(f"<td>{esc(r['to_whatsapp'])}</td>")
             html.append(f"<td>{esc(ts_str(r.get('verified_at')))}</td>")
-            html.append("<td>")
+            html.append("<td class='row'>")
+
+            # form independiente por fila
             html.append(f"""
-            <form method="post" action="/admin/verifications_delete" style="display:inline;" onsubmit="return confirm('¿Borrar verificación?');">
+              <form method="post" action="/admin/verifications_delete"
+                    onsubmit="return confirm('¿Borrar verificación?');" style="margin:0">
                 <input type="hidden" name="token" value="{esc(token)}">
                 <input type="hidden" name="tenant" value="{esc(tenant)}">
                 <input type="hidden" name="cuil" value="{esc(r['cuil'])}">
                 <input type="hidden" name="to_whatsapp" value="{esc(r['to_whatsapp'])}">
-                <button type="submit">Borrar</button>
-            </form>
+                <button class="btn small danger" type="submit">Borrar</button>
+              </form>
             """)
             html.append("</td>")
             html.append("</tr>")
 
-        html.append("""
-        </table>
-        <p style="margin-top:10px;">
-            <button type="submit">🗑️ Borrar seleccionados</button>
-        </p>
-        </form>
-        """)
+        html.append("</tbody></table></div>")
+        html.append("<div style='margin-top:10px'>")
+        html.append("<button class='btn danger' form='bulkForm' type='submit'>🗑️ Borrar seleccionados</button>")
+        html.append("</div>")
     else:
-        html.append("<p>No hay verificaciones cargadas.</p>")
+        html.append("<div class='muted'>No hay verificaciones cargadas.</div>")
 
+    html.append("<div class='sep'></div>")
 
-    # Importar excel verificaciones
+    # Importar verificaciones
     html.append(f"""
-    <form method="post" action="/admin/verifications_import" enctype="multipart/form-data" style="border:1px solid #ddd;padding:10px;border-radius:8px;">
-    <input type="hidden" name="token" value="{esc(token)}">
-    <input type="hidden" name="tenant" value="{esc(tenant)}">
-    <div><b>Importar verificaciones</b></div>
-    <input type="file" name="file" accept=".xlsx" required>
-    <button type="submit">Importar</button>
-    <div style="font-size:12px;color:#666;margin-top:6px;">
-        Columnas requeridas: <code>cuil</code>, <code>whatsapp</code> (o teléfono). Opcional: <code>dni</code>.
-    </div>
-    </form>
+      <h3>📥 Importar verificaciones</h3>
+      <div class="muted">Subí un Excel con columnas: <code>cuil</code>, <code>whatsapp</code> (o teléfono). Opcional: <code>dni</code>.</div>
+      <form method="post" action="/admin/verifications_import" enctype="multipart/form-data" style="margin-top:10px">
+        <input type="hidden" name="token" value="{esc(token)}">
+        <input type="hidden" name="tenant" value="{esc(tenant)}">
+        <div class="row">
+          <input type="file" name="file" accept=".xlsx" required>
+          <button class="btn secondary" type="submit">Importar</button>
+        </div>
+      </form>
     """)
 
+    html.append("</div>")  # fin card verifs
 
-
-
-    # ---------- Reset ----------
-    html.append("<hr>")
-    html.append("<h3>🧹 Reset (limpiar por empresa/período)</h3>")
-    html.append("<p>Esto borra <code>pending_views</code> y <code>recibo_estado</code> SOLO para esta empresa (y período si lo completás).</p>")
-    html.append("<form method='post' action='/admin/reset' onsubmit='return confirm(\"¿Seguro? Esto borra pending y estados.\");'>")
-    html.append(f"<input type='hidden' name='token' value='{esc(token)}'>")
-    html.append(f"<input type='hidden' name='tenant' value='{esc(tenant)}'>")
-    html.append("<label>Período a resetear (opcional, mm/aaaa): <input type='text' name='period' placeholder='01/2026'></label><br><br>")
-    html.append("<button type='submit'>Resetear</button>")
-    html.append("</form>")
-
-    # ---------- Preview envíos ----------
-    html.append("<hr>")
-    html.append("<h3>Preview Excel de envíos</h3>")
-    html.append(f"<p>Filas: {len(envios_rows)}</p>")
+    # Preview envíos
+    html.append("<div class='card' style='margin-top:14px'>")
+    html.append("<div class='row' style='justify-content:space-between'>")
+    html.append("<div>")
+    html.append("<h3>👀 Preview Excel de envíos</h3>")
+    html.append(f"<div class='muted'>Filas: <b>{len(envios_rows)}</b></div>")
+    html.append("</div>")
+    html.append(f"<a class='btn secondary' href='/admin/panel?tenant={esc(tenant)}&token={esc(token)}&refresh=1&period={esc(selected_period or '')}'>🔄 Refrescar</a>")
+    html.append("</div>")
+    html.append("<div class='sep'></div>")
 
     sample = envios_rows[:10]
     if sample:
         cols = list(sample[0].keys())
-        html.append("<table border='1' cellpadding='6' cellspacing='0'>")
-        html.append("<tr>" + "".join(f"<th>{esc(c)}</th>" for c in cols) + "</tr>")
+        html.append("<div class='table-wrap'>")
+        html.append("<table>")
+        html.append("<thead><tr>" + "".join(f"<th>{esc(c)}</th>" for c in cols) + "</tr></thead>")
+        html.append("<tbody>")
         for r in sample:
             html.append("<tr>" + "".join(f"<td>{esc(str(r.get(c,'')))}</td>" for c in cols) + "</tr>")
-        html.append("</table>")
+        html.append("</tbody></table></div>")
     else:
-        html.append("<p>No se pudo leer el Excel de envíos o está vacío.</p>")
+        html.append("<div class='muted'>No se pudo leer el Excel de envíos o está vacío.</div>")
 
-    # ---------- Buscar períodos ----------
-    html.append("<hr>")
-    html.append("<h3>Buscar períodos por CUIL</h3>")
-    html.append(f"""
-      <form method="get" action="/admin/periodos">
-        <input type="hidden" name="token" value="{esc(token)}">
-        <input type="hidden" name="tenant" value="{esc(tenant)}">
-        <input type="text" name="cuil" placeholder="xx-xxxxxxxx-x" required>
-        <button type="submit">Buscar</button>
-      </form>
-    """)
+    html.append("</div>")  # fin preview card
 
-    html.append("</body></html>")
+    html.append("</div></body></html>")
     return Response("".join(html), mimetype="text/html")
 
 
@@ -4181,7 +4406,6 @@ def _send_pdf_flow(from_whatsapp: str, tenant: str, cuil: str, period: str, orig
             status_callback=STATUS_CALLBACK_URL,
         )
 
-        set_recibo_estado(tenant, cuil, period, "DISPONIBLE")
 
         # ✅ Guardamos SID + ORIGIN (para decidir si enviar firma o no al delivered)
         save_pdf_sid(tenant, cuil, period, from_whatsapp, sid_pdf, origin=origin)
