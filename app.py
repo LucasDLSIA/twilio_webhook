@@ -2407,47 +2407,176 @@ def admin_home():
         return auth
 
     token = (request.args.get("token") or "").strip()
-
-    tenants = list_all_tenants()  # implementá: devuelve [{slug, display_name}, ...]
+    tenants = load_tenants(force=True) or []
 
     html = []
-    html.append("<!doctype html><html><head><meta charset='utf-8'>")
-    html.append("<meta name='viewport' content='width=device-width, initial-scale=1'>")
-    html.append("<title>Admin</title>")
-    html.append("""
-    <style>
-      body{font-family:system-ui;margin:0;background:#0b1220;color:#eaf0ff}
-      .wrap{max-width:980px;margin:0 auto;padding:22px}
-      .top{display:flex;justify-content:space-between;align-items:center;gap:10px}
-      .grid{display:grid;grid-template-columns:repeat(3,1fr);gap:12px;margin-top:14px}
-      @media(max-width:900px){.grid{grid-template-columns:1fr}}
-      .card{border:1px solid rgba(255,255,255,.12);border-radius:14px;padding:14px;background:rgba(255,255,255,.03)}
-      .card h3{margin:0 0 6px 0;font-size:15px}
-      .muted{color:#9fb2d0;font-size:13px}
-      a.btn{display:inline-block;margin-top:10px;padding:9px 12px;border-radius:12px;border:1px solid rgba(255,255,255,.12);text-decoration:none;color:#eaf0ff;background:rgba(255,255,255,.04);font-weight:600}
-      code{background:rgba(255,255,255,.06);padding:2px 6px;border-radius:8px}
-    </style>
-    """)
-    html.append("</head><body><div class='wrap'>")
+    html.append("""<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Admin</title>
+  <style>
+    :root{
+      --bg:#0b1220;
+      --muted:#9fb2d0;
+      --text:#eaf0ff;
+      --line:rgba(255,255,255,.08);
+      --shadow: 0 10px 25px rgba(0,0,0,.25);
+      --radius:14px;
+      --mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+      --sans: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial;
+    }
+    *{box-sizing:border-box}
+    body{
+      margin:0;
+      font-family:var(--sans);
+      background: radial-gradient(1200px 700px at 20% -20%, rgba(90,167,255,.25), transparent 60%),
+                  radial-gradient(1200px 700px at 90% 0%, rgba(52,211,153,.18), transparent 55%),
+                  var(--bg);
+      color:var(--text);
+    }
+    .wrap{max-width:1100px;margin:0 auto;padding:22px}
+    .topbar{
+      display:flex;gap:14px;align-items:center;justify-content:space-between;
+      padding:16px 18px;border:1px solid var(--line);border-radius:var(--radius);
+      background:rgba(255,255,255,.03);box-shadow:var(--shadow);
+      position:sticky;top:12px;backdrop-filter: blur(8px); z-index:10;
+    }
+    h2{margin:0;font-size:18px;letter-spacing:.2px}
+    .muted{color:var(--muted);font-size:13px}
+    code{font-family:var(--mono);font-size:12px;background:rgba(255,255,255,.06);padding:2px 6px;border-radius:8px;border:1px solid var(--line)}
+    .card{
+      margin-top:14px;
+      border:1px solid var(--line);
+      background:rgba(255,255,255,.03);
+      border-radius:var(--radius);
+      padding:16px;
+      box-shadow:var(--shadow);
+    }
+    .row{display:flex;gap:10px;flex-wrap:wrap;align-items:center;justify-content:space-between}
+    input[type="text"]{
+      background:rgba(0,0,0,.25);
+      border:1px solid var(--line);
+      color:var(--text);
+      padding:10px 10px;
+      border-radius:12px;
+      outline:none;
+      min-width: 240px;
+    }
+    .grid{
+      margin-top:12px;
+      display:grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap:12px;
+    }
+    @media(max-width:960px){ .grid{grid-template-columns:1fr} .topbar{flex-direction:column;align-items:flex-start}}
+    .tile{
+      border:1px solid var(--line);
+      background:rgba(255,255,255,.02);
+      border-radius:14px;
+      padding:14px;
+      transition:transform .05s ease, background .2s ease;
+    }
+    .tile:hover{transform:translateY(-1px);background:rgba(255,255,255,.04)}
+    .tile h3{margin:0 0 6px 0;font-size:15px}
+    .btn{
+      display:inline-flex;align-items:center;justify-content:center;
+      gap:8px;
+      padding:10px 12px;
+      border-radius:12px;
+      border:1px solid var(--line);
+      background:linear-gradient(180deg, rgba(255,255,255,.06), rgba(255,255,255,.02));
+      cursor:pointer;
+      font-weight:600;
+      font-size:13px;
+      text-decoration:none;
+      color:var(--text);
+    }
+    .btn.secondary{background:rgba(255,255,255,.02)}
+    .btn.small{padding:7px 10px;font-size:12px;border-radius:10px}
+    .actions{display:flex;gap:10px;flex-wrap:wrap;margin-top:10px}
+    .warn{
+      border:1px solid rgba(251,191,36,.35);
+      background: rgba(251,191,36,.10);
+      padding:10px 12px;border-radius:12px;
+      color: var(--text);
+    }
+  </style>
+</head>
+<body>
+<div class="wrap">
+""")
 
-    html.append("<div class='top'>")
+    html.append("<div class='topbar'>")
     html.append("<div>")
-    html.append("<h2 style='margin:0'>Admin</h2>")
-    html.append("<div class='muted'>Elegí la empresa (tenant) para abrir el panel.</div>")
+    html.append("<h2>Panel Admin</h2>")
+    html.append("<div class='muted'>Elegí la empresa para abrir el panel.</div>")
     html.append("</div>")
     html.append(f"<div class='muted'>Token: <code>{esc(token)}</code></div>")
     html.append("</div>")
 
-    html.append("<div class='grid'>")
-    for t in tenants:
-        slug = (t.get("slug") or "").strip().lower()
-        name = t.get("display_name") or slug
+    # Warning si falta master
+    if not EMPRESAS_FILE_ID:
+        html.append("<div class='card'><div class='warn'>⚠️ Falta <code>EMPRESAS_FILE_ID</code> en ENV.</div></div>")
+
+    if not tenants:
         html.append("<div class='card'>")
-        html.append(f"<h3>{esc(name)}</h3>")
-        html.append(f"<div class='muted'>tenant: <code>{esc(slug)}</code></div>")
-        html.append(f"<a class='btn' href='/admin/panel?tenant={esc(slug)}&token={esc(token)}'>Abrir panel →</a>")
+        html.append("<h3 style='margin:0 0 6px 0'>No hay empresas detectadas en el Excel maestro</h3>")
+        html.append("<div class='muted'>Encabezados esperados: <code>Empresa</code> | <code>Envios_File_ID</code> | <code>Drive_Root_ID</code></div>")
         html.append("</div>")
-    html.append("</div>")
+    else:
+        html.append("<div class='card'>")
+        html.append("<div class='row'>")
+        html.append("<div>")
+        html.append("<h3 style='margin:0 0 6px 0'>Empresas</h3>")
+        html.append(f"<div class='muted'>Detectadas: <b>{len(tenants)}</b></div>")
+        html.append("</div>")
+        html.append("<div>")
+        html.append("<label class='muted' style='display:block;margin-bottom:6px'>Buscar</label>")
+        html.append("<input id='q' type='text' placeholder='Escribí para filtrar...'>")
+        html.append("</div>")
+        html.append("</div>")
+
+        html.append("<div class='grid' id='grid'>")
+        for t in tenants:
+            slug = t["slug"]
+            name = t.get("display_name") or slug
+            panel_url = f"/admin/panel?tenant={esc(slug)}&token={esc(token)}"
+            test_url = f"/admin/send_test?tenant={esc(slug)}&token={esc(token)}"
+
+            html.append(f"""
+              <div class="tile" data-name="{esc(name).lower()} {esc(slug).lower()}">
+                <h3>{esc(name)}</h3>
+                <div class="muted">tenant: <code>{esc(slug)}</code></div>
+                <div class="actions">
+                  <a class="btn" href="{panel_url}">Abrir panel →</a>
+                  <a class="btn secondary small" href="{test_url}">🧪 Prueba</a>
+                </div>
+              </div>
+            """)
+
+        html.append("</div>")  # grid
+
+        # JS filtro
+        html.append("""
+        <script>
+          (function(){
+            const q = document.getElementById('q');
+            const tiles = Array.from(document.querySelectorAll('#grid .tile'));
+            function apply(){
+              const s = (q.value || '').trim().toLowerCase();
+              for(const t of tiles){
+                const hay = (t.getAttribute('data-name') || '');
+                t.style.display = (!s || hay.includes(s)) ? '' : 'none';
+              }
+            }
+            q.addEventListener('input', apply);
+          })();
+        </script>
+        """)
+
+        html.append("</div>")  # card
 
     html.append("</div></body></html>")
     return Response("".join(html), mimetype="text/html")
