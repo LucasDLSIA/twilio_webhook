@@ -2034,7 +2034,7 @@ def generate_pdf_report_v2(tenant: str, period_filter: str = ""):
         color_map = {
             "Firmados": "#22c55e",        # verde
             "Observados": "#f59e0b",      # ámbar
-            "Pend. respuesta": "#3b82f6", # azul
+            "Pend. respuesta": "#d4f63b", # amarillo-limón
             "Pend. envío": "#ef4444",     # rojo
             "Pend. lectura": "#a855f7",   # violeta
             "OK": "#64748b",              # gris
@@ -2131,6 +2131,25 @@ def generate_pdf_report_v2(tenant: str, period_filter: str = ""):
 
     story = []
     # --- Página 1: solo gráficos / KPIs ---
+    icon_path = "static/icon_dashboard.png"
+    icon = Image(icon_path, width=1.8*cm, height=1.8*cm)
+
+    left = [
+        Paragraph(f"📌 Control de Recibos • <b>{tenant}</b>", styles["TitleCool"]),
+        Paragraph(f"Período: <b>{period_label}</b> • Generado: {gen_ts}", styles["SubCool"]),
+    ]
+
+    header = Table([[left, icon]], colWidths=[24.7*cm, 2.6*cm])
+    header.setStyle(TableStyle([
+        ("VALIGN", (0,0), (-1,-1), "TOP"),
+        ("LEFTPADDING", (0,0), (-1,-1), 0),
+        ("RIGHTPADDING", (0,0), (-1,-1), 0),
+        ("TOPPADDING", (0,0), (-1,-1), 0),
+        ("BOTTOMPADDING", (0,0), (-1,-1), 0),
+    ]))
+    story.append(header)
+    story.append(Spacer(1, 0.25*cm))
+
     story.append(Paragraph(f"📌 Control de Recibos • <b>{tenant}</b>", styles["TitleCool"]))
     story.append(Paragraph(f"Período: <b>{period_label}</b> • Generado: {gen_ts}", styles["SubCool"]))
     story.append(Spacer(1, 0.25 * cm))
