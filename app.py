@@ -1818,6 +1818,25 @@ def norm_period_label(p: str) -> str:
 from io import BytesIO
 import sqlite3
 import time
+import os
+from reportlab.platypus import Image
+
+def _load_icon_flowable():
+    # 1) paths candidatos (Render / local)
+    candidates = [
+        os.path.join(os.path.dirname(__file__), "static", "icon_dashboard.png"),
+        os.path.join(os.getcwd(), "static", "icon_dashboard.png"),
+        "static/icon_dashboard.png",
+        r"C:\Users\lucasdl\Desktop\TWILIO\twilio_webhook\icon_dashboard.png",
+    ]
+
+    for p in candidates:
+        try:
+            if p and os.path.exists(p):
+                return Image(p, width=1.8*cm, height=1.8*cm)
+        except Exception:
+            pass
+    return None  # si no está, no mostramos icono
 
 
 
@@ -2131,15 +2150,17 @@ def generate_pdf_report_v2(tenant: str, period_filter: str = ""):
 
     story = []
     # --- Página 1: solo gráficos / KPIs ---
-    icon_path = "static/icon_dashboard.png"
-    icon = Image(icon_path, width=1.8*cm, height=1.8*cm)
+    icon = _load_icon_flowable()
 
     left = [
         Paragraph(f"📌 Control de Recibos • <b>{tenant}</b>", styles["TitleCool"]),
         Paragraph(f"Período: <b>{period_label}</b> • Generado: {gen_ts}", styles["SubCool"]),
     ]
 
-    header = Table([[left, icon]], colWidths=[24.7*cm, 2.6*cm])
+    # si no hay icono, ponemos un Spacer para que no explote el layout
+    right = icon if icon else Spacer(1, 1.8*cm)
+
+    header = Table([[left, right]], colWidths=[24.7*cm, 2.6*cm])
     header.setStyle(TableStyle([
         ("VALIGN", (0,0), (-1,-1), "TOP"),
         ("LEFTPADDING", (0,0), (-1,-1), 0),
@@ -2149,6 +2170,7 @@ def generate_pdf_report_v2(tenant: str, period_filter: str = ""):
     ]))
     story.append(header)
     story.append(Spacer(1, 0.25*cm))
+
 
     story.append(Paragraph(f"📌 Control de Recibos • <b>{tenant}</b>", styles["TitleCool"]))
     story.append(Paragraph(f"Período: <b>{period_label}</b> • Generado: {gen_ts}", styles["SubCool"]))
