@@ -1824,14 +1824,12 @@ import time
 def generate_pdf_report_v2(tenant: str, period_filter: str = ""):
     """
     Reporte con:
-    - KPIs + 2 donuts
-    - Tabla de TODAS las personas (todas las filas)
+    - KPIs + 1 donut (Estados por jerarquía)
+    - Tabla de TODAS las personas (entra en A4 apaisado sin recortar)
     - Estado único por (WhatsApp, Periodo) con jerarquía:
         FIRMADO > OBSERVADO > PEND. RESPUESTA > PEND. ENVÍO
       (si califica en más de uno, se queda con el de mayor jerarquía)
-
-    Importante: usa latest-wins por timestamps para que siempre tome la info más reciente.
-    Requiere helpers existentes: norm_period_label, ts_to_str, get_db_connection
+    - Latest-wins por timestamps (siempre toma la info más reciente)
     """
     from io import BytesIO
     import time
@@ -1849,9 +1847,6 @@ def generate_pdf_report_v2(tenant: str, period_filter: str = ""):
 
     tenant = (tenant or "").strip().lower()
     period_filter = norm_period_label(period_filter)
-
-    def ne(x: str) -> bool:
-        return bool((x or "").strip())
 
     def _safe_int(x):
         try:
@@ -1889,7 +1884,7 @@ def generate_pdf_report_v2(tenant: str, period_filter: str = ""):
 
     conn.close()
 
-    # ========= maps: quedarnos con el MÁS RECIENTE por key =========
+    # ========= maps: MÁS RECIENTE por key =========
     estado_map = {}
     for r in estado_rows:
         c = (r["cuil"] or "").strip()
@@ -1925,11 +1920,6 @@ def generate_pdf_report_v2(tenant: str, period_filter: str = ""):
                 "Nombre": base.get("Nombre", ""),
                 "CUIL": base.get("CUIL", ""),
                 "WhatsApp": base.get("WhatsApp", ""),
-
-                "PDF_enviado": "",
-                "PDF_entregado": "",
-                "PDF_leido": "",
-                "PDF_fallido": "",
 
                 "Respuesta": "",
                 "Pedidos": 0,
@@ -1978,19 +1968,12 @@ def generate_pdf_report_v2(tenant: str, period_filter: str = ""):
 
         if sent_ts and sent_ts >= rec["_sent_ts"]:
             rec["_sent_ts"] = sent_ts
-            rec["PDF_enviado"] = ts_to_str(sent_ts)
-
         if deliv_ts and deliv_ts >= rec["_delivered_ts"]:
             rec["_delivered_ts"] = deliv_ts
-            rec["PDF_entregado"] = ts_to_str(deliv_ts)
-
         if read_ts and read_ts >= rec["_read_ts"]:
             rec["_read_ts"] = read_ts
-            rec["PDF_leido"] = ts_to_str(read_ts)
-
         if fail_ts and fail_ts >= rec["_failed_ts"]:
             rec["_failed_ts"] = fail_ts
-            rec["PDF_fallido"] = ts_to_str(fail_ts)
 
         rec["_last_ts"] = max(rec["_last_ts"], sent_ts, deliv_ts, read_ts, fail_ts)
 
@@ -2019,12 +2002,6 @@ def generate_pdf_report_v2(tenant: str, period_filter: str = ""):
     rows = list(agg.values())
 
     # ========= Estado ÚNICO con jerarquía =========
-    # Jerarquía pedida:
-    # 1 FIRMADO
-    # 2 OBSERVADO
-    # 3 PEND. RESPUESTA (leyó pero no respondió)
-    # 4 PEND. ENVÍO (no enviado)
-
     def classify_status(r: dict) -> str:
         resp = (r.get("Respuesta", "") or "").strip().upper()
         sent = r.get("_sent_ts", 0) > 0
@@ -2038,7 +2015,7 @@ def generate_pdf_report_v2(tenant: str, period_filter: str = ""):
             return "PEND. RESPUESTA"
         if not sent:
             return "PEND. ENVÍO"
-        # extras (no pedidas en jerarquía, pero útiles)
+        # extra útil (no entra en tu jerarquía principal)
         if sent and not read and resp == "":
             return "PEND. LECTURA"
         return resp or "OK"
@@ -2046,7 +2023,7 @@ def generate_pdf_report_v2(tenant: str, period_filter: str = ""):
     for r in rows:
         r["_status"] = classify_status(r)
 
-    # ========= Contadores por status (para gráficos) =========
+    # ========= Contadores =========
     def count_status(s):
         return sum(1 for r in rows if r.get("_status") == s)
 
@@ -2057,9 +2034,9 @@ def generate_pdf_report_v2(tenant: str, period_filter: str = ""):
     c_plec = count_status("PEND. LECTURA")
     c_ok = count_status("OK")
 
-    # ========= Donuts =========
+    # ========= Donut (solo estados) =========
     def donut_png(labels, values, title):
-        fig = plt.figure(figsize=(3.6, 3.6), dpi=170)
+        fig = plt.figure(figsize=(3.8, 3.8), dpi=170)
         ax = fig.add_subplot(111)
         ax.pie(values, startangle=90, wedgeprops=dict(width=0.42))
         ax.axis("equal")
@@ -2071,13 +2048,6 @@ def generate_pdf_report_v2(tenant: str, period_filter: str = ""):
         buf.seek(0)
         return buf
 
-    donut_envios = donut_png(
-        ["Enviados", "Pend. envío"],
-        [sum(1 for r in rows if r.get("_sent_ts", 0) > 0), c_penv],
-        "Envíos"
-    )
-
-    # Donut de estados (incluye tus 4 de jerarquía + extras si existen)
     labels_est = ["Firmados", "Observados", "Pend. respuesta", "Pend. envío"]
     values_est = [c_firm, c_obs, c_presp, c_penv]
     if c_plec:
@@ -2089,7 +2059,7 @@ def generate_pdf_report_v2(tenant: str, period_filter: str = ""):
 
     donut_estados = donut_png(labels_est, values_est, "Estados (jerarquía)")
 
-    # ========= Orden para la tabla (por jerarquía y por último movimiento) =========
+    # ========= Orden de tabla =========
     order_rank = {
         "FIRMADO": 1,
         "OBSERVADO": 2,
@@ -2098,7 +2068,6 @@ def generate_pdf_report_v2(tenant: str, period_filter: str = ""):
         "PEND. LECTURA": 5,
         "OK": 6,
     }
-
     rows_sorted = sorted(
         rows,
         key=lambda r: (order_rank.get(r.get("_status"), 99), -int(r.get("_last_ts") or 0))
@@ -2122,6 +2091,8 @@ def generate_pdf_report_v2(tenant: str, period_filter: str = ""):
     styles.add(ParagraphStyle(name="TitleCool", fontSize=18, leading=20, spaceAfter=2))
     styles.add(ParagraphStyle(name="SubCool", fontSize=10, leading=12, textColor=colors.HexColor("#6b7280")))
     styles.add(ParagraphStyle(name="HSection", fontSize=12, leading=14, spaceBefore=8, spaceAfter=6))
+    styles.add(ParagraphStyle(name="Cell7", fontSize=7, leading=8))
+    styles.add(ParagraphStyle(name="Cell7B", fontSize=7, leading=8, fontName="Helvetica-Bold"))
 
     period_label = period_filter if period_filter else "TODOS"
     gen_ts = time.strftime("%Y-%m-%d %H:%M")
@@ -2131,24 +2102,23 @@ def generate_pdf_report_v2(tenant: str, period_filter: str = ""):
     story.append(Paragraph(f"Período: <b>{period_label}</b> • Generado: {gen_ts}", styles["SubCool"]))
     story.append(Spacer(1, 0.25 * cm))
 
-    # --- KPIs + donuts en 2 columnas ---
+    # --- KPIs + donut ---
     def kpi_box(items):
-        # items: list of (label, value)
         data = []
         for lab, val in items:
             data.append([
                 Paragraph(f"<font color='#6b7280'>{lab}</font>", styles["BodyText"]),
-                Paragraph(f"<b><font size='18'>{val}</font></b>", styles["BodyText"])
+                Paragraph(f"<b><font size='16'>{val}</font></b>", styles["BodyText"])
             ])
-        t = Table(data, colWidths=[4.2*cm, 2.0*cm])
+        t = Table(data, colWidths=[4.2*cm, 1.8*cm])
         t.setStyle(TableStyle([
             ("BACKGROUND", (0,0), (-1,-1), colors.HexColor("#f6f7fb")),
             ("BOX", (0,0), (-1,-1), 0.6, colors.HexColor("#e5e7eb")),
             ("INNERGRID", (0,0), (-1,-1), 0.4, colors.HexColor("#e5e7eb")),
             ("LEFTPADDING", (0,0), (-1,-1), 10),
             ("RIGHTPADDING", (0,0), (-1,-1), 10),
-            ("TOPPADDING", (0,0), (-1,-1), 8),
-            ("BOTTOMPADDING", (0,0), (-1,-1), 8),
+            ("TOPPADDING", (0,0), (-1,-1), 7),
+            ("BOTTOMPADDING", (0,0), (-1,-1), 7),
             ("VALIGN", (0,0), (-1,-1), "MIDDLE"),
         ]))
         return t
@@ -2164,17 +2134,8 @@ def generate_pdf_report_v2(tenant: str, period_filter: str = ""):
     ])
 
     top_grid = Table(
-        [[
-            kpis,
-            Table(
-                [[
-                    Image(donut_envios, width=12.2*cm, height=6.0*cm),
-                    Image(donut_estados, width=12.2*cm, height=6.0*cm),
-                ]],
-                colWidths=[12.6*cm, 12.6*cm]
-            )
-        ]],
-        colWidths=[7.0*cm, 25.2*cm]
+        [[kpis, Image(donut_estados, width=18.0*cm, height=6.2*cm)]],
+        colWidths=[7.0*cm, 20.3*cm]
     )
     top_grid.setStyle(TableStyle([
         ("VALIGN", (0,0), (-1,-1), "TOP"),
@@ -2184,9 +2145,9 @@ def generate_pdf_report_v2(tenant: str, period_filter: str = ""):
         ("BOTTOMPADDING", (0,0), (-1,-1), 0),
     ]))
     story.append(top_grid)
-    story.append(Spacer(1, 0.35 * cm))
+    story.append(Spacer(1, 0.30 * cm))
 
-    # --- TABLA de TODAS las personas ---
+    # --- TABLA de TODAS las personas (entra sin recortar) ---
     story.append(Paragraph("📋 Detalle (todas las personas)", styles["HSection"]))
 
     def clip(s, n):
@@ -2197,61 +2158,46 @@ def generate_pdf_report_v2(tenant: str, period_filter: str = ""):
         ts = _safe_int(ts)
         return ts_to_str(ts) if ts else ""
 
-    table_data = [[
-        "Estado", "Período", "Nombre", "CUIL", "WhatsApp",
-        "Enviado", "Entregado", "Leído",
-        "Respuesta", "Pedidos", "Últ. pedido", "Últ. actividad"
-    ]]
+    # Tabla reducida a columnas que SI entran en A4 apaisado
+    headers = ["Estado", "Período", "Nombre", "CUIL", "WhatsApp", "Enviado", "Leído", "Respuesta", "Pedidos", "Últ. act."]
+    table_data = [[Paragraph(h, styles["Cell7B"]) for h in headers]]
 
     for r in rows_sorted:
         table_data.append([
-            r.get("_status", ""),
-            r.get("Periodo", ""),
-            clip(r.get("Nombre", "") or "—", 26),
-            clip(r.get("CUIL", "") or "—", 16),
-            clip(r.get("WhatsApp", "") or "—", 18),
-
-            fmt_ts(r.get("_sent_ts")),
-            fmt_ts(r.get("_delivered_ts")),
-            fmt_ts(r.get("_read_ts")),
-
-            (r.get("Respuesta", "") or "").strip(),
-            str(int(r.get("Pedidos") or 0)),
-            r.get("Ultimo_pedido", "") or "",
-            fmt_ts(r.get("_last_ts")),
+            Paragraph(r.get("_status",""), styles["Cell7"]),
+            Paragraph(r.get("Periodo","") or "", styles["Cell7"]),
+            Paragraph(clip(r.get("Nombre","") or "—", 32), styles["Cell7"]),
+            Paragraph(clip(r.get("CUIL","") or "—", 16), styles["Cell7"]),
+            Paragraph(clip(r.get("WhatsApp","") or "—", 18), styles["Cell7"]),
+            Paragraph(fmt_ts(r.get("_sent_ts")), styles["Cell7"]),
+            Paragraph(fmt_ts(r.get("_read_ts")), styles["Cell7"]),
+            Paragraph((r.get("Respuesta","") or "").strip(), styles["Cell7"]),
+            Paragraph(str(int(r.get("Pedidos") or 0)), styles["Cell7"]),
+            Paragraph(fmt_ts(r.get("_last_ts")), styles["Cell7"]),
         ])
 
-    people_table = Table(
-        table_data,
-        colWidths=[3.2*cm, 2.4*cm, 5.8*cm, 3.2*cm, 3.4*cm,
-                   3.0*cm, 3.0*cm, 3.0*cm,
-                   2.8*cm, 1.6*cm, 3.0*cm, 3.0*cm]
-    )
+    # Anchos que entran (≈ 27.3 cm útiles con tus márgenes)
+    col_widths = [2.8*cm, 2.2*cm, 6.4*cm, 3.0*cm, 3.2*cm, 2.5*cm, 2.5*cm, 2.7*cm, 1.4*cm, 2.6*cm]
 
-    # estilo header + zebra
+    people_table = Table(table_data, colWidths=col_widths, repeatRows=1)
+
     people_table.setStyle(TableStyle([
         ("BACKGROUND", (0,0), (-1,0), colors.HexColor("#111827")),
         ("TEXTCOLOR", (0,0), (-1,0), colors.white),
-        ("FONTNAME", (0,0), (-1,0), "Helvetica-Bold"),
-        ("FONTSIZE", (0,0), (-1,0), 9),
         ("GRID", (0,0), (-1,-1), 0.35, colors.HexColor("#e5e7eb")),
         ("BOX", (0,0), (-1,-1), 0.8, colors.HexColor("#e5e7eb")),
-        ("LEFTPADDING", (0,0), (-1,-1), 5),
-        ("RIGHTPADDING", (0,0), (-1,-1), 5),
-        ("TOPPADDING", (0,0), (-1,-1), 4),
-        ("BOTTOMPADDING", (0,0), (-1,-1), 4),
+        ("LEFTPADDING", (0,0), (-1,-1), 4),
+        ("RIGHTPADDING", (0,0), (-1,-1), 4),
+        ("TOPPADDING", (0,0), (-1,-1), 3),
+        ("BOTTOMPADDING", (0,0), (-1,-1), 3),
         ("VALIGN", (0,0), (-1,-1), "MIDDLE"),
-        ("ALIGN", (9,1), (9,-1), "CENTER"),
+        ("ALIGN", (8,1), (8,-1), "CENTER"),  # Pedidos
     ]))
 
+    # zebra
     for i in range(1, len(table_data)):
         if i % 2 == 0:
-            people_table.setStyle(TableStyle([
-                ("BACKGROUND", (0,i), (-1,i), colors.HexColor("#f9fafb")),
-            ]))
-
-    # repetir header en páginas nuevas
-    people_table.repeatRows = 1
+            people_table.setStyle(TableStyle([("BACKGROUND", (0,i), (-1,i), colors.HexColor("#f9fafb"))]))
 
     story.append(people_table)
 
