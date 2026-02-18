@@ -2172,10 +2172,6 @@ def generate_pdf_report_v2(tenant: str, period_filter: str = ""):
     story.append(Spacer(1, 0.25*cm))
 
 
-    story.append(Paragraph(f"📌 Control de Recibos • <b>{tenant}</b>", styles["TitleCool"]))
-    story.append(Paragraph(f"Período: <b>{period_label}</b> • Generado: {gen_ts}", styles["SubCool"]))
-    story.append(Spacer(1, 0.25 * cm))
-
     def kpi_box(items):
         data = []
         for lab, val in items:
