@@ -1822,21 +1822,30 @@ import os
 from reportlab.platypus import Image
 
 def _load_icon_flowable():
-    # 1) paths candidatos (Render / local)
+    import os
+    from reportlab.platypus import Image
+    from reportlab.lib.units import cm
+
+    # __file__ = /opt/render/project/src/app.py  (en Render)
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+
     candidates = [
-        os.path.join(os.path.dirname(__file__), "static", "icon_dashboard.png"),
+        os.path.join(base_dir, "static", "icon_dashboard.png"),           # /src/static/...
+        os.path.join(base_dir, "..", "static", "icon_dashboard.png"),     # /static/... (si tu static quedó 1 nivel arriba)
         os.path.join(os.getcwd(), "static", "icon_dashboard.png"),
         "static/icon_dashboard.png",
         r"C:\Users\lucasdl\Desktop\TWILIO\twilio_webhook\icon_dashboard.png",
     ]
 
     for p in candidates:
+        p = os.path.abspath(p)
         try:
-            if p and os.path.exists(p):
+            if os.path.exists(p):
                 return Image(p, width=1.8*cm, height=1.8*cm)
         except Exception:
             pass
-    return None  # si no está, no mostramos icono
+
+    return None
 
 
 
