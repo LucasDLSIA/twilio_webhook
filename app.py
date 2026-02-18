@@ -2030,12 +2030,50 @@ def generate_pdf_report_v2(tenant: str, period_filter: str = ""):
 
     # ========= Donut estados =========
     def donut_png(labels, values, title):
-        fig = plt.figure(figsize=(3.8, 3.8), dpi=170)
+        # Colores por etiqueta (si no encuentra, usa gris)
+        color_map = {
+            "Firmados": "#22c55e",        # verde
+            "Observados": "#f59e0b",      # ámbar
+            "Pend. respuesta": "#3b82f6", # azul
+            "Pend. envío": "#ef4444",     # rojo
+            "Pend. lectura": "#a855f7",   # violeta
+            "OK": "#64748b",              # gris
+        }
+        colors_list = [color_map.get(l, "#94a3b8") for l in labels]
+
+        total = sum([int(v or 0) for v in values]) or 0
+
+        # Más resolución y “más alto” para que no se vea chato
+        fig = plt.figure(figsize=(6.2, 4.0), dpi=200)
         ax = fig.add_subplot(111)
-        ax.pie(values, startangle=90, wedgeprops=dict(width=0.42))
-        ax.axis("equal")
-        ax.set_title(title, fontsize=11, pad=8)
-        ax.legend(labels, loc="center left", bbox_to_anchor=(1.0, 0.5), fontsize=8, frameon=False)
+
+        wedges, _ = ax.pie(
+            values,
+            startangle=90,
+            colors=colors_list,
+            wedgeprops=dict(width=0.42, edgecolor="white", linewidth=2),
+        )
+
+        ax.set_aspect("equal")
+        ax.set_title(title, fontsize=13, pad=10)
+
+        # Texto al centro
+        ax.text(0, 0.06, f"{total}", ha="center", va="center", fontsize=22, fontweight="bold")
+        ax.text(0, -0.10, "total", ha="center", va="center", fontsize=10, color="#6b7280")
+
+        # Leyenda a la derecha (sin aplastar)
+        ax.legend(
+            wedges,
+            [f"{l} • {v}" for l, v in zip(labels, values)],
+            loc="center left",
+            bbox_to_anchor=(1.02, 0.5),
+            fontsize=9,
+            frameon=False,
+            handlelength=1.2,
+            labelspacing=0.6,
+        )
+
+        fig.tight_layout()
         buf = BytesIO()
         fig.savefig(buf, format="png", bbox_inches="tight", transparent=True)
         plt.close(fig)
