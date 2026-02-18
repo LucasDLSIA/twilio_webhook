@@ -1823,13 +1823,10 @@ import time
 
 def generate_pdf_report_v2(tenant: str, period_filter: str = ""):
     """
-    Reporte con:
-    - KPIs + 1 donut (Estados por jerarquía)
-    - Tabla de TODAS las personas (entra en A4 apaisado sin recortar)
-    - Estado único por (WhatsApp, Periodo) con jerarquía:
-        FIRMADO > OBSERVADO > PEND. RESPUESTA > PEND. ENVÍO
-      (si califica en más de uno, se queda con el de mayor jerarquía)
-    - Latest-wins por timestamps (siempre toma la info más reciente)
+    Página 1: KPIs + 1 donut (Estados por jerarquía)
+    Página 2+: Tabla con TODAS las personas (sin recortes) y sin duplicar "FIRMADO"
+    Jerarquía: FIRMADO > OBSERVADO > PEND. RESPUESTA > PEND. ENVÍO
+    Latest-wins por timestamps.
     """
     from io import BytesIO
     import time
@@ -1839,7 +1836,7 @@ def generate_pdf_report_v2(tenant: str, period_filter: str = ""):
     from reportlab.lib.units import cm
     from reportlab.lib import colors
     from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
-    from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer, Image
+    from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer, Image, PageBreak
 
     import matplotlib
     matplotlib.use("Agg")
@@ -1884,7 +1881,7 @@ def generate_pdf_report_v2(tenant: str, period_filter: str = ""):
 
     conn.close()
 
-    # ========= maps: MÁS RECIENTE por key =========
+    # ========= maps (más reciente por key) =========
     estado_map = {}
     for r in estado_rows:
         c = (r["cuil"] or "").strip()
@@ -1921,7 +1918,7 @@ def generate_pdf_report_v2(tenant: str, period_filter: str = ""):
                 "CUIL": base.get("CUIL", ""),
                 "WhatsApp": base.get("WhatsApp", ""),
 
-                "Respuesta": "",
+                "Respuesta": "",          # se usa solo para clasificar, no se imprime
                 "Pedidos": 0,
                 "Ultimo_pedido": "",
 
@@ -1942,7 +1939,6 @@ def generate_pdf_report_v2(tenant: str, period_filter: str = ""):
         cuil = (row["cuil"] or "").strip()
         nombre = (row["nombre"] or "").strip()
         per = norm_period_label((row["period"] or "").strip())
-
         if period_filter and per != period_filter:
             continue
         if not per:
@@ -2015,7 +2011,6 @@ def generate_pdf_report_v2(tenant: str, period_filter: str = ""):
             return "PEND. RESPUESTA"
         if not sent:
             return "PEND. ENVÍO"
-        # extra útil (no entra en tu jerarquía principal)
         if sent and not read and resp == "":
             return "PEND. LECTURA"
         return resp or "OK"
@@ -2023,7 +2018,6 @@ def generate_pdf_report_v2(tenant: str, period_filter: str = ""):
     for r in rows:
         r["_status"] = classify_status(r)
 
-    # ========= Contadores =========
     def count_status(s):
         return sum(1 for r in rows if r.get("_status") == s)
 
@@ -2034,7 +2028,7 @@ def generate_pdf_report_v2(tenant: str, period_filter: str = ""):
     c_plec = count_status("PEND. LECTURA")
     c_ok = count_status("OK")
 
-    # ========= Donut (solo estados) =========
+    # ========= Donut estados =========
     def donut_png(labels, values, title):
         fig = plt.figure(figsize=(3.8, 3.8), dpi=170)
         ax = fig.add_subplot(111)
@@ -2098,11 +2092,11 @@ def generate_pdf_report_v2(tenant: str, period_filter: str = ""):
     gen_ts = time.strftime("%Y-%m-%d %H:%M")
 
     story = []
+    # --- Página 1: solo gráficos / KPIs ---
     story.append(Paragraph(f"📌 Control de Recibos • <b>{tenant}</b>", styles["TitleCool"]))
     story.append(Paragraph(f"Período: <b>{period_label}</b> • Generado: {gen_ts}", styles["SubCool"]))
     story.append(Spacer(1, 0.25 * cm))
 
-    # --- KPIs + donut ---
     def kpi_box(items):
         data = []
         for lab, val in items:
@@ -2145,9 +2139,11 @@ def generate_pdf_report_v2(tenant: str, period_filter: str = ""):
         ("BOTTOMPADDING", (0,0), (-1,-1), 0),
     ]))
     story.append(top_grid)
-    story.append(Spacer(1, 0.30 * cm))
 
-    # --- TABLA de TODAS las personas (entra sin recortar) ---
+    # --- salto: tabla arranca en hoja 2 ---
+    story.append(PageBreak())
+
+    # --- Página 2+: tabla ---
     story.append(Paragraph("📋 Detalle (todas las personas)", styles["HSection"]))
 
     def clip(s, n):
@@ -2158,29 +2154,39 @@ def generate_pdf_report_v2(tenant: str, period_filter: str = ""):
         ts = _safe_int(ts)
         return ts_to_str(ts) if ts else ""
 
-    # Tabla reducida a columnas que SI entran en A4 apaisado
-    headers = ["Estado", "Período", "Nombre", "CUIL", "WhatsApp", "Enviado", "Leído", "Respuesta", "Pedidos", "Últ. act."]
+    # ✅ Sin columna "Respuesta" para que no duplique FIRMADO/OBSERVADO
+    headers = ["Estado", "Período", "Nombre", "CUIL", "WhatsApp", "Enviado", "Leído", "Pedidos", "Últ. pedido", "Últ. act."]
     table_data = [[Paragraph(h, styles["Cell7B"]) for h in headers]]
 
     for r in rows_sorted:
         table_data.append([
             Paragraph(r.get("_status",""), styles["Cell7"]),
             Paragraph(r.get("Periodo","") or "", styles["Cell7"]),
-            Paragraph(clip(r.get("Nombre","") or "—", 32), styles["Cell7"]),
+            Paragraph(clip(r.get("Nombre","") or "—", 34), styles["Cell7"]),
             Paragraph(clip(r.get("CUIL","") or "—", 16), styles["Cell7"]),
             Paragraph(clip(r.get("WhatsApp","") or "—", 18), styles["Cell7"]),
             Paragraph(fmt_ts(r.get("_sent_ts")), styles["Cell7"]),
             Paragraph(fmt_ts(r.get("_read_ts")), styles["Cell7"]),
-            Paragraph((r.get("Respuesta","") or "").strip(), styles["Cell7"]),
             Paragraph(str(int(r.get("Pedidos") or 0)), styles["Cell7"]),
+            Paragraph(r.get("Ultimo_pedido","") or "", styles["Cell7"]),
             Paragraph(fmt_ts(r.get("_last_ts")), styles["Cell7"]),
         ])
 
-    # Anchos que entran (≈ 27.3 cm útiles con tus márgenes)
-    col_widths = [2.8*cm, 2.2*cm, 6.4*cm, 3.0*cm, 3.2*cm, 2.5*cm, 2.5*cm, 2.7*cm, 1.4*cm, 2.6*cm]
+    # Anchos que entran en A4 apaisado con tus márgenes (~27.3 cm útiles)
+    col_widths = [
+        2.6*cm,  # Estado
+        2.2*cm,  # Período
+        6.6*cm,  # Nombre
+        3.0*cm,  # CUIL
+        3.2*cm,  # WhatsApp
+        2.6*cm,  # Enviado
+        2.6*cm,  # Leído
+        1.5*cm,  # Pedidos
+        3.0*cm,  # Últ. pedido
+        2.6*cm,  # Últ. act.
+    ]
 
     people_table = Table(table_data, colWidths=col_widths, repeatRows=1)
-
     people_table.setStyle(TableStyle([
         ("BACKGROUND", (0,0), (-1,0), colors.HexColor("#111827")),
         ("TEXTCOLOR", (0,0), (-1,0), colors.white),
@@ -2191,10 +2197,9 @@ def generate_pdf_report_v2(tenant: str, period_filter: str = ""):
         ("TOPPADDING", (0,0), (-1,-1), 3),
         ("BOTTOMPADDING", (0,0), (-1,-1), 3),
         ("VALIGN", (0,0), (-1,-1), "MIDDLE"),
-        ("ALIGN", (8,1), (8,-1), "CENTER"),  # Pedidos
+        ("ALIGN", (7,1), (7,-1), "CENTER"),  # Pedidos
     ]))
 
-    # zebra
     for i in range(1, len(table_data)):
         if i % 2 == 0:
             people_table.setStyle(TableStyle([("BACKGROUND", (0,i), (-1,i), colors.HexColor("#f9fafb"))]))
