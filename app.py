@@ -1821,13 +1821,12 @@ import time
 
 
 
-def generate_pdf_report_v2(tenant: str, period_filter: str = "") -> BytesIO:
+def generate_pdf_report_v2(tenant: str, period_filter: str = ""):
     """
-    Diseño "cards + donuts + tarjetas de personas" (menos formal).
-    - 2 donuts (envíos / respuestas)
-    - contadores grandes tipo cards
-    - personas a accionar (máx 10) en tarjetas
-    Prioridad personas: Observados -> Pendientes envío -> Pendientes firma -> Pendientes lectura
+    Dashboard simple (sin donuts):
+    - 2 filas de KPIs grandes
+    - Tabla de "Personas a accionar" (máx 10)
+    - La info SIEMPRE toma lo más reciente (latest-wins) aunque la DB devuelva filas mezcladas.
     """
     from io import BytesIO
     import time
@@ -1837,26 +1836,33 @@ def generate_pdf_report_v2(tenant: str, period_filter: str = "") -> BytesIO:
     from reportlab.lib.units import cm
     from reportlab.lib import colors
     from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
-    from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer, Image
-
-    import matplotlib
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
+    from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer
 
     tenant = (tenant or "").strip().lower()
     period_filter = norm_period_label(period_filter)
+
+    def ne(x: str) -> bool:
+        return bool((x or "").strip())
+
+    def _safe_int(x):
+        try:
+            return int(x or 0)
+        except Exception:
+            return 0
 
     # ========= DB =========
     conn = get_db_connection()
     conn.row_factory = sqlite3.Row
     cur = conn.cursor()
 
+    # IMPORTANTE: ordenamos por tiempo para reducir sorpresas, igual hacemos latest-wins en Python
     cur.execute("""
         SELECT
             to_whatsapp, tenant, cuil, period, nombre, kind,
             created_at, delivered_at, read_at, failed_at
         FROM message_status
         WHERE tenant = ?
+        ORDER BY COALESCE(read_at, delivered_at, failed_at, created_at, 0) ASC
     """, (tenant,))
     msg_rows = cur.fetchall()
 
@@ -1864,6 +1870,7 @@ def generate_pdf_report_v2(tenant: str, period_filter: str = "") -> BytesIO:
         SELECT tenant, cuil, period, estado, updated_at
         FROM recibo_estado
         WHERE tenant = ?
+        ORDER BY COALESCE(updated_at, 0) ASC
     """, (tenant,))
     estado_rows = cur.fetchall()
 
@@ -1871,32 +1878,71 @@ def generate_pdf_report_v2(tenant: str, period_filter: str = "") -> BytesIO:
         SELECT tenant,cuil,period,to_whatsapp,request_count,last_requested_at
         FROM receipt_requests
         WHERE tenant = ?
+        ORDER BY COALESCE(last_requested_at, 0) ASC
     """, (tenant,))
     rr_rows = cur.fetchall()
 
     conn.close()
 
-    # ========= maps =========
+    # ========= maps (más reciente por key) =========
     estado_map = {}
     for r in estado_rows:
         c = (r["cuil"] or "").strip()
         p = norm_period_label(r["period"] or "")
-        if c and p:
-            estado_map[(c, p)] = {"estado": (r["estado"] or "").strip(), "ts": r["updated_at"]}
+        ts = _safe_int(r["updated_at"])
+        if not (c and p):
+            continue
+        key = (c, p)
+        prev = estado_map.get(key)
+        if (prev is None) or (ts >= _safe_int(prev.get("ts"))):
+            estado_map[key] = {"estado": (r["estado"] or "").strip(), "ts": ts}
 
     rr_map = {}
     for r in rr_rows:
         c = (r["cuil"] or "").strip()
         p = norm_period_label(r["period"] or "")
         w = (r["to_whatsapp"] or "").strip()
-        if c and p and w:
-            rr_map[(w, c, p)] = {"count": int(r["request_count"] or 0), "last": r["last_requested_at"]}
+        ts = _safe_int(r["last_requested_at"])
+        if not (c and p and w):
+            continue
+        key = (w, c, p)
+        prev = rr_map.get(key)
+        if (prev is None) or (ts >= _safe_int(prev.get("last"))):
+            rr_map[key] = {"count": int(r["request_count"] or 0), "last": ts}
 
-    def ne(x: str) -> bool:
-        return bool((x or "").strip())
-
-    # ========= agregación por (whatsapp, periodo) =========
+    # ========= agregación por (whatsapp, periodo) con latest-wins =========
     agg = {}
+
+    def _ensure(k, base):
+        if k not in agg:
+            agg[k] = {
+                "Periodo": base.get("Periodo", ""),
+                "Nombre": base.get("Nombre", ""),
+                "CUIL": base.get("CUIL", ""),
+                "WhatsApp": base.get("WhatsApp", ""),
+
+                # strings formateadas
+                "PDF_enviado": "",
+                "PDF_entregado": "",
+                "PDF_leido": "",
+                "PDF_fallido": "",
+
+                "Respuesta": "",
+                "Pedidos": 0,
+                "Ultimo_pedido": "",
+
+                # timestamps numéricos para comparar
+                "_sent_ts": 0,
+                "_delivered_ts": 0,
+                "_read_ts": 0,
+                "_failed_ts": 0,
+                "_estado_ts": 0,
+                "_pedido_ts": 0,
+
+                # último evento global
+                "_last_ts": 0,
+            }
+
     for row in msg_rows:
         wpp = (row["to_whatsapp"] or "").strip()
         if not wpp:
@@ -1912,73 +1958,76 @@ def generate_pdf_report_v2(tenant: str, period_filter: str = "") -> BytesIO:
             continue
 
         k = (wpp, per)
-        if k not in agg:
-            agg[k] = {
-                "Periodo": per,
-                "Nombre": nombre,
-                "CUIL": cuil,
-                "WhatsApp": wpp,
-                "PDF_enviado": "",
-                "PDF_entregado": "",
-                "PDF_leido": "",
-                "PDF_fallido": "",
-                "Respuesta": "",
-                "Pedidos": 0,
-                "Ultimo_pedido": "",
-                "_last_ts": 0,
-            }
+        _ensure(k, {"Periodo": per, "Nombre": nombre, "CUIL": cuil, "WhatsApp": wpp})
 
-        # rellenar nombre/cuil si aparece
-        if nombre and not agg[k]["Nombre"]:
-            agg[k]["Nombre"] = nombre
-        if cuil and not agg[k]["CUIL"]:
-            agg[k]["CUIL"] = cuil
+        rec = agg[k]
+
+        # completa nombre/cuil si faltan
+        if nombre and not rec["Nombre"]:
+            rec["Nombre"] = nombre
+        if cuil and not rec["CUIL"]:
+            rec["CUIL"] = cuil
 
         kind = (row["kind"] or "").strip().lower()
-        if kind in ("pdf", "media"):
-            if row["created_at"]:
-                agg[k]["PDF_enviado"] = ts_to_str(row["created_at"])
-                agg[k]["_last_ts"] = max(agg[k]["_last_ts"], int(row["created_at"]))
-            if row["delivered_at"]:
-                agg[k]["PDF_entregado"] = ts_to_str(row["delivered_at"])
-                agg[k]["_last_ts"] = max(agg[k]["_last_ts"], int(row["delivered_at"]))
-            if row["read_at"]:
-                agg[k]["PDF_leido"] = ts_to_str(row["read_at"])
-                agg[k]["_last_ts"] = max(agg[k]["_last_ts"], int(row["read_at"]))
-            if row["failed_at"]:
-                agg[k]["PDF_fallido"] = ts_to_str(row["failed_at"])
-                agg[k]["_last_ts"] = max(agg[k]["_last_ts"], int(row["failed_at"]))
+        if kind not in ("pdf", "media"):
+            continue
 
-    # mezclar estado + pedidos
-    for _, rec in agg.items():
+        sent_ts = _safe_int(row["created_at"])
+        deliv_ts = _safe_int(row["delivered_at"])
+        read_ts = _safe_int(row["read_at"])
+        fail_ts = _safe_int(row["failed_at"])
+
+        # latest-wins por campo
+        if sent_ts and sent_ts >= rec["_sent_ts"]:
+            rec["_sent_ts"] = sent_ts
+            rec["PDF_enviado"] = ts_to_str(sent_ts)
+
+        if deliv_ts and deliv_ts >= rec["_delivered_ts"]:
+            rec["_delivered_ts"] = deliv_ts
+            rec["PDF_entregado"] = ts_to_str(deliv_ts)
+
+        if read_ts and read_ts >= rec["_read_ts"]:
+            rec["_read_ts"] = read_ts
+            rec["PDF_leido"] = ts_to_str(read_ts)
+
+        if fail_ts and fail_ts >= rec["_failed_ts"]:
+            rec["_failed_ts"] = fail_ts
+            rec["PDF_fallido"] = ts_to_str(fail_ts)
+
+        rec["_last_ts"] = max(rec["_last_ts"], sent_ts, deliv_ts, read_ts, fail_ts)
+
+    # mezclar estado + pedidos (también latest-wins)
+    for rec in agg.values():
         cuil = rec.get("CUIL", "")
         per = rec.get("Periodo", "")
 
         st = estado_map.get((cuil, per))
         if st:
-            rec["Respuesta"] = st.get("estado", "") or ""
-            if st.get("ts"):
-                rec["_last_ts"] = max(rec["_last_ts"], int(st["ts"]))
+            ts = _safe_int(st.get("ts"))
+            if ts >= rec["_estado_ts"]:
+                rec["_estado_ts"] = ts
+                rec["Respuesta"] = st.get("estado", "") or ""
+            rec["_last_ts"] = max(rec["_last_ts"], ts)
 
         rr = rr_map.get((rec["WhatsApp"], cuil, per))
         if rr:
-            rec["Pedidos"] = rr["count"]
-            rec["Ultimo_pedido"] = ts_to_str(rr["last"])
-            if rr.get("last"):
-                rec["_last_ts"] = max(rec["_last_ts"], int(rr["last"]))
+            ts = _safe_int(rr.get("last"))
+            if ts >= rec["_pedido_ts"]:
+                rec["_pedido_ts"] = ts
+                rec["Pedidos"] = int(rr.get("count") or 0)
+                rec["Ultimo_pedido"] = ts_to_str(ts) if ts else ""
+            rec["_last_ts"] = max(rec["_last_ts"], ts)
 
     rows = list(agg.values())
 
     # ========= categorías =========
-    enviados = [r for r in rows if ne(r.get("PDF_enviado", ""))]
-    pendientes_envio = [r for r in rows if not ne(r.get("PDF_enviado", ""))]
+    enviados = [r for r in rows if r.get("_sent_ts", 0) > 0]
+    pendientes_envio = [r for r in rows if r.get("_sent_ts", 0) == 0]
 
-    # fallido "real": falló y NO llegó a entregarse/leer
+    # fallido "actual": falló y NO llegó a entregarse/leer luego
     fallidos = [
         r for r in rows
-        if ne(r.get("PDF_fallido", ""))
-        and not ne(r.get("PDF_entregado", ""))
-        and not ne(r.get("PDF_leido", ""))
+        if r.get("_failed_ts", 0) > 0 and r.get("_delivered_ts", 0) == 0 and r.get("_read_ts", 0) == 0
     ]
 
     firmados = [r for r in rows if (r.get("Respuesta", "") or "").strip().upper() == "FIRMADO"]
@@ -1986,14 +2035,12 @@ def generate_pdf_report_v2(tenant: str, period_filter: str = "") -> BytesIO:
 
     pendientes_firma = [
         r for r in rows
-        if ne(r.get("PDF_leido", ""))
-        and (r.get("Respuesta", "") or "").strip() == ""
+        if r.get("_read_ts", 0) > 0 and (r.get("Respuesta", "") or "").strip() == ""
     ]
 
     pendientes_lectura = [
         r for r in rows
-        if ne(r.get("PDF_enviado", ""))
-        and not ne(r.get("PDF_leido", ""))
+        if r.get("_sent_ts", 0) > 0 and r.get("_read_ts", 0) == 0
     ]
 
     # ========= top 10 personas a accionar =========
@@ -2001,11 +2048,11 @@ def generate_pdf_report_v2(tenant: str, period_filter: str = "") -> BytesIO:
         resp = (r.get("Respuesta", "") or "").strip().upper()
         if resp == "OBSERVADO":
             return "OBSERVADO"
-        if not ne(r.get("PDF_enviado", "")):
+        if r.get("_sent_ts", 0) == 0:
             return "PEND. ENVÍO"
-        if ne(r.get("PDF_leido", "")) and resp == "":
+        if r.get("_read_ts", 0) > 0 and resp == "":
             return "PEND. FIRMA"
-        if ne(r.get("PDF_enviado", "")) and not ne(r.get("PDF_leido", "")):
+        if r.get("_sent_ts", 0) > 0 and r.get("_read_ts", 0) == 0:
             return "PEND. LECTURA"
         if resp == "FIRMADO":
             return "FIRMADO"
@@ -2033,31 +2080,6 @@ def generate_pdf_report_v2(tenant: str, period_filter: str = "") -> BytesIO:
         if len(top_people) >= 10:
             break
 
-    # ========= donuts =========
-    def donut_png(labels, values, title):
-        fig = plt.figure(figsize=(3.4, 3.4), dpi=170)
-        ax = fig.add_subplot(111)
-        ax.pie(values, startangle=90, wedgeprops=dict(width=0.42))
-        ax.axis("equal")
-        ax.set_title(title, fontsize=11, pad=8)
-        ax.legend(labels, loc="center left", bbox_to_anchor=(1.0, 0.5), fontsize=8, frameon=False)
-        buf = BytesIO()
-        fig.savefig(buf, format="png", bbox_inches="tight", transparent=True)
-        plt.close(fig)
-        buf.seek(0)
-        return buf
-
-    donut_envios = donut_png(
-        ["Enviados", "Pendientes", "Fallidos"],
-        [len(enviados), len(pendientes_envio), len(fallidos)],
-        "Envíos"
-    )
-    donut_resp = donut_png(
-        ["Firmados", "Observados", "Pend. firma", "Pend. lectura"],
-        [len(firmados), len(observados), len(pendientes_firma), len(pendientes_lectura)],
-        "Respuestas"
-    )
-
     # ========= PDF build =========
     out = BytesIO()
     page_w, page_h = landscape(A4)
@@ -2075,7 +2097,7 @@ def generate_pdf_report_v2(tenant: str, period_filter: str = "") -> BytesIO:
     styles = getSampleStyleSheet()
     styles.add(ParagraphStyle(name="TitleCool", fontSize=18, leading=20, spaceAfter=2))
     styles.add(ParagraphStyle(name="SubCool", fontSize=10, leading=12, textColor=colors.HexColor("#6b7280")))
-    styles.add(ParagraphStyle(name="HSection", fontSize=12, leading=14, spaceBefore=6, spaceAfter=6))
+    styles.add(ParagraphStyle(name="HSection", fontSize=12, leading=14, spaceBefore=8, spaceAfter=6))
 
     period_label = period_filter if period_filter else "TODOS"
     gen_ts = time.strftime("%Y-%m-%d %H:%M")
@@ -2085,143 +2107,96 @@ def generate_pdf_report_v2(tenant: str, period_filter: str = "") -> BytesIO:
     story.append(Paragraph(f"Período: <b>{period_label}</b> • Generado: {gen_ts}", styles["SubCool"]))
     story.append(Spacer(1, 0.35 * cm))
 
-    # --- Cards ---
-    def card_row(items):
+    # --- KPI cards (2 filas) ---
+    def kpi_row(items):
+        # items: [("label", value), ...] (4 por fila ideal)
         row = []
         for lab, val in items:
-            row += [str(lab), str(val)]
+            row.append(Paragraph(f"<font color='#6b7280'>{lab}</font>", styles["BodyText"]))
+            row.append(Paragraph(f"<b><font size='18'>{val}</font></b>", styles["BodyText"]))
 
-        t = Table([row], colWidths=[3.0 * cm, 2.0 * cm] * len(items))
+        t = Table([row], colWidths=[3.2*cm, 2.0*cm] * len(items))
         ts = TableStyle([
-            ("BACKGROUND", (0, 0), (-1, -1), colors.HexColor("#f6f7fb")),
-            ("BOX", (0, 0), (-1, -1), 0.6, colors.HexColor("#e5e7eb")),
-            ("INNERGRID", (0, 0), (-1, -1), 0.4, colors.HexColor("#e5e7eb")),
-            ("FONTNAME", (0, 0), (-1, -1), "Helvetica"),
-            ("LEFTPADDING", (0, 0), (-1, -1), 10),
-            ("RIGHTPADDING", (0, 0), (-1, -1), 10),
-            ("TOPPADDING", (0, 0), (-1, -1), 8),
-            ("BOTTOMPADDING", (0, 0), (-1, -1), 8),
-            ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+            ("BACKGROUND", (0,0), (-1,-1), colors.HexColor("#f6f7fb")),
+            ("BOX", (0,0), (-1,-1), 0.6, colors.HexColor("#e5e7eb")),
+            ("INNERGRID", (0,0), (-1,-1), 0.4, colors.HexColor("#e5e7eb")),
+            ("LEFTPADDING", (0,0), (-1,-1), 10),
+            ("RIGHTPADDING", (0,0), (-1,-1), 10),
+            ("TOPPADDING", (0,0), (-1,-1), 8),
+            ("BOTTOMPADDING", (0,0), (-1,-1), 8),
+            ("VALIGN", (0,0), (-1,-1), "MIDDLE"),
         ])
-
-        for i in range(len(items)):
-            lab_col = i * 2
-            val_col = i * 2 + 1
-
-            ts.add("TEXTCOLOR", (lab_col, 0), (lab_col, 0), colors.HexColor("#6b7280"))
-            ts.add("FONTSIZE", (lab_col, 0), (lab_col, 0), 10)
-
-            ts.add("TEXTCOLOR", (val_col, 0), (val_col, 0), colors.HexColor("#111827"))
-            ts.add("FONTNAME", (val_col, 0), (val_col, 0), "Helvetica-Bold")
-            ts.add("FONTSIZE", (val_col, 0), (val_col, 0), 18)
-
         t.setStyle(ts)
         return t
 
-    story.append(Paragraph("📤 Enviados / Pendientes", styles["HSection"]))
-    story.append(card_row([
+    story.append(Paragraph("📊 Resumen", styles["HSection"]))
+    story.append(kpi_row([
         ("Enviados", len(enviados)),
-        ("Pendientes", len(pendientes_envio)),
-        ("Fallidos", len(fallidos))
+        ("Pend. envío", len(pendientes_envio)),
+        ("Fallidos", len(fallidos)),
+        ("Total", len(rows)),
     ]))
-    story.append(Spacer(1, 0.25 * cm))
-
-    story.append(Paragraph("✍️ Firmados / Observados", styles["HSection"]))
-    story.append(card_row([
+    story.append(Spacer(1, 0.18 * cm))
+    story.append(kpi_row([
         ("Firmados", len(firmados)),
         ("Observados", len(observados)),
         ("Pend. firma", len(pendientes_firma)),
-        ("Pend. lectura", len(pendientes_lectura))
+        ("Pend. lectura", len(pendientes_lectura)),
     ]))
     story.append(Spacer(1, 0.35 * cm))
 
-    # --- Donuts side-by-side ---
-    donuts_grid = Table(
-        [[
-            Image(donut_envios, width=12.0 * cm, height=6.3 * cm),
-            Image(donut_resp, width=12.0 * cm, height=6.3 * cm)
-        ]],
-        colWidths=[12.6 * cm, 12.6 * cm]
-    )
-    donuts_grid.setStyle(TableStyle([
-        ("VALIGN", (0, 0), (-1, -1), "TOP"),
-        ("LEFTPADDING", (0, 0), (-1, -1), 0),
-        ("RIGHTPADDING", (0, 0), (-1, -1), 0),
-        ("TOPPADDING", (0, 0), (-1, -1), 0),
-        ("BOTTOMPADDING", (0, 0), (-1, -1), 0),
-    ]))
-    story.append(donuts_grid)
-    story.append(Spacer(1, 0.35 * cm))
-
-    # --- Personas ---
+    # --- Tabla Personas a accionar ---
     story.append(Paragraph("👥 Personas a accionar (máx 10)", styles["HSection"]))
 
     def clip(s, n):
         s = str(s or "")
-        return s if len(s) <= n else s[:n - 1] + "…"
+        return s if len(s) <= n else s[:n-1] + "…"
 
-    def fmt_last_ts(r):
-        ts = int(r.get("_last_ts") or 0)
-        return ts_to_str(ts) if ts else ""
+    table_data = [[
+        "Nombre", "WhatsApp", "Estado", "Período", "Últ. actividad", "Pedidos", "Últ. pedido"
+    ]]
 
-    cards = []
     for r in top_people:
-        nombre = clip(r.get("Nombre", "") or "—", 30)
-        wpp = clip(r.get("WhatsApp", ""), 24)
-        est = _label_estado(r)
-        per = r.get("Periodo", "")
-        last = fmt_last_ts(r)
+        last_ts = int(r.get("_last_ts") or 0)
+        table_data.append([
+            clip(r.get("Nombre", "") or "—", 28),
+            clip(r.get("WhatsApp", "") or "—", 18),
+            _label_estado(r),
+            r.get("Periodo", "") or "—",
+            ts_to_str(last_ts) if last_ts else "",
+            str(int(r.get("Pedidos") or 0)),
+            r.get("Ultimo_pedido", "") or "",
+        ])
 
-        txt = (
-            f"<b>{nombre}</b><br/>"
-            f"{wpp}<br/>"
-            f"<b>{est}</b> • {per}<br/>"
-            f"<font color='#6b7280'>Últ: {last}</font>"
-        )
-        box = Table([[Paragraph(txt, styles["BodyText"])]], colWidths=[12.0 * cm])
-        box.setStyle(TableStyle([
-            ("BACKGROUND", (0, 0), (-1, -1), colors.HexColor("#ffffff")),
-            ("BOX", (0, 0), (-1, -1), 0.8, colors.HexColor("#e5e7eb")),
-            ("LEFTPADDING", (0, 0), (-1, -1), 10),
-            ("RIGHTPADDING", (0, 0), (-1, -1), 10),
-            ("TOPPADDING", (0, 0), (-1, -1), 8),
-            ("BOTTOMPADDING", (0, 0), (-1, -1), 8),
-        ]))
-        cards.append(box)
+    if len(table_data) == 1:
+        table_data.append(["—", "—", "—", "—", "—", "0", "—"])
 
-    # card vacío para mantener grilla prolija
-    empty_card = Table([[Paragraph("&nbsp;", styles["BodyText"])]], colWidths=[12.0 * cm])
-    empty_card.setStyle(TableStyle([
-        ("BACKGROUND", (0, 0), (-1, -1), colors.HexColor("#ffffff")),
-        ("BOX", (0, 0), (-1, -1), 0.8, colors.HexColor("#e5e7eb")),
-        ("LEFTPADDING", (0, 0), (-1, -1), 10),
-        ("RIGHTPADDING", (0, 0), (-1, -1), 10),
-        ("TOPPADDING", (0, 0), (-1, -1), 8),
-        ("BOTTOMPADDING", (0, 0), (-1, -1), 8),
+    people_table = Table(
+        table_data,
+        colWidths=[7.2*cm, 3.4*cm, 3.2*cm, 2.6*cm, 4.0*cm, 2.0*cm, 3.6*cm]
+    )
+    people_table.setStyle(TableStyle([
+        ("BACKGROUND", (0,0), (-1,0), colors.HexColor("#111827")),
+        ("TEXTCOLOR", (0,0), (-1,0), colors.white),
+        ("FONTNAME", (0,0), (-1,0), "Helvetica-Bold"),
+        ("FONTSIZE", (0,0), (-1,0), 10),
+        ("ALIGN", (5,1), (5,-1), "CENTER"),
+
+        ("BACKGROUND", (0,1), (-1,-1), colors.white),
+        ("GRID", (0,0), (-1,-1), 0.4, colors.HexColor("#e5e7eb")),
+        ("BOX", (0,0), (-1,-1), 0.8, colors.HexColor("#e5e7eb")),
+        ("LEFTPADDING", (0,0), (-1,-1), 8),
+        ("RIGHTPADDING", (0,0), (-1,-1), 8),
+        ("TOPPADDING", (0,0), (-1,-1), 6),
+        ("BOTTOMPADDING", (0,0), (-1,-1), 6),
     ]))
-
-    while len(cards) < 10:
-        cards.append(empty_card)
-
-    grid = []
-    for i in range(0, 10, 2):
-        grid.append([cards[i], cards[i + 1]])
-
-    people_grid = Table(grid, colWidths=[12.6 * cm, 12.6 * cm])
-    people_grid.setStyle(TableStyle([
-        ("VALIGN", (0, 0), (-1, -1), "TOP"),
-        ("LEFTPADDING", (0, 0), (-1, -1), 0),
-        ("RIGHTPADDING", (0, 0), (-1, -1), 0),
-        ("TOPPADDING", (0, 0), (-1, -1), 0),
-        ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
-    ]))
-    story.append(people_grid)
+    story.append(people_table)
 
     def on_page(canvas, doc_obj):
         canvas.saveState()
         canvas.setFont("Helvetica", 8)
         canvas.setFillColor(colors.HexColor("#9ca3af"))
-        canvas.drawRightString(page_w - 1.2 * cm, 0.8 * cm, f"Página {doc_obj.page}")
+        canvas.drawRightString(page_w - 1.2*cm, 0.8*cm, f"Página {doc_obj.page}")
         canvas.restoreState()
 
     doc.build(story, onFirstPage=on_page, onLaterPages=on_page)
