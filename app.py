@@ -2166,7 +2166,7 @@ def generate_pdf_report_v2(tenant: str, period_filter: str = ""):
     ])
 
     top_grid = Table(
-        [[kpis, Image(donut_estados, width=18.0*cm, height=6.2*cm)]],
+        [[kpis, Image(donut_estados, width=18.0*cm, height=10.2*cm)]],
         colWidths=[7.0*cm, 20.3*cm]
     )
     top_grid.setStyle(TableStyle([
