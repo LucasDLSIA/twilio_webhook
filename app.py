@@ -4240,12 +4240,10 @@ def admin_reset():
     conn = get_db_connection()
     cur = conn.cursor()
 
-    # helper para loguear
     def _del(sql, args):
         cur.execute(sql, args)
-        print("RESET:", sql.split("\n")[0][:60], "args=", args, "deleted=", cur.rowcount)
+        print("RESET:", sql.split("\n")[0][:80], "args=", args, "deleted=", cur.rowcount)
 
-    # ✅ SIEMPRE: limpiar pendings SOLO del tenant
     _del("DELETE FROM pending_views WHERE tenant=?;", (tenant,))
 
     if periods:
@@ -4254,18 +4252,24 @@ def admin_reset():
             _del("DELETE FROM message_status WHERE tenant=? AND period=?;", (tenant, p))
             _del("DELETE FROM sent_pdfs WHERE tenant=? AND period=?;", (tenant, p))
             _del("DELETE FROM receipt_request_events WHERE tenant=? AND period=?;", (tenant, p))
+            _del("DELETE FROM receipt_requests WHERE tenant=? AND period=?;", (tenant, p))
+            _del("DELETE FROM template_send_queue WHERE tenant=? AND period=?;", (tenant, p))
     else:
         _del("DELETE FROM recibo_estado WHERE tenant=?;", (tenant,))
         _del("DELETE FROM message_status WHERE tenant=?;", (tenant,))
         _del("DELETE FROM sent_pdfs WHERE tenant=?;", (tenant,))
         _del("DELETE FROM receipt_request_events WHERE tenant=?;", (tenant,))
+        _del("DELETE FROM receipt_requests WHERE tenant=?;", (tenant,))
+        _del("DELETE FROM template_send_queue WHERE tenant=?;", (tenant,))
 
     conn.commit()
     conn.close()
 
-    # mostrás el período normalizado si venía uno
     p_show = norm_period_label(period_raw) if period_raw else ""
-    return redirect(f"/admin/panel?tenant={tenant}&token={token}&msg=reset_ok&period={p_show}")
+    url = f"/admin/panel?tenant={tenant}&token={token}&msg=reset_ok"
+    if p_show:
+        url += f"&period={p_show}"
+    return redirect(url)
 
 def queue_template_send(tenant: str, period: str, to_whatsapp: str, cuil: str,
                         nombre: str = "", require_pdf: bool = True) -> str:
