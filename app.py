@@ -4163,6 +4163,7 @@ def admin_reset_tenant():
     token = _get_admin_token_from_request()
     tenant = (request.form.get("tenant") or "").strip().lower()
     period = (request.form.get("period") or "").strip()  # opcional
+    period_norm = norm_period_label(period) if period else ""
 
     if not tenant:
         return Response("Falta tenant", status=400)
@@ -4170,14 +4171,26 @@ def admin_reset_tenant():
     conn = get_db_connection()
     cur = conn.cursor()
 
-    # limpia pendings de esa empresa
+    # siempre limpiamos pendings de esa empresa (independiente del período)
     cur.execute("DELETE FROM pending_views WHERE tenant=?;", (tenant,))
 
-    # si mandan period, limpia solo ese período; si no, limpia todo el estado
-    if period:
-        cur.execute("DELETE FROM recibo_estado WHERE tenant=? AND period=?;", (tenant, period))
+    if period_norm:
+        # ✅ firma/obs
+        cur.execute("DELETE FROM recibo_estado WHERE tenant=? AND period=?;", (tenant, period_norm))
+
+        # ✅ tracking de estados (template/pdf delivered/read/failed)
+        cur.execute("DELETE FROM message_status WHERE tenant=? AND period=?;", (tenant, period_norm))
+
+        # ✅ registro del pdf enviado
+        cur.execute("DELETE FROM sent_pdfs WHERE tenant=? AND period=?;", (tenant, period_norm))
+
+        # ✅ auditoría/eventos de pedidos
+        cur.execute("DELETE FROM receipt_request_events WHERE tenant=? AND period=?;", (tenant, period_norm))
     else:
         cur.execute("DELETE FROM recibo_estado WHERE tenant=?;", (tenant,))
+        cur.execute("DELETE FROM message_status WHERE tenant=?;", (tenant,))
+        cur.execute("DELETE FROM sent_pdfs WHERE tenant=?;", (tenant,))
+        cur.execute("DELETE FROM receipt_request_events WHERE tenant=?;", (tenant,))
 
     conn.commit()
     conn.close()
