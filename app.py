@@ -2043,20 +2043,20 @@ def generate_pdf_report_v2(tenant: str, period_filter: str = ""):
     # ========= Estado ÚNICO con jerarquía =========
     def classify_status(r: dict) -> str:
         resp = (r.get("Respuesta", "") or "").strip().upper()
-        sent = r.get("_sent_ts", 0) > 0
-        last_status = (r.get("_last_status","") or "").strip().upper()
+
+        # "Se envió" = cualquier evidencia de PDF en status:
+        any_sent = (
+            _safe_int(r.get("_sent_ts")) > 0
+            or _safe_int(r.get("_delivered_ts")) > 0
+            or _safe_int(r.get("_read_ts")) > 0
+        )
 
         if resp == "FIRMADO":
             return "FIRMADO"
         if resp == "OBSERVADO":
             return "OBSERVADO"
 
-        # Si ya está en "A_FINALIZAR" o si simplemente se envió el PDF,
-        # y no hubo respuesta, lo consideramos pendiente de respuesta.
-        if last_status == "A_FINALIZAR":
-            return "PEND. RESPUESTA"
-
-        if sent and resp == "":
+        if any_sent:
             return "PEND. RESPUESTA"
 
         return "PEND. ENVÍO"
