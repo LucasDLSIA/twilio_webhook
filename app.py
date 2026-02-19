@@ -4162,30 +4162,36 @@ def twilio_webhook():
 def admin_reset_tenant():
     token = _get_admin_token_from_request()
     tenant = (request.form.get("tenant") or "").strip().lower()
-    period = (request.form.get("period") or "").strip()  # opcional
-    period_norm = norm_period_label(period) if period else ""
+    period_raw = (request.form.get("period") or "").strip()
 
     if not tenant:
         return Response("Falta tenant", status=400)
 
+    # Siempre limpiar pendings del tenant
     conn = get_db_connection()
     cur = conn.cursor()
-
-    # siempre limpiamos pendings de esa empresa (independiente del período)
     cur.execute("DELETE FROM pending_views WHERE tenant=?;", (tenant,))
 
-    if period_norm:
-        # ✅ firma/obs
-        cur.execute("DELETE FROM recibo_estado WHERE tenant=? AND period=?;", (tenant, period_norm))
+    if period_raw:
+        p_norm = norm_period_label(period_raw)  # MM/AAAA
+        # si no se pudo normalizar, usamos el raw igual
+        candidates = set([period_raw])
 
-        # ✅ tracking de estados (template/pdf delivered/read/failed)
-        cur.execute("DELETE FROM message_status WHERE tenant=? AND period=?;", (tenant, period_norm))
+        if p_norm:
+            candidates.add(p_norm)
+            candidates.add(p_norm.replace("/", "-"))  # MM-AAAA (legacy)
 
-        # ✅ registro del pdf enviado
-        cur.execute("DELETE FROM sent_pdfs WHERE tenant=? AND period=?;", (tenant, period_norm))
+        # También cubrimos el caso inverso: si mandan MM-AAAA, generamos MM/AAAA
+        if "-" in period_raw and not p_norm:
+            # por las dudas
+            candidates.add(period_raw.replace("-", "/"))
 
-        # ✅ auditoría/eventos de pedidos
-        cur.execute("DELETE FROM receipt_request_events WHERE tenant=? AND period=?;", (tenant, period_norm))
+        # borramos en todas las tablas por cada candidato
+        for p in candidates:
+            cur.execute("DELETE FROM recibo_estado WHERE tenant=? AND period=?;", (tenant, p))
+            cur.execute("DELETE FROM message_status WHERE tenant=? AND period=?;", (tenant, p))
+            cur.execute("DELETE FROM sent_pdfs WHERE tenant=? AND period=?;", (tenant, p))
+            cur.execute("DELETE FROM receipt_request_events WHERE tenant=? AND period=?;", (tenant, p))
     else:
         cur.execute("DELETE FROM recibo_estado WHERE tenant=?;", (tenant,))
         cur.execute("DELETE FROM message_status WHERE tenant=?;", (tenant,))
@@ -4195,7 +4201,10 @@ def admin_reset_tenant():
     conn.commit()
     conn.close()
 
-    return redirect(f"/admin/panel?tenant={tenant}&token={token}&msg=reset_ok")
+    # devolvemos SIEMPRE el normalizado para que el panel quede prolijo
+    p_show = norm_period_label(period_raw) if period_raw else ""
+    return redirect(f"/admin/panel?tenant={tenant}&token={token}&msg=reset_ok&period={p_show or period_raw}")
+
 
 from flask import redirect
 
