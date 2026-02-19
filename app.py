@@ -1891,7 +1891,8 @@ def generate_pdf_report_v2(tenant: str, period_filter: str = ""):
     cur.execute("""
         SELECT
             to_whatsapp, tenant, cuil, period, nombre, kind,
-            created_at, delivered_at, read_at, failed_at
+            created_at, delivered_at, read_at, failed_at,
+            last_status, last_status_at
         FROM message_status
         WHERE tenant = ?
     """, (tenant,))
@@ -1953,7 +1954,8 @@ def generate_pdf_report_v2(tenant: str, period_filter: str = ""):
                 "Respuesta": "",          # se usa solo para clasificar, no se imprime
                 "Pedidos": 0,
                 "Ultimo_pedido": "",
-
+                "_last_status": "",
+                "_last_status_at": 0,
                 "_sent_ts": 0,
                 "_delivered_ts": 0,
                 "_read_ts": 0,
@@ -1979,6 +1981,15 @@ def generate_pdf_report_v2(tenant: str, period_filter: str = ""):
         k = (wpp, per)
         _ensure(k, {"Periodo": per, "Nombre": nombre, "CUIL": cuil, "WhatsApp": wpp})
         rec = agg[k]
+
+        last_status = (row["last_status"] or "").strip().upper()
+        last_status_at = _safe_int(row["last_status_at"])
+
+        # guardar el last_status más reciente
+        if last_status and last_status_at >= rec.get("_last_status_at", 0):
+            rec["_last_status"] = last_status
+            rec["_last_status_at"] = last_status_at
+            rec["_last_ts"] = max(rec["_last_ts"], last_status_at)
 
         if nombre and not rec["Nombre"]:
             rec["Nombre"] = nombre
@@ -2033,19 +2044,22 @@ def generate_pdf_report_v2(tenant: str, period_filter: str = ""):
     def classify_status(r: dict) -> str:
         resp = (r.get("Respuesta", "") or "").strip().upper()
         sent = r.get("_sent_ts", 0) > 0
-        read = r.get("_read_ts", 0) > 0
+        last_status = (r.get("_last_status","") or "").strip().upper()
 
         if resp == "FIRMADO":
             return "FIRMADO"
         if resp == "OBSERVADO":
             return "OBSERVADO"
-        if read and resp == "":
+
+        # Si ya está en "A_FINALIZAR" o si simplemente se envió el PDF,
+        # y no hubo respuesta, lo consideramos pendiente de respuesta.
+        if last_status == "A_FINALIZAR":
             return "PEND. RESPUESTA"
-        if not sent:
-            return "PEND. ENVÍO"
-        if sent and not read and resp == "":
-            return "PEND. LECTURA"
-        return resp or "OK"
+
+        if sent and resp == "":
+            return "PEND. RESPUESTA"
+
+        return "PEND. ENVÍO"
 
     for r in rows:
         r["_status"] = classify_status(r)
