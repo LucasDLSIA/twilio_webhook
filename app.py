@@ -706,6 +706,10 @@ def twilio_status():
 
         if row:
             tenant, cuil, period, to_whatsapp, sign_sent_at, origin = row
+            tenant = (tenant or "").strip().lower()
+            cuil = norm_cuil(cuil)
+            period = norm_period_label(period)
+
 
             # ✅ Marcar A_FINALIZAR al entregar (pero NO pisar si ya está FIRMADO/OBSERVADO)
             cur.execute("""
@@ -1912,7 +1916,7 @@ def generate_pdf_report_v2(tenant: str, period_filter: str = ""):
     # ========= maps (más reciente por key) =========
     estado_map = {}
     for r in estado_rows:
-        c = (r["cuil"] or "").strip()
+        c = norm_cuil(r["cuil"])
         p = norm_period_label(r["period"] or "")
         ts = _safe_int(r["updated_at"])
         if not (c and p):
@@ -1924,7 +1928,7 @@ def generate_pdf_report_v2(tenant: str, period_filter: str = ""):
 
     rr_map = {}
     for r in rr_rows:
-        c = (r["cuil"] or "").strip()
+        c = norm_cuil(r["cuil"])
         p = norm_period_label(r["period"] or "")
         w = (r["to_whatsapp"] or "").strip()
         ts = _safe_int(r["last_requested_at"])
@@ -1964,7 +1968,7 @@ def generate_pdf_report_v2(tenant: str, period_filter: str = ""):
         if not wpp:
             continue
 
-        cuil = (row["cuil"] or "").strip()
+        cuil = norm_cuil(row["cuil"])
         nombre = (row["nombre"] or "").strip()
         per = norm_period_label((row["period"] or "").strip())
         if period_filter and per != period_filter:
@@ -2499,17 +2503,21 @@ def consume_pending_view(pending_id: int):
     conn.close()
 
 def set_recibo_estado(tenant: str, cuil: str, period: str, estado: str):
+    tenant = (tenant or "").strip().lower()
+    cuil = norm_cuil(cuil)
+    period = norm_period_label(period)
+    estado = (estado or "").strip().upper()
+
     conn = get_db_connection()
     cur = conn.cursor()
     now = int(time.time())
 
-    # Si ya está FIRMADO, no se cambia nunca más
     cur.execute("""
         SELECT estado FROM recibo_estado
         WHERE tenant=? AND cuil=? AND period=?
     """, (tenant, cuil, period))
     row = cur.fetchone()
-    if row and row[0] == "FIRMADO":
+    if row and (row[0] or "").strip().upper() == "FIRMADO":
         conn.close()
         return
 
@@ -2525,6 +2533,10 @@ def set_recibo_estado(tenant: str, cuil: str, period: str, estado: str):
 
 
 def get_recibo_estado(tenant: str, cuil: str, period: str):
+    tenant = (tenant or "").strip().lower()
+    cuil = norm_cuil(cuil)
+    period = norm_period_label(period)
+
     conn = get_db_connection()
     conn.row_factory = sqlite3.Row
     cur = conn.cursor()
@@ -2535,7 +2547,7 @@ def get_recibo_estado(tenant: str, cuil: str, period: str):
     """, (tenant, cuil, period))
     row = cur.fetchone()
     conn.close()
-    return row["estado"] if row else None
+    return (row["estado"].strip().upper() if row and row["estado"] else None)
 
 import requests
 
@@ -3044,14 +3056,14 @@ def generate_excel_report_v2(tenant: str, period_filter: str = "") -> BytesIO:
 
     estado_map = {}
     for r in estado_rows:
-        c = (r["cuil"] or "").strip()
+        c = norm_cuil(r["cuil"])
         p = norm_period_label(r["period"] or "")
         if c and p:
             estado_map[(c, p)] = {"estado": (r["estado"] or "").strip(), "ts": r["updated_at"]}
 
     rr_map = {}
     for r in rr_rows:
-        c = (r["cuil"] or "").strip()
+        c = norm_cuil(r["cuil"])
         p = norm_period_label(r["period"] or "")
         w = (r["to_whatsapp"] or "").strip()
         if c and p and w:
@@ -3070,7 +3082,7 @@ def generate_excel_report_v2(tenant: str, period_filter: str = "") -> BytesIO:
         if not wpp:
             continue
 
-        cuil = (row["cuil"] or "").strip()
+        cuil = norm_cuil(row["cuil"])
         nombre = (row["nombre"] or "").strip()
 
         period_raw = (row["period"] or "").strip()
