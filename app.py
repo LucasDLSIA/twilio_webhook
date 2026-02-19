@@ -4210,31 +4210,62 @@ from flask import redirect
 
 from flask import redirect
 
+def _period_candidates(period_raw: str) -> list[str]:
+    period_raw = (period_raw or "").strip()
+    if not period_raw:
+        return []
+    p_norm = norm_period_label(period_raw)  # MM/AAAA o ""
+    s = {period_raw}
+    if p_norm:
+        s.add(p_norm)
+        s.add(p_norm.replace("/", "-"))
+    else:
+        # si no normaliza, probamos el cambio simple
+        s.add(period_raw.replace("-", "/"))
+        s.add(period_raw.replace("/", "-"))
+    return sorted(x for x in s if x)
+
 @app.post("/admin/reset")
 @admin_required
 def admin_reset():
     token = _get_admin_token_from_request()
     tenant = (request.form.get("tenant") or "").strip().lower()
-    period = (request.form.get("period") or "").strip()
+    period_raw = (request.form.get("period") or "").strip()
 
     if not tenant:
         return Response("Falta tenant", status=400)
 
+    periods = _period_candidates(period_raw)
+
     conn = get_db_connection()
     cur = conn.cursor()
 
-    # Limpia pending siempre
-    if period:
-        cur.execute("DELETE FROM pending_views WHERE tenant=? AND period=?;", (tenant, period))
-        cur.execute("DELETE FROM recibo_estado WHERE tenant=? AND period=?;", (tenant, period))
+    # helper para loguear
+    def _del(sql, args):
+        cur.execute(sql, args)
+        print("RESET:", sql.split("\n")[0][:60], "args=", args, "deleted=", cur.rowcount)
+
+    # ✅ SIEMPRE: limpiar pendings SOLO del tenant
+    _del("DELETE FROM pending_views WHERE tenant=?;", (tenant,))
+
+    if periods:
+        for p in periods:
+            _del("DELETE FROM recibo_estado WHERE tenant=? AND period=?;", (tenant, p))
+            _del("DELETE FROM message_status WHERE tenant=? AND period=?;", (tenant, p))
+            _del("DELETE FROM sent_pdfs WHERE tenant=? AND period=?;", (tenant, p))
+            _del("DELETE FROM receipt_request_events WHERE tenant=? AND period=?;", (tenant, p))
     else:
-        cur.execute("DELETE FROM pending_views WHERE tenant=?;", (tenant,))
-        cur.execute("DELETE FROM recibo_estado WHERE tenant=?;", (tenant,))
+        _del("DELETE FROM recibo_estado WHERE tenant=?;", (tenant,))
+        _del("DELETE FROM message_status WHERE tenant=?;", (tenant,))
+        _del("DELETE FROM sent_pdfs WHERE tenant=?;", (tenant,))
+        _del("DELETE FROM receipt_request_events WHERE tenant=?;", (tenant,))
 
     conn.commit()
     conn.close()
 
-    return redirect(f"/admin/panel?tenant={tenant}&token={token}&msg=reset_ok&period={period}")
+    # mostrás el período normalizado si venía uno
+    p_show = norm_period_label(period_raw) if period_raw else ""
+    return redirect(f"/admin/panel?tenant={tenant}&token={token}&msg=reset_ok&period={p_show}")
 
 def queue_template_send(tenant: str, period: str, to_whatsapp: str, cuil: str,
                         nombre: str = "", require_pdf: bool = True) -> str:
