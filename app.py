@@ -2720,19 +2720,56 @@ def admin_home():
       padding:10px 12px;border-radius:12px;
       color: var(--text);
     }
+
+    /* --- Blur empresas (selector /admin) --- */
+    .secret-blur{
+      filter: blur(6px);
+      transition: .2s ease;
+      user-select: none;
+    }
+    .secret-show{
+      filter: blur(0);
+    }
+    .tile-head{
+      display:flex;
+      align-items:flex-start;
+      justify-content:space-between;
+      gap:10px;
+    }
+    .eye-btn{
+      width: 36px;
+      height: 36px;
+      border-radius: 10px;
+      border: 1px solid var(--line);
+      background: rgba(255,255,255,.04);
+      color: var(--text);
+      cursor: pointer;
+      display:inline-flex;
+      align-items:center;
+      justify-content:center;
+      flex: 0 0 auto;
+    }
+    .eye-btn:hover{ background: rgba(255,255,255,.08); }
   </style>
 </head>
 <body>
 <div class="wrap">
 """)
 
+    # Topbar
     html.append("<div class='topbar'>")
     html.append("<div>")
     html.append("<h2>Panel Admin</h2>")
     html.append("<div class='muted'>Elegí la empresa para abrir el panel.</div>")
     html.append("</div>")
+
+    # Ojo general + token
+    html.append("<div class='row' style='gap:10px;justify-content:flex-end'>")
+    html.append("<button class='eye-btn' type='button' id='eyeAll' title='Mostrar/ocultar todas'>👁️</button>")
     html.append(f"<div class='muted'>Token: <code>{esc(token)}</code></div>")
     html.append("</div>")
+
+    html.append("</div>")  # topbar
 
     # Warning si falta master
     if not EMPRESAS_FILE_ID:
@@ -2764,9 +2801,15 @@ def admin_home():
             test_url = f"/admin/send_test?tenant={esc(slug)}&token={esc(token)}"
 
             html.append(f"""
-              <div class="tile" data-name="{esc(name).lower()} {esc(slug).lower()}">
-                <h3>{esc(name)}</h3>
-                <div class="muted">tenant: <code>{esc(slug)}</code></div>
+              <div class="tile" data-name="{esc(name).lower()} {esc(slug).lower()}" data-tenant="{esc(slug)}">
+                <div class="tile-head">
+                  <div>
+                    <h3 class="company-name secret-blur" data-tenant="{esc(slug)}">{esc(name)}</h3>
+                    <div class="muted company-tenant secret-blur" data-tenant="{esc(slug)}">tenant: <code>{esc(slug)}</code></div>
+                  </div>
+                  <button class="eye-btn eye-one" type="button" data-tenant="{esc(slug)}" title="Mostrar solo esta">👁️</button>
+                </div>
+
                 <div class="actions">
                   <a class="btn" href="{panel_url}">Abrir panel →</a>
                   <a class="btn secondary small" href="{test_url}">🧪 Prueba</a>
@@ -2776,12 +2819,67 @@ def admin_home():
 
         html.append("</div>")  # grid
 
-        # JS filtro
+        # JS filtro + blur/ojos
         html.append("""
         <script>
           (function(){
             const q = document.getElementById('q');
             const tiles = Array.from(document.querySelectorAll('#grid .tile'));
+
+            const eyeAll = document.getElementById('eyeAll');
+            const names  = Array.from(document.querySelectorAll('.company-name'));
+            const tenants= Array.from(document.querySelectorAll('.company-tenant'));
+            const eyeOne = Array.from(document.querySelectorAll('.eye-one'));
+
+            function blurAll(){
+              [...names, ...tenants].forEach(el => {
+                el.classList.add('secret-blur');
+                el.classList.remove('secret-show');
+              });
+              if(eyeAll) eyeAll.textContent = "👁️";
+            }
+
+            function showAll(){
+              [...names, ...tenants].forEach(el => {
+                el.classList.remove('secret-blur');
+                el.classList.add('secret-show');
+              });
+              if(eyeAll) eyeAll.textContent = "🙈";
+            }
+
+            function showOnly(tenant){
+              blurAll();
+              [...names, ...tenants].forEach(el => {
+                if(el.getAttribute('data-tenant') === tenant){
+                  el.classList.remove('secret-blur');
+                  el.classList.add('secret-show');
+                }
+              });
+            }
+
+            // Default: todo blureado
+            blurAll();
+
+            // Ojo general
+            if(eyeAll){
+              eyeAll.addEventListener('click', () => {
+                const anyHidden = [...names, ...tenants].some(el => !el.classList.contains('secret-show'));
+                if(anyHidden) showAll();
+                else blurAll();
+              });
+            }
+
+            // Ojo por empresa: muestra SOLO esa
+            eyeOne.forEach(btn => {
+              btn.addEventListener('click', (e) => {
+                e.preventDefault();
+                e.stopPropagation();
+                const tenant = btn.getAttribute('data-tenant') || '';
+                showOnly(tenant);
+              });
+            });
+
+            // Filtro (tu lógica original)
             function apply(){
               const s = (q.value || '').trim().toLowerCase();
               for(const t of tiles){
@@ -2790,6 +2888,11 @@ def admin_home():
               }
             }
             q.addEventListener('input', apply);
+
+            // Opcional: al cambiar de pestaña, volver a ocultar
+            document.addEventListener("visibilitychange", () => {
+              if(document.hidden) blurAll();
+            });
           })();
         </script>
         """)
@@ -2798,7 +2901,6 @@ def admin_home():
 
     html.append("</div></body></html>")
     return Response("".join(html), mimetype="text/html")
-
 
 from flask import send_file
 import pandas as pd
