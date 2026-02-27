@@ -5091,7 +5091,7 @@ def twilio_inbound():
 
         n = inc_receipt_request_count(tenant, cuil, period, from_whatsapp)
         _log_receipt_request_event(tenant, cuil, period, from_whatsapp, "DNI_OK", "SENT", message_sid=sid_pdf, origin=origin)
-        return twiml(f"✅ DNI verificado. Te envío el recibo ahora. (Pedido {n}/3)")
+        return twiml(f"✅ DNI verificado.")
 
     # =========================
     # VIEW_NOW
