@@ -4945,6 +4945,43 @@ def twilio_inbound():
 
     pending = get_latest_pending_view(from_whatsapp)
     print("PENDING:", pending)
+        # =========================
+    # SEE_PREVIOUS debe funcionar incluso sin pending
+    # y SIEMPRE excluir el mes corriente
+    # =========================
+    if button == "SEE_PREVIOUS":
+        # 1) intentamos tomar contexto del pending si existe
+        if pending and isinstance(pending, dict):
+            tenant0 = (pending.get("tenant") or "").strip().lower()
+            cuil0 = (pending.get("cuil") or "").strip()
+        else:
+            # 2) si no hay pending, reconstruimos desde ctx (SIN resolve_best_period...)
+            ctx = get_latest_context_for_whatsapp(from_whatsapp)
+            if not ctx:
+                return twiml("👋 Para ver períodos anteriores, necesitás el mensaje inicial de RRHH. Si no lo tenés, avisá a RRHH.")
+
+            tenant0 = (ctx.get("tenant") or "").strip().lower()
+            cuil0 = (ctx.get("cuil") or "").strip()
+
+            if not (tenant0 and cuil0):
+                return twiml("👋 No pude identificar tu recibo. Avisá a RRHH.")
+
+        prev = list_previous_periods_excluding_current(tenant0, cuil0, limit=3)
+
+        if not prev:
+            return twiml("ℹ️ No tengo períodos anteriores disponibles para tu CUIL.")
+
+        # aseguramos pending para que la respuesta 1/2/3 funcione
+        # usamos como period base el primero de prev (el más nuevo anterior al mes actual)
+        add_pending_view(from_whatsapp, tenant0, cuil0, prev[0], origin="SEE_PREVIOUS")
+        pending = get_latest_pending_view(from_whatsapp)
+        set_pending_step(pending["id"], "CHOOSE_PREVIOUS")
+
+        msg = "🗂️ Períodos anteriores:\n\n"
+        for i, p in enumerate(prev, start=1):
+            msg += f"{i}. {p}\n"
+        msg += "\nRespondé con 1, 2 o 3 para elegir."
+        return twiml(msg)
 
     # =========================
     # REGLA: cualquier texto (sin botón) dispara menú,
@@ -5065,43 +5102,6 @@ def twilio_inbound():
         _log_receipt_request_event(tenant, cuil, best_period, from_whatsapp, "RESEND_LAST", "SENT", message_sid=sid_pdf, origin="RESEND_LAST")
         return Response("OK", status=200)
 
-    # =========================
-    # SEE_PREVIOUS debe funcionar incluso sin pending
-    # y SIEMPRE excluir el mes corriente
-    # =========================
-    if button == "SEE_PREVIOUS":
-        # 1) intentamos tomar contexto del pending si existe
-        if pending and isinstance(pending, dict):
-            tenant0 = (pending.get("tenant") or "").strip().lower()
-            cuil0 = (pending.get("cuil") or "").strip()
-        else:
-            # 2) si no hay pending, reconstruimos desde ctx (SIN resolve_best_period...)
-            ctx = get_latest_context_for_whatsapp(from_whatsapp)
-            if not ctx:
-                return twiml("👋 Para ver períodos anteriores, necesitás el mensaje inicial de RRHH. Si no lo tenés, avisá a RRHH.")
-
-            tenant0 = (ctx.get("tenant") or "").strip().lower()
-            cuil0 = (ctx.get("cuil") or "").strip()
-
-            if not (tenant0 and cuil0):
-                return twiml("👋 No pude identificar tu recibo. Avisá a RRHH.")
-
-        prev = list_previous_periods_excluding_current(tenant0, cuil0, limit=3)
-
-        if not prev:
-            return twiml("ℹ️ No tengo períodos anteriores disponibles para tu CUIL.")
-
-        # aseguramos pending para que la respuesta 1/2/3 funcione
-        # usamos como period base el primero de prev (el más nuevo anterior al mes actual)
-        add_pending_view(from_whatsapp, tenant0, cuil0, prev[0], origin="SEE_PREVIOUS")
-        pending = get_latest_pending_view(from_whatsapp)
-        set_pending_step(pending["id"], "CHOOSE_PREVIOUS")
-
-        msg = "🗂️ Períodos anteriores:\n\n"
-        for i, p in enumerate(prev, start=1):
-            msg += f"{i}. {p}\n"
-        msg += "\nRespondé con 1, 2 o 3 para elegir."
-        return twiml(msg)
 
     # =========================
     # SELECCIÓN de período anterior (1/2/3) cuando step=CHOOSE_PREVIOUS
@@ -5109,8 +5109,7 @@ def twilio_inbound():
     if step == "CHOOSE_PREVIOUS" and (not button) and (body or "").strip() in ("1", "2", "3"):
         idx = int((body or "").strip()) - 1
 
-        periods = list_periods_for_cuil2(tenant, strip_pdf(cuil)) or []
-        prev = periods[1:4]
+        prev = list_previous_periods_excluding_current(tenant, cuil, limit=3)
         if idx >= len(prev):
             return twiml("❌ Opción inválida. Respondé con 1, 2 o 3.")
 
