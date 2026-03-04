@@ -4906,6 +4906,18 @@ def send_whatsapp_menu_template(to_whatsapp: str, nombre: str = "") -> str | Non
         print("ERROR send_whatsapp_menu_template:", e, "vars_=", vars_)
         return None
 
+def list_previous_periods_excluding_current(tenant: str, cuil: str, limit: int = 3) -> list[str]:
+    import datetime as _dt
+
+    now = _dt.datetime.now()
+    current = f"{now.month:02d}/{now.year:04d}"   # ej "03/2026"
+
+    periods = list_periods_for_cuil2(tenant, cuil) or []  # ya viene ordenado desc
+    # sacamos el mes corriente si aparece
+    periods = [p for p in periods if (p or "").replace("-", "/") != current]
+
+    # ahora periods[0] es el último real anterior al mes actual
+    return periods[:limit]
 
 TWILIO_SIGN_TEMPLATE_SID = os.environ.get("TWILIO_SIGN_TEMPLATE_SID", "").strip()
 
@@ -5053,14 +5065,36 @@ def twilio_inbound():
         _log_receipt_request_event(tenant, cuil, best_period, from_whatsapp, "RESEND_LAST", "SENT", message_sid=sid_pdf, origin="RESEND_LAST")
         return Response("OK", status=200)
 
-    # SEE_PREVIOUS -> ofrece hasta 3 períodos anteriores (no envía PDF todavía)
+    # =========================
+    # SEE_PREVIOUS debe funcionar incluso sin pending
+    # y SIEMPRE excluir el mes corriente
+    # =========================
     if button == "SEE_PREVIOUS":
-        periods = list_periods_for_cuil2(tenant, strip_pdf(cuil)) or []
-        prev = periods[1:4]  # tres anteriores al último disponible
+        # 1) intentamos tomar contexto del pending si existe
+        if pending and isinstance(pending, dict):
+            tenant0 = (pending.get("tenant") or "").strip().lower()
+            cuil0 = (pending.get("cuil") or "").strip()
+        else:
+            # 2) si no hay pending, reconstruimos desde ctx (SIN resolve_best_period...)
+            ctx = get_latest_context_for_whatsapp(from_whatsapp)
+            if not ctx:
+                return twiml("👋 Para ver períodos anteriores, necesitás el mensaje inicial de RRHH. Si no lo tenés, avisá a RRHH.")
+
+            tenant0 = (ctx.get("tenant") or "").strip().lower()
+            cuil0 = (ctx.get("cuil") or "").strip()
+
+            if not (tenant0 and cuil0):
+                return twiml("👋 No pude identificar tu recibo. Avisá a RRHH.")
+
+        prev = list_previous_periods_excluding_current(tenant0, cuil0, limit=3)
 
         if not prev:
-            return twiml("ℹ️ Esta opción estará disponible próximamente.")
+            return twiml("ℹ️ No tengo períodos anteriores disponibles para tu CUIL.")
 
+        # aseguramos pending para que la respuesta 1/2/3 funcione
+        # usamos como period base el primero de prev (el más nuevo anterior al mes actual)
+        add_pending_view(from_whatsapp, tenant0, cuil0, prev[0], origin="SEE_PREVIOUS")
+        pending = get_latest_pending_view(from_whatsapp)
         set_pending_step(pending["id"], "CHOOSE_PREVIOUS")
 
         msg = "🗂️ Períodos anteriores:\n\n"
