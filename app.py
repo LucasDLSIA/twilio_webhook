@@ -426,6 +426,65 @@ def find_pdf_file_id_for_cuil_period(tenant: str, cuil: str, period: str) -> str
     return None
 
 
+from typing import List, Optional
+import re
+
+def list_periods_for_cuil2(tenant_slug: str, cuil: str) -> List[str]:
+    t = get_tenant(tenant_slug)
+    if not t:
+        return []
+
+    root_id = (t.get("recibos_root_id") or t.get("drive_root_id") or "").strip()
+    if not root_id:
+        return []
+
+    # normalizar cuil a 11 dígitos y con guiones
+    cuil_digits = norm_digits(strip_pdf(cuil).strip())
+    if len(cuil_digits) != 11:
+        return []
+
+    cuil_dash = format_cuil_with_dashes(cuil_digits)
+    filename_exact = f"{cuil_dash}.pdf"
+
+    service = drive_service()
+
+    folders = service.files().list(
+        q=f"'{root_id}' in parents and mimeType='application/vnd.google-apps.folder' and trashed=false",
+        fields="files(id,name)",
+        pageSize=1000,
+    ).execute().get("files", [])
+
+    periods = []
+    for f in folders:
+        label = parse_period_folder(f.get("name", ""))
+        if not label:
+            continue
+
+        # 1) exacto
+        q_exact = (
+            f"'{f['id']}' in parents and trashed=false "
+            f"and name='{filename_exact}'"
+        )
+        res = service.files().list(q=q_exact, fields="files(id)", pageSize=1).execute().get("files", [])
+        if res:
+            periods.append(label)
+            continue
+
+        # 2) fallback contains (por si cambia el prefijo/sufijo)
+        q_contains = (
+            f"'{f['id']}' in parents and trashed=false "
+            f"and mimeType='application/pdf' "
+            f"and name contains '{cuil_dash}'"
+        )
+        res2 = service.files().list(q=q_contains, fields="files(id)", pageSize=1).execute().get("files", [])
+        if res2:
+            periods.append(label)
+
+    def key(p: str):
+        mm, yyyy = p.split("/")
+        return int(yyyy) * 100 + int(mm)
+
+    return sorted(set(periods), key=key, reverse=True)
 
 def list_periods_for_cuil(tenant_slug: str, cuil: str) -> List[str]:
     t = get_tenant(tenant_slug)
@@ -4996,7 +5055,7 @@ def twilio_inbound():
 
     # SEE_PREVIOUS -> ofrece hasta 3 períodos anteriores (no envía PDF todavía)
     if button == "SEE_PREVIOUS":
-        periods = list_periods_for_cuil(tenant, strip_pdf(cuil)) or []
+        periods = list_periods_for_cuil2(tenant, strip_pdf(cuil)) or []
         prev = periods[1:4]  # tres anteriores al último disponible
 
         if not prev:
@@ -5016,7 +5075,7 @@ def twilio_inbound():
     if step == "CHOOSE_PREVIOUS" and (not button) and (body or "").strip() in ("1", "2", "3"):
         idx = int((body or "").strip()) - 1
 
-        periods = list_periods_for_cuil(tenant, strip_pdf(cuil)) or []
+        periods = list_periods_for_cuil2(tenant, strip_pdf(cuil)) or []
         prev = periods[1:4]
         if idx >= len(prev):
             return twiml("❌ Opción inválida. Respondé con 1, 2 o 3.")
