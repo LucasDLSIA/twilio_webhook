@@ -363,30 +363,28 @@ def format_cuil_with_dashes(cuil: str) -> str:
     return f"{d[0:2]}-{d[2:10]}-{d[10:11]}"
 
 
-def find_pdf_file_id_for_cuil_period(tenant: str, cuil: str, period: str) -> str | None:
+def find_pdf_file_id_for_cuil_period(tenant: str, cuil: str, period: str, *, quiet: bool = False) -> str | None:
     t = get_tenant(tenant)
     if not t:
-        print("❌ tenant inválido:", tenant)
+        if not quiet: print("❌ tenant inválido:", tenant)
         return None
 
     root_id = (t.get("recibos_root_id") or t.get("drive_root_id") or "").strip()
     if not root_id:
-        print("❌ tenant sin recibos_root_id:", tenant)
+        if not quiet: print("❌ tenant sin recibos_root_id:", tenant)
         return None
 
     cuil_digits = norm_digits(strip_pdf(cuil).strip())
     if len(cuil_digits) != 11:
-        print("❌ CUIL inválido:", cuil)
+        if not quiet: print("❌ CUIL inválido:", cuil)
         return None
 
     cuil_dash = format_cuil_with_dashes(cuil_digits)
     filename_exact = f"{cuil_dash}.pdf"
-
     period_folder_name = normalize_period_for_drive((period or "").strip())
 
     service = drive_service()
 
-    # 1) carpeta período
     q_folder = (
         f"'{root_id}' in parents and trashed=false "
         f"and mimeType='application/vnd.google-apps.folder' "
@@ -395,22 +393,18 @@ def find_pdf_file_id_for_cuil_period(tenant: str, cuil: str, period: str) -> str
     res = service.files().list(q=q_folder, fields="files(id,name)", pageSize=5).execute()
     folders = res.get("files", [])
     if not folders:
-        print(f"❌ No encontré carpeta período '{period_folder_name}' en root {root_id}")
+        if not quiet:
+            print(f"❌ No encontré carpeta período '{period_folder_name}' en root {root_id}")
         return None
 
     period_id = folders[0]["id"]
 
-    # 2a) buscar exacto (xx-xxxxxxxx-x.pdf)
-    q_pdf_exact = (
-        f"'{period_id}' in parents and trashed=false "
-        f"and name='{filename_exact}'"
-    )
+    q_pdf_exact = f"'{period_id}' in parents and trashed=false and name='{filename_exact}'"
     res2 = service.files().list(q=q_pdf_exact, fields="files(id,name)", pageSize=5).execute()
     files = res2.get("files", [])
     if files:
         return files[0]["id"]
 
-    # 2b) fallback robusto: pdf + contiene el cuil con guiones
     q_pdf_contains = (
         f"'{period_id}' in parents and trashed=false "
         f"and mimeType='application/pdf' "
@@ -419,12 +413,11 @@ def find_pdf_file_id_for_cuil_period(tenant: str, cuil: str, period: str) -> str
     res3 = service.files().list(q=q_pdf_contains, fields="files(id,name)", pageSize=10).execute()
     files2 = res3.get("files", [])
     if files2:
-        # si hay más de uno, agarramos el primero (podés ordenar por modifiedTime si querés)
         return files2[0]["id"]
 
-    print(f"❌ No encontré {filename_exact} (ni variantes) dentro de carpeta período {period_folder_name} ({period_id})")
+    if not quiet:
+        print(f"❌ No encontré {filename_exact} dentro de carpeta período {period_folder_name} ({period_id})")
     return None
-
 
 from typing import List, Optional
 import re
@@ -883,38 +876,36 @@ def get_latest_context_for_whatsapp(to_whatsapp: str) -> dict | None:
     return dict(row) if row else None
 
 
-def resolve_best_period_with_pdf(tenant: str, cuil: str) -> str | None:
+def resolve_best_period_with_pdf(tenant: str, cuil: str, *, max_months_back: int = 36) -> str | None:
     """
-    Devuelve:
-      - mes actual si existe PDF
-      - si no, el último período disponible con PDF
+    Devuelve el período MÁS CERCANO a hoy con PDF:
+      - prueba mes actual
+      - si no, mes anterior, y así hacia atrás hasta encontrar.
     """
     import datetime as _dt
+
+    def add_months(dt: _dt.datetime, delta_months: int) -> _dt.datetime:
+        # delta_months negativo para ir hacia atrás
+        y = dt.year + (dt.month - 1 + delta_months) // 12
+        m = (dt.month - 1 + delta_months) % 12 + 1
+        return _dt.datetime(y, m, 1)
+
     now = _dt.datetime.now()
 
-    current = f"{now.month:02d}/{now.year:04d}"
+    for back in range(0, max_months_back + 1):
+        d = add_months(now, -back)
+        period = f"{d.month:02d}/{d.year:04d}"
 
-    # 1) Mes actual (si existe)
-    try:
-        fid = find_pdf_file_id_for_cuil_period(tenant, cuil, current)
+        # quiet=True para que no te tire ❌ por cada mes que no exista
+        try:
+            fid = find_pdf_file_id_for_cuil_period(tenant, cuil, period, quiet=True)
+        except Exception:
+            fid = None
+
         if fid:
-            return current
-    except Exception:
-        pass  # no existe carpeta/periodo -> seguimos
+            return period
 
-    # 2) Último período disponible
-    periods = []
-    try:
-        periods = list_periods_for_cuil(tenant, strip_pdf(cuil))  # debería devolverte algo tipo ["01/2026","12/2025",...]
-    except Exception:
-        periods = []
-
-    if not periods:
-        return None
-
-    # normalizamos por si vienen con "-" en vez de "/"
-    return (periods[0] or "").replace("-", "/")
-
+    return None
 
 def get_receipt_request_count(tenant: str, cuil: str, period: str, to_whatsapp: str) -> int:
     conn = get_db_connection()
