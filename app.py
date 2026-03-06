@@ -92,9 +92,17 @@ def norm_whatsapp(s: str) -> str:
     d = norm_digits(s)
     if not d:
         return ""
-    if d.startswith("54"):
+
+    # ya viene correcto
+    if d.startswith("549"):
         return "whatsapp:+" + d
-    return "whatsapp:+54" + d
+
+    # viene con 54 pero sin 9
+    if d.startswith("54"):
+        return "whatsapp:+549" + d[2:]
+
+    # número local
+    return "whatsapp:+549" + d
 
 def parse_period_folder(name: str) -> Optional[str]:
     """
@@ -3004,12 +3012,16 @@ def normalize_whatsapp(raw: str) -> str | None:
       - '+54911...'
       - '11 3622-2572'
       - '1136222572'
+      - '2323 555360'
+
     Devuelve:
-      - 'whatsapp:+54XXXXXXXXXXX'
+      - 'whatsapp:+549XXXXXXXXXX'
     """
+
     s = (raw or "").strip()
     if not s:
         return None
+
     if s.startswith("whatsapp:"):
         s = s.replace("whatsapp:", "").strip()
 
@@ -3017,11 +3029,17 @@ def normalize_whatsapp(raw: str) -> str | None:
     if not d:
         return None
 
-    # Argentina default: si no empieza con 54, lo agregamos
-    if not d.startswith("54"):
-        d = "54" + d
+    # ya viene correcto
+    if d.startswith("549"):
+        return f"whatsapp:+{d}"
 
-    return f"whatsapp:+{d}"
+    # viene con 54 pero sin 9
+    if d.startswith("54"):
+        return f"whatsapp:+549{d[2:]}"
+
+    # número local
+    return f"whatsapp:+549{d}"
+
 
 def ts_str(ts: int | None) -> str:
     if not ts:
