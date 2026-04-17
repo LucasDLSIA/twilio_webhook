@@ -4803,7 +4803,7 @@ def admin_send_test():
         return Response("Tenant inválido", status=400)
 
     html = []
-    html.append("<h2>Envío de prueba (1 persona)</h2>")
+    html.append("<h2>Envío individual</h2>")
     html.append(f"<p><b>Empresa:</b> {esc(t['display_name'])}</p>")
     html.append(f"<p><a href='/admin?token={esc(token)}'>← volver</a></p>")
 
@@ -4820,7 +4820,7 @@ def admin_send_test():
         <input type="text" name="period" value="{esc(period)}" required>
       </label><br><br>
 
-      <button type="submit">Enviar plantilla (prueba)</button>
+      <button type="submit">Enviar plantilla</button>
     </form>
     """)
 
@@ -4847,9 +4847,14 @@ def admin_send_test():
 
         html.append(f"<p>📄 PDF disponible para {esc(period)}</p>")
 
+        # Chequeamos si ya se envió para no duplicar
+        if already_sent_template(tenant, cuil, period, phone):
+            html.append(f"<p style='color:orange'>⚠️ Ya se envió la plantilla a esta persona para el período {esc(period)}. No se reenvía para evitar duplicados.</p>")
+            html.append(f"<p><a href='/admin/panel?tenant={esc(tenant)}&token={esc(token)}'>← Volver al panel</a></p>")
+            return Response("".join(html), mimetype="text/html")
+
         # Guardamos pending view ANTES del click VIEW_NOW
         add_pending_view(phone, tenant, cuil, period, origin="INITIAL")
-
 
         # Enviamos plantilla con botón VIEW_NOW (abre conversación)
         try:
@@ -4860,12 +4865,17 @@ def admin_send_test():
                     "2": period,
                 },
                 template_sid=TWILIO_TEMPLATE_SID or None,
+                status_callback=STATUS_CALLBACK_URL,   # ← AGREGADO: para que llegue el callback de estado
             )
+
+            # ✅ Grabamos en message_status para que aparezca en reportes
+            save_template_sid(tenant, cuil, period, phone, sid_tpl, nombre=person.get("nombre", ""))
+
             html.append(f"<p style='color:green'>✅ Plantilla enviada. SID: {esc(sid_tpl)}</p>")
         except Exception as e:
             html.append(f"<p style='color:red'>❌ Error enviando plantilla: {esc(str(e))}</p>")
             return Response("".join(html), mimetype="text/html")
-
+        
         # Debug: URL del PDF (Twilio la va a pedir cuando toque VIEW_NOW)
         pdf_url = (
             f"{request.host_url.rstrip('/')}/media/pdf"
