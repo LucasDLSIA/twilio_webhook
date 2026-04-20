@@ -689,132 +689,138 @@ def twilio_status():
     if not sid:
         return Response("OK", status=200)
 
-    with db_conn() as conn:
-        cur = conn.cursor()
+    conn = get_db_connection()
+    cur = conn.cursor()
 
-        # 1) intentar update (si existe fila)
+    # 1) intentar update (si existe fila)
+    cur.execute("""
+        UPDATE message_status
+        SET last_status = ?, last_status_at = ?,
+            error_code = CASE WHEN ? != '' THEN ? ELSE error_code END,
+            error_message = CASE WHEN ? != '' THEN ? ELSE error_message END
+        WHERE message_sid = ?
+    """, (status, now, error_code, error_code, error_message, error_message, sid))
+
+    # 2) ✅ si no existía, crearla desde sent_pdfs (caso PDF/media)
+    if cur.rowcount == 0:
+        cur.execute("""
+            SELECT tenant, cuil, period, to_whatsapp
+            FROM sent_pdfs
+            WHERE message_sid = ?
+            LIMIT 1
+        """, (sid,))
+        r = cur.fetchone()
+
+        if r:
+            tenant, cuil, period, to_whatsapp = r
+            # creamos fila mínima en message_status para que el callback pueda registrar delivered/read
+            cur.execute("""
+                INSERT OR IGNORE INTO message_status
+                (message_sid, to_whatsapp, tenant, cuil, period, nombre, kind, created_at, last_status, last_status_at)
+                VALUES (?, ?, ?, ?, ?, '', 'media', ?, ?, ?)
+            """, (sid, to_whatsapp, tenant, cuil, period, now, status, now))
+
+            # volver a aplicar update (por si insertó recién)
+            cur.execute("""
+                UPDATE message_status
+                SET last_status = ?, last_status_at = ?,
+                    error_code = CASE WHEN ? != '' THEN ? ELSE error_code END,
+                    error_message = CASE WHEN ? != '' THEN ? ELSE error_message END
+                WHERE message_sid = ?
+            """, (status, now, error_code, error_code, error_message, error_message, sid))
+
+    # 3) timestamps por estado
+    if status == "delivered":
         cur.execute("""
             UPDATE message_status
-            SET last_status = ?, last_status_at = ?,
-                error_code = CASE WHEN ? != '' THEN ? ELSE error_code END,
-                error_message = CASE WHEN ? != '' THEN ? ELSE error_message END
+            SET delivered_at = COALESCE(delivered_at, ?)
             WHERE message_sid = ?
-        """, (status, now, error_code, error_code, error_message, error_message, sid))
+        """, (now, sid))
 
-        # 2) ✅ si no existía, crearla desde sent_pdfs (caso PDF/media)
-        if cur.rowcount == 0:
-            cur.execute("""
-                SELECT tenant, cuil, period, to_whatsapp
-                FROM sent_pdfs
-                WHERE message_sid = ?
-                LIMIT 1
-            """, (sid,))
-            r = cur.fetchone()
+    if status == "read":
+        cur.execute("""
+            UPDATE message_status
+            SET read_at = COALESCE(read_at, ?)
+            WHERE message_sid = ?
+        """, (now, sid))
 
-            if r:
-                tenant, cuil, period, to_whatsapp = r
-                # creamos fila mínima en message_status para que el callback pueda registrar delivered/read
-                cur.execute("""
-                    INSERT OR IGNORE INTO message_status
-                    (message_sid, to_whatsapp, tenant, cuil, period, nombre, kind, created_at, last_status, last_status_at)
-                    VALUES (?, ?, ?, ?, ?, '', 'media', ?, ?, ?)
-                """, (sid, to_whatsapp, tenant, cuil, period, now, status, now))
+    if status == "failed":
+        cur.execute("""
+            UPDATE message_status
+            SET failed_at = COALESCE(failed_at, ?),
+                error_code = COALESCE(NULLIF(?, ''), error_code),
+                error_message = COALESCE(NULLIF(?, ''), error_message)
+            WHERE message_sid = ?
+        """, (now, error_code, error_message, sid))
 
-                # volver a aplicar update (por si insertó recién)
-                cur.execute("""
-                    UPDATE message_status
-                    SET last_status = ?, last_status_at = ?,
-                        error_code = CASE WHEN ? != '' THEN ? ELSE error_code END,
-                        error_message = CASE WHEN ? != '' THEN ? ELSE error_message END
-                    WHERE message_sid = ?
-                """, (status, now, error_code, error_code, error_message, error_message, sid))
-
-        # 3) timestamps por estado
-        if status == "delivered":
-            cur.execute("""
-                UPDATE message_status
-                SET delivered_at = COALESCE(delivered_at, ?)
-                WHERE message_sid = ?
-            """, (now, sid))
-
-        if status == "read":
-            cur.execute("""
-                UPDATE message_status
-                SET read_at = COALESCE(read_at, ?)
-                WHERE message_sid = ?
-            """, (now, sid))
-
-        if status == "failed":
-            cur.execute("""
-                UPDATE message_status
-                SET failed_at = COALESCE(failed_at, ?),
-                    error_code = COALESCE(NULLIF(?, ''), error_code),
-                    error_message = COALESCE(NULLIF(?, ''), error_message)
-                WHERE message_sid = ?
-            """, (now, error_code, error_message, sid))
-
+    # 4) SIGN después de delivered (solo INITIAL)
         # 4) SIGN después de delivered (solo INITIAL) + estado A_FINALIZAR
-        if status == "delivered":
+    if status == "delivered":
+        cur.execute("""
+            SELECT tenant, cuil, period, to_whatsapp, sign_sent_at, COALESCE(origin, 'INITIAL')
+            FROM sent_pdfs
+            WHERE message_sid = ?
+            LIMIT 1
+        """, (sid,))
+        row = cur.fetchone()
+
+        if row:
+            tenant, cuil, period, to_whatsapp, sign_sent_at, origin = row
+            tenant = (tenant or "").strip().lower()
+            cuil = norm_cuil(cuil)
+            period = norm_period_label(period)
+
+
+            # ✅ Marcar A_FINALIZAR al entregar (pero NO pisar si ya está FIRMADO/OBSERVADO)
             cur.execute("""
-                SELECT tenant, cuil, period, to_whatsapp, sign_sent_at, COALESCE(origin, 'INITIAL')
-                FROM sent_pdfs
-                WHERE message_sid = ?
+                INSERT INTO recibo_estado (tenant, cuil, period, estado, updated_at)
+                VALUES (?, ?, ?, 'A_FINALIZAR', ?)
+                ON CONFLICT(tenant, cuil, period) DO UPDATE SET
+                  estado='A_FINALIZAR',
+                  updated_at=excluded.updated_at
+                WHERE recibo_estado.estado NOT IN ('FIRMADO','OBSERVADO');
+            """, (tenant, cuil, period, now))
+
+            # 🔒 Si ya está cerrado, no mandes firma
+            cur.execute("""
+                SELECT estado FROM recibo_estado
+                WHERE tenant=? AND cuil=? AND period=?
                 LIMIT 1
-            """, (sid,))
-            row = cur.fetchone()
+            """, (tenant, cuil, period))
+            est = (cur.fetchone() or [None])[0]
 
-            if row:
-                tenant, cuil, period, to_whatsapp, sign_sent_at, origin = row
-                tenant = (tenant or "").strip().lower()
-                cuil = norm_cuil(cuil)
-                period = norm_period_label(period)
+            # Si es reenvío, NO firmar nunca
+            if origin != "INITIAL":
+                print("SKIP SIGN AFTER PDF (origin=", origin, "):", sid)
 
-                # ✅ Marcar A_FINALIZAR al entregar (pero NO pisar si ya está FIRMADO/OBSERVADO)
-                cur.execute("""
-                    INSERT INTO recibo_estado (tenant, cuil, period, estado, updated_at)
-                    VALUES (?, ?, ?, 'A_FINALIZAR', ?)
-                    ON CONFLICT(tenant, cuil, period) DO UPDATE SET
-                      estado='A_FINALIZAR',
-                      updated_at=excluded.updated_at
-                    WHERE recibo_estado.estado NOT IN ('FIRMADO','OBSERVADO');
-                """, (tenant, cuil, period, now))
+            elif est in ("FIRMADO", "OBSERVADO"):
+                print("SKIP SIGN (already closed):", tenant, cuil, period, est)
 
-                # 🔒 Si ya está cerrado, no mandes firma
-                cur.execute("""
-                    SELECT estado FROM recibo_estado
-                    WHERE tenant=? AND cuil=? AND period=?
-                    LIMIT 1
-                """, (tenant, cuil, period))
-                est = (cur.fetchone() or [None])[0]
+            else:
+                if not sign_sent_at and TWILIO_SIGN_TEMPLATE_SID:
+                    try:
+                        sid_sign = send_whatsapp_template(
+                            to_whatsapp,
+                            content_vars={"1": period},
+                            template_sid=TWILIO_SIGN_TEMPLATE_SID
+                        )
 
-                # Si es reenvío, NO firmar nunca
-                if origin != "INITIAL":
-                    print("SKIP SIGN AFTER PDF (origin=", origin, "):", sid)
+                        cur.execute("""
+                            INSERT OR IGNORE INTO message_status
+                            (message_sid, to_whatsapp, tenant, cuil, period, kind, created_at, last_status, last_status_at)
+                            VALUES (?, ?, ?, ?, ?, 'sign', ?, 'sent', ?)
+                        """, (sid_sign, to_whatsapp, tenant, cuil, period, now, now))
 
-                elif est in ("FIRMADO", "OBSERVADO"):
-                    print("SKIP SIGN (already closed):", tenant, cuil, period, est)
+                        cur.execute("UPDATE sent_pdfs SET sign_sent_at = ? WHERE message_sid = ?", (now, sid))
+                        print("SENT SIGN AFTER PDF DELIVERED:", sid_sign)
+                    except Exception as e:
+                        print("WARN: could not send SIGN:", e)
 
-                else:
-                    if not sign_sent_at and TWILIO_SIGN_TEMPLATE_SID:
-                        try:
-                            sid_sign = send_whatsapp_template(
-                                to_whatsapp,
-                                content_vars={"1": period},
-                                template_sid=TWILIO_SIGN_TEMPLATE_SID
-                            )
 
-                            cur.execute("""
-                                INSERT OR IGNORE INTO message_status
-                                (message_sid, to_whatsapp, tenant, cuil, period, kind, created_at, last_status, last_status_at)
-                                VALUES (?, ?, ?, ?, ?, 'sign', ?, 'sent', ?)
-                            """, (sid_sign, to_whatsapp, tenant, cuil, period, now, now))
-
-                            cur.execute("UPDATE sent_pdfs SET sign_sent_at = ? WHERE message_sid = ?", (now, sid))
-                            print("SENT SIGN AFTER PDF DELIVERED:", sid_sign)
-                        except Exception as e:
-                            print("WARN: could not send SIGN:", e)
-
+    conn.commit()
+    conn.close()
     return Response("OK", status=200)
+
 
 def is_template_sid(message_sid: str) -> bool:
     conn = get_db_connection()
@@ -855,22 +861,6 @@ def get_db_connection():
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     return conn
-
-from contextlib import contextmanager
-
-@contextmanager
-def db_conn():
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    try:
-        yield conn
-        conn.commit()
-    except Exception:
-        conn.rollback()
-        raise
-    finally:
-        conn.close()
-
 
 def get_latest_context_for_whatsapp(to_whatsapp: str) -> dict | None:
     """
@@ -925,16 +915,19 @@ def resolve_best_period_with_pdf(tenant: str, cuil: str, *, max_months_back: int
 
     return None
 
-# ✅ DESPUÉS
-def get_receipt_request_count(tenant, cuil, period, to_whatsapp):
-    with db_conn() as conn:
-        cur = conn.cursor()
-        cur.execute("""
-            SELECT count FROM receipt_request_counts
-            WHERE tenant=? AND cuil=? AND period=? AND to_whatsapp=?
-        """, (tenant, cuil, period, to_whatsapp))
-        row = cur.fetchone()
-        return int(row["count"]) if row else 0
+def get_receipt_request_count(tenant: str, cuil: str, period: str, to_whatsapp: str) -> int:
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT request_count
+        FROM receipt_requests
+        WHERE tenant=? AND cuil=? AND period=? AND to_whatsapp=?
+        LIMIT 1
+    """, (tenant, cuil, period, to_whatsapp))
+    row = cur.fetchone()
+    conn.close()
+    return int(row[0]) if row and row[0] is not None else 0
+
 
 def inc_receipt_request_count(tenant: str, cuil: str, period: str, to_whatsapp: str) -> int:
     now = int(time.time())
@@ -4803,7 +4796,7 @@ def admin_send_test():
         return Response("Tenant inválido", status=400)
 
     html = []
-    html.append("<h2>Envío individual</h2>")
+    html.append("<h2>Envío de prueba (1 persona)</h2>")
     html.append(f"<p><b>Empresa:</b> {esc(t['display_name'])}</p>")
     html.append(f"<p><a href='/admin?token={esc(token)}'>← volver</a></p>")
 
@@ -4820,7 +4813,7 @@ def admin_send_test():
         <input type="text" name="period" value="{esc(period)}" required>
       </label><br><br>
 
-      <button type="submit">Enviar plantilla</button>
+      <button type="submit">Enviar plantilla (prueba)</button>
     </form>
     """)
 
@@ -4847,14 +4840,9 @@ def admin_send_test():
 
         html.append(f"<p>📄 PDF disponible para {esc(period)}</p>")
 
-        # Chequeamos si ya se envió para no duplicar
-        if already_sent_template(tenant, cuil, period, phone):
-            html.append(f"<p style='color:orange'>⚠️ Ya se envió la plantilla a esta persona para el período {esc(period)}. No se reenvía para evitar duplicados.</p>")
-            html.append(f"<p><a href='/admin/panel?tenant={esc(tenant)}&token={esc(token)}'>← Volver al panel</a></p>")
-            return Response("".join(html), mimetype="text/html")
-
         # Guardamos pending view ANTES del click VIEW_NOW
         add_pending_view(phone, tenant, cuil, period, origin="INITIAL")
+
 
         # Enviamos plantilla con botón VIEW_NOW (abre conversación)
         try:
@@ -4865,17 +4853,12 @@ def admin_send_test():
                     "2": period,
                 },
                 template_sid=TWILIO_TEMPLATE_SID or None,
-                status_callback=STATUS_CALLBACK_URL,   # ← AGREGADO: para que llegue el callback de estado
             )
-
-            # ✅ Grabamos en message_status para que aparezca en reportes
-            save_template_sid(tenant, cuil, period, phone, sid_tpl, nombre=person.get("nombre", ""))
-
             html.append(f"<p style='color:green'>✅ Plantilla enviada. SID: {esc(sid_tpl)}</p>")
         except Exception as e:
             html.append(f"<p style='color:red'>❌ Error enviando plantilla: {esc(str(e))}</p>")
             return Response("".join(html), mimetype="text/html")
-        
+
         # Debug: URL del PDF (Twilio la va a pedir cuando toque VIEW_NOW)
         pdf_url = (
             f"{request.host_url.rstrip('/')}/media/pdf"
