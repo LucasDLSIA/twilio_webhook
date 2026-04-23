@@ -4612,6 +4612,41 @@ def admin_send_template_queue_start():
         f"&failed={stats.get('FAILED',0)}&skipped={stats.get('SKIPPED',0)}"
     )
 
+@app.post("/admin/send_auto")
+def admin_send_auto():
+    """
+    Dispara el procesamiento automático de la cola usando Celery.
+    No bloquea - devuelve inmediatamente y procesa en background.
+    """
+    token = _get_admin_token_from_request()
+    
+    tenant = (request.form.get("tenant") or "").strip().lower()
+    period = (request.form.get("period") or "").strip()
+    
+    try:
+        batch_size = int(request.form.get("batch_size") or "10")
+    except ValueError:
+        batch_size = 10
+    batch_size = max(1, min(batch_size, 50))
+    
+    if not tenant:
+        return Response("Falta tenant", status=400)
+    if not period:
+        return Response("Falta period", status=400)
+    
+    # Importar la tarea (lazy import para evitar problemas)
+    from task import process_queue_auto
+    
+    # Disparar la tarea en background
+    task = process_queue_auto.delay(tenant, period, batch_size)
+    
+    # Respuesta inmediata
+    return redirect(
+        f"/admin/panel?tenant={tenant}&token={token}&msg=auto_started"
+        f"&period={period}&task_id={task.id}"
+    )
+
+
 def _fetch_queue_batch(tenant: str, period: str, batch_size: int = 10) -> list[dict]:
     conn = get_db_connection()
     cur = conn.cursor()

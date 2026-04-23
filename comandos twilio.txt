@@ -1,0 +1,58 @@
+Subir cambios al código 
+
+20-28324485-8
+
+
+git add app.py
+git commit -m "panel nuevo"
+git push origin main
+
+mandar wpp con plantilla
+
+curl -k -i -X POST "https://twilio-webhook-lddc.onrender.com/admin/send_template_queue_start" ^
+  -H "X-Admin-Token: 30092002" ^
+  -H "Content-Type: application/x-www-form-urlencoded" ^
+  --data-urlencode "period=2025-12" ^
+  --data-urlencode "require_pdf=true"
+
+con limite de personas
+
+curl -i -X POST "https://twilio-webhook-lddc.onrender.com/admin/send_template_queue_start" ^
+  -H "X-Admin-Token: 30092002" ^
+  -H "Content-Type: application/x-www-form-urlencoded" ^
+  --data-urlencode "period=2025-12" ^
+  --data-urlencode "limit=1"
+
+
+
+reporte de enviados
+
+curl -L "https://twilio-webhook-lddc.onrender.com/admin/report_recibos.xlsx" ^
+  -H "X-Admin-Token: 30092002" ^
+  -o reporte_recibos.xlsx
+
+
+limpiar reporte de enviados
+
+curl -i -X POST "https://twilio-webhook-lddc.onrender.com/admin/reset_test_data" ^
+  -H "X-Admin-Token: 30092002" ^
+  -H "Content-Type: application/x-www-form-urlencoded" ^
+  --data-urlencode "confirm=YES"
+
+
+Ver los que están verificados
+curl -L "https://twilio-webhook-lddc.onrender.com/admin/report_identity_verification.csv" -H "X-Admin-Token: 30092002" -o identity_verification_report.csv
+
+notepad identity_verification_report.csv
+
+
+Debug listado de personas en Envios.xlsx
+
+curl -i "https://twilio-webhook-lddc.onrender.com/admin/envios_debug" -H "X-Admin-Token: 30092002"
+
+
+
+
+F:\ACTUALIZACION\Mike ganancia\xls\ML
+
+Si querés, el próximo paso lo haría sobre esto: un endpoint “admin UI” simple (HTML) para cargar/ver/borrar verificados sin usar curl (ideal si lo vas a operar solo vos).

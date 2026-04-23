@@ -1,0 +1,28 @@
+cd C:\Users\lucasdl\Desktop\TWILIO\twilio_webhook
+
+git status
+git fetch origin
+
+:: ir a main (crea el branch si no existe localmente)
+git switch main 2>nul || git switch -c main --track origin/main
+
+:: traer últimos cambios con rebase y autostash por si tenés cambios sin commit
+git pull --rebase --autostash origin main
+
+REM agrega tus cambios (send_template + diag endpoint)
+git add app.py
+git commit -m "Fix"
+
+:: primer push del branch local a remoto (usa -u para dejar upstream configurado)
+git push -u origin main
+
+
+curl -X POST "https://twilio-webhook-lddc.onrender.com/admin/send_template_all" ^
+     -d "to=+5491136222572"
+
+usted no esta registrado en este servicio
+usted no tiene pdf disponible para el periodo actual, ante cualquier inquietud acérquese a RRHH
+
+conversación cerrada en si, solo opción de volver a ver o reenviar (desea volver a verlo)
+
+Usted a observado su recibo, por favor acérquese a la oficina de recursos humanos
