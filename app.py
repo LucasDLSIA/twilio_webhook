@@ -3766,6 +3766,15 @@ def admin_panel():
         html.append("</div>")
         html.append("</form>")
 
+        # NUEVO: Botón de envío automático
+        html.append("<form method='post' action='/admin/send_auto' style='margin-top:10px;'>")
+        html.append(f"<input type='hidden' name='token' value='{esc(token)}'>")
+        html.append(f"<input type='hidden' name='tenant' value='{esc(tenant)}'>")
+        html.append(f"<input type='hidden' name='period' value='{esc(panel_period)}'>")
+        html.append("<input type='hidden' name='batch_size' value='10'>")
+        html.append("<button class='btn' type='submit' style='background:linear-gradient(180deg, rgba(90,167,255,.15), rgba(90,167,255,.08)); border-color:rgba(90,167,255,.4)'>🚀 Envío automático (procesa todo)</button>")
+        html.append("</form>")
+
         html.append("<div class='hint'>Cron URL (POST) sugerida:</div>")
         html.append(f"<div class='hint mono'><code>/admin/send_template_queue_tick?tenant={esc(tenant)}&period={esc(panel_period)}&batch_size=10&token={esc(token)}&mode=json</code></div>")
     else:
