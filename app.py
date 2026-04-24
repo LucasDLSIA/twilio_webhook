@@ -4230,7 +4230,7 @@ def get_pending_views_over_7days(tenant: str, period: str) -> list:
     
     seven_days_ago = int(time.time()) - (7 * 24 * 60 * 60)
     
-    # Buscar templates enviados hace más de 7 días en message_status
+    # Buscar templates enviados hace más de 7 días SIN PDF enviado
     cur.execute("""
         SELECT 
             ms.cuil,
@@ -4245,12 +4245,11 @@ def get_pending_views_over_7days(tenant: str, period: str) -> list:
           AND ms.created_at < ?
           AND ms.created_at IS NOT NULL
           AND NOT EXISTS (
-            SELECT 1 FROM pending_views pv
-            WHERE pv.tenant = ms.tenant
-              AND pv.cuil = ms.cuil
-              AND pv.period = ms.period
-              AND pv.to_whatsapp = ms.to_whatsapp
-              AND pv.step != 'INITIAL'
+            SELECT 1 FROM sent_pdfs sp
+            WHERE sp.tenant = ms.tenant
+              AND sp.cuil = ms.cuil
+              AND sp.period = ms.period
+              AND sp.to_whatsapp = ms.to_whatsapp
           )
         ORDER BY ms.created_at ASC
     """, (tenant, period, seven_days_ago))
@@ -4271,7 +4270,6 @@ def get_pending_views_over_7days(tenant: str, period: str) -> list:
         })
     
     return result
-
 
 def get_pending_signatures_over_7days(tenant: str, period: str) -> list:
     """
@@ -4320,13 +4318,12 @@ def get_pending_signatures_over_7days(tenant: str, period: str) -> list:
             'cuil': r['cuil'],
             'whatsapp': r['to_whatsapp'],
             'nombre': person.get('nombre', '') if person else '',
-            'sent_at': r['created_at'],  # Para compatibilidad
+            'sent_at': r['created_at'],
             'days_ago': days_ago,
             'sid': r['message_sid']
         })
     
     return result
-
 
 def get_envios_df_for_tenant(tenant_slug: str, force: bool = False) -> pd.DataFrame:
     """
