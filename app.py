@@ -4830,7 +4830,7 @@ def admin_send_auto():
     )
 
 
-    
+
 def debug_list_root_pdfs(tenant: str, limit=20):
     t = get_tenant(tenant)
     root_id = t.get("drive_root_id") or t.get("recibos_root_id")
@@ -4895,78 +4895,125 @@ def admin_send_test():
         return Response("Tenant inválido", status=400)
 
     html = []
-    html.append("<h2>Envío de prueba (1 persona)</h2>")
+    html.append("<h2>Envío individual a persona específica</h2>")
     html.append(f"<p><b>Empresa:</b> {esc(t['display_name'])}</p>")
-    html.append(f"<p><a href='/admin?token={esc(token)}'>← volver</a></p>")
+    html.append(f"<p><a href='/admin/panel?tenant={esc(tenant)}&token={esc(token)}'>← volver al panel</a></p>")
 
+    html.append(f"""
+    <style>
+      body {{ font-family: system-ui; max-width: 700px; margin: 40px auto; padding: 20px; background: #f5f5f5; }}
+      .card {{ background: white; padding: 20px; border-radius: 8px; box-shadow: 0 2px 8px rgba(0,0,0,0.1); margin-bottom: 20px; }}
+      label {{ display: block; margin-bottom: 5px; font-weight: 600; color: #333; }}
+      input {{ width: 100%; padding: 10px; border: 1px solid #ddd; border-radius: 4px; margin-bottom: 15px; }}
+      button {{ background: #0066cc; color: white; padding: 12px 24px; border: none; border-radius: 4px; cursor: pointer; font-size: 14px; font-weight: 600; }}
+      button:hover {{ background: #0052a3; }}
+      .success {{ color: #059669; background: #d1fae5; padding: 12px; border-radius: 4px; border-left: 4px solid #059669; }}
+      .error {{ color: #dc2626; background: #fee2e2; padding: 12px; border-radius: 4px; border-left: 4px solid #dc2626; }}
+      .info {{ color: #0284c7; background: #e0f2fe; padding: 12px; border-radius: 4px; border-left: 4px solid #0284c7; margin: 10px 0; }}
+      .mono {{ font-family: monospace; background: #f3f4f6; padding: 2px 6px; border-radius: 3px; }}
+    </style>
+    """)
+
+    html.append("<div class='card'>")
     html.append(f"""
     <form method="get">
       <input type="hidden" name="tenant" value="{esc(tenant)}">
       <input type="hidden" name="token" value="{esc(token)}">
 
-      <label>CUIL<br>
-        <input type="text" name="cuil" value="{esc(cuil)}" required>
-      </label><br><br>
+      <label>CUIL</label>
+      <input type="text" name="cuil" value="{esc(cuil)}" placeholder="20-12345678-9" required>
 
-      <label>Período (mm/aaaa)<br>
-        <input type="text" name="period" value="{esc(period)}" required>
-      </label><br><br>
+      <label>Período (mm/aaaa)</label>
+      <input type="text" name="period" value="{esc(period)}" placeholder="04/2025" required>
 
-      <button type="submit">Enviar plantilla (prueba)</button>
+      <button type="submit">🔍 Buscar y enviar</button>
     </form>
     """)
+    html.append("</div>")
 
     if cuil and period:
-        html.append("<hr><h3>Resultado</h3>")
+        html.append("<div class='card'>")
+        html.append("<h3>Resultado del envío</h3>")
 
+        # Normalizar CUIL
+        cuil_digits = norm_cuil(cuil)
+        if len(cuil_digits) != 11:
+            html.append("<div class='error'>❌ CUIL inválido. Debe tener 11 dígitos.</div>")
+            return Response("".join(html) + "</div></body></html>", mimetype="text/html")
+
+        # Buscar persona en Excel de envíos
         envios = load_envios_rows(tenant)
-        person = find_person_by_cuil(envios, cuil)
+        person = find_person_by_cuil(envios, cuil_digits)
 
-        if not person or not person.get("to_whatsapp"):
-            html.append("<p style='color:red'>No se encontró WhatsApp para ese CUIL en el Excel de envíos.</p>")
-            return Response("".join(html), mimetype="text/html")
+        if not person:
+            html.append("<div class='error'>❌ No se encontró esa persona en el Excel de envíos.</div>")
+            return Response("".join(html) + "</div></body></html>", mimetype="text/html")
 
-        phone = person["to_whatsapp"]
-        html.append("<p>✔ Persona encontrada</p>")
-        html.append(f"<p>👤 Nombre: {esc(person.get('nombre',''))}</p>")
-        html.append(f"<p>📞 WhatsApp: {esc(phone)}</p>")
+        to_whatsapp = person.get("to_whatsapp", "")
+        if not to_whatsapp:
+            html.append("<div class='error'>❌ Esa persona no tiene WhatsApp configurado en el Excel.</div>")
+            return Response("".join(html) + "</div></body></html>", mimetype="text/html")
 
-        periods = list_periods_for_cuil(tenant, cuil)
-        if period not in periods:
-            html.append("<p style='color:red'>No se encontró el PDF para ese período.</p>")
-            html.append(f"<p class='mono'>Períodos disponibles: {esc(', '.join(periods))}</p>")
-            return Response("".join(html), mimetype="text/html")
+        nombre = person.get("nombre", "")
 
-        html.append(f"<p>📄 PDF disponible para {esc(period)}</p>")
+        html.append(f"<div class='info'>✅ Persona encontrada<br>")
+        html.append(f"<b>Nombre:</b> {esc(nombre)}<br>")
+        html.append(f"<b>WhatsApp:</b> <span class='mono'>{esc(to_whatsapp)}</span><br>")
+        html.append(f"<b>CUIL:</b> <span class='mono'>{esc(cuil_digits)}</span></div>")
 
-        # Guardamos pending view ANTES del click VIEW_NOW
-        add_pending_view(phone, tenant, cuil, period, origin="INITIAL")
+        # Verificar que exista el PDF
+        pdf_file_id = find_pdf_file_id_for_cuil_period(tenant, cuil_digits, period)
+        if not pdf_file_id:
+            html.append(f"<div class='error'>❌ No se encontró el PDF para el período {esc(period)}.</div>")
+            periods = list_periods_for_cuil(tenant, cuil_digits)
+            if periods:
+                html.append(f"<div class='info'>Períodos disponibles: {esc(', '.join(periods))}</div>")
+            return Response("".join(html) + "</div></body></html>", mimetype="text/html")
 
+        html.append(f"<div class='info'>✅ PDF encontrado para {esc(period)}</div>")
 
-        # Enviamos plantilla con botón VIEW_NOW (abre conversación)
+        # Verificar si ya fue enviado antes
+        already = already_sent_template(tenant, cuil_digits, period, to_whatsapp)
+        if already:
+            html.append(f"<div class='info'>ℹ️ Esta persona ya recibió el template anteriormente.</div>")
+
+        # Enviar template
         try:
             sid_tpl = send_whatsapp_template(
-                phone,
+                to_whatsapp,
                 content_vars={
-                    "1": person.get("nombre", ""),
+                    "1": nombre or "Hola",
                     "2": period,
                 },
                 template_sid=TWILIO_TEMPLATE_SID or None,
+                status_callback=STATUS_CALLBACK_URL,
             )
-            html.append(f"<p style='color:green'>✅ Plantilla enviada. SID: {esc(sid_tpl)}</p>")
+            
+            # Registrar en las tablas correspondientes
+            save_template_sid(tenant, cuil_digits, period, to_whatsapp, sid_tpl, nombre=nombre)
+            add_pending_view(to_whatsapp, tenant, cuil_digits, period, origin="MANUAL")
+            
+            # Marcar en la cola como enviado (si existía)
+            conn = get_db_connection()
+            cur = conn.cursor()
+            cur.execute("""
+                UPDATE template_send_queue
+                SET status = 'SENT', sent_at = ?, sent_sid = ?
+                WHERE tenant = ? AND cuil = ? AND period = ? AND to_whatsapp = ?
+            """, (int(time.time()), sid_tpl, tenant, cuil_digits, period, to_whatsapp))
+            conn.commit()
+            conn.close()
+
+            html.append(f"<div class='success'>✅ Template enviado exitosamente<br>")
+            html.append(f"<b>Message SID:</b> <span class='mono'>{esc(sid_tpl)}</span></div>")
+
         except Exception as e:
-            html.append(f"<p style='color:red'>❌ Error enviando plantilla: {esc(str(e))}</p>")
-            return Response("".join(html), mimetype="text/html")
+            html.append(f"<div class='error'>❌ Error enviando template:<br>{esc(str(e))}</div>")
 
-        # Debug: URL del PDF (Twilio la va a pedir cuando toque VIEW_NOW)
-        pdf_url = (
-            f"{request.host_url.rstrip('/')}/media/pdf"
-            f"?tenant={tenant}&cuil={strip_pdf(cuil)}&period={period}&token={ADMIN_TOKEN or token}"
-        )
-        html.append(f"<p class='mono'>PDF URL (debug): {esc(pdf_url)}</p>")
-        html.append("<p>👉 Ahora el empleado toca el botón <b>VIEW_NOW</b> y se envía el PDF automáticamente.</p>")
+        html.append("</div>")
 
-    return Response("".join(html), mimetype="text/html")
+    return Response("".join(html) + "</body></html>", mimetype="text/html")
+
 
 # =========================
 # Twilio inbound: VIEW_NOW + firma/observa
