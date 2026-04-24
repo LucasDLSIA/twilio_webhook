@@ -4273,7 +4273,7 @@ def get_pending_views_over_7days(tenant: str, period: str) -> list:
 
 def get_pending_signatures_over_7days(tenant: str, period: str) -> list:
     """
-    Devuelve personas que recibieron el PDF hace +7 días pero nunca firmaron.
+    Devuelve personas que recibieron el PDF hace +7 días pero nunca firmaron ni observaron.
     """
     conn = get_db_connection()
     conn.row_factory = sqlite3.Row
@@ -4281,7 +4281,7 @@ def get_pending_signatures_over_7days(tenant: str, period: str) -> list:
     
     seven_days_ago = int(time.time()) - (7 * 24 * 60 * 60)
     
-    # Buscar PDFs enviados hace más de 7 días sin firma
+    # Buscar PDFs enviados hace más de 7 días sin firma ni observación
     cur.execute("""
         SELECT 
             sp.cuil,
@@ -4298,7 +4298,7 @@ def get_pending_signatures_over_7days(tenant: str, period: str) -> list:
             WHERE re.tenant = sp.tenant
               AND re.cuil = sp.cuil
               AND re.period = sp.period
-              AND re.estado IN ('FIRMADO', 'OBSERVADO') 
+              AND re.estado IN ('FIRMADO', 'OBSERVADO')
           )
         ORDER BY sp.created_at ASC
     """, (tenant, period, seven_days_ago))
