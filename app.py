@@ -3478,6 +3478,13 @@ def admin_panel():
     stats = None
     if panel_period:
         stats = get_queue_stats(tenant, panel_period)
+    
+    # Cargar pendientes de seguimiento
+    pending_views_7d = []
+    pending_sigs_7d = []
+    if panel_period:
+        pending_views_7d = get_pending_views_over_7days(tenant, panel_period)
+        pending_sigs_7d = get_pending_signatures_over_7days(tenant, panel_period)
 
     # Verificaciones
     verifs = get_verifications_rows(tenant)
@@ -3780,6 +3787,76 @@ def admin_panel():
     else:
         html.append("<div class='muted'>Elegí un período en Reportes para ver la cola y poder procesarla.</div>")
 
+    # Seguimiento de pendientes
+    if panel_period and (pending_views_7d or pending_sigs_7d):
+        html.append("<div class='sep'></div>")
+        html.append("<h3>⚠️ Seguimiento - Pendientes</h3>")
+        
+        # No vieron el recibo (>7 días)
+        if pending_views_7d:
+            html.append(f"<div class='muted' style='margin-top:10px'>🔴 <b>No vieron el recibo</b> (más de 7 días desde envío) - Total: <b>{len(pending_views_7d)}</b></div>")
+            html.append("<div class='table-wrap' style='margin-top:8px'>")
+            html.append("<table>")
+            html.append("<thead><tr><th>Nombre</th><th>CUIL</th><th>Días</th><th>Acción</th></tr></thead>")
+            html.append("<tbody>")
+            
+            for p in pending_views_7d[:20]:  # Mostrar máximo 20
+                html.append("<tr>")
+                html.append(f"<td>{esc(p['nombre'])}</td>")
+                html.append(f"<td class='mono'>{esc(p['cuil'])}</td>")
+                html.append(f"<td>{p['days_ago']} días</td>")
+                html.append("<td>")
+                html.append(f"""
+                    <form method='post' action='/admin/resend_template' style='margin:0'>
+                        <input type='hidden' name='token' value='{esc(token)}'>
+                        <input type='hidden' name='tenant' value='{esc(tenant)}'>
+                        <input type='hidden' name='period' value='{esc(panel_period)}'>
+                        <input type='hidden' name='cuil' value='{esc(p["cuil"])}'>
+                        <input type='hidden' name='whatsapp' value='{esc(p["whatsapp"])}'>
+                        <button class='btn small' type='submit'>🔄 Reenviar</button>
+                    </form>
+                """)
+                html.append("</td>")
+                html.append("</tr>")
+            
+            html.append("</tbody></table></div>")
+            
+            if len(pending_views_7d) > 20:
+                html.append(f"<div class='hint'>Mostrando 20 de {len(pending_views_7d)} pendientes</div>")
+        
+        # No firmaron (>7 días)
+        if pending_sigs_7d:
+            html.append(f"<div class='muted' style='margin-top:15px'>🟡 <b>No firmaron</b> (más de 7 días desde recepción PDF) - Total: <b>{len(pending_sigs_7d)}</b></div>")
+            html.append("<div class='table-wrap' style='margin-top:8px'>")
+            html.append("<table>")
+            html.append("<thead><tr><th>Nombre</th><th>CUIL</th><th>Días</th><th>Acción</th></tr></thead>")
+            html.append("<tbody>")
+            
+            for p in pending_sigs_7d[:20]:  # Mostrar máximo 20
+                html.append("<tr>")
+                html.append(f"<td>{esc(p['nombre'])}</td>")
+                html.append(f"<td class='mono'>{esc(p['cuil'])}</td>")
+                html.append(f"<td>{p['days_ago']} días</td>")
+                html.append("<td>")
+                html.append(f"""
+                    <form method='post' action='/admin/remind_signature' style='margin:0'>
+                        <input type='hidden' name='token' value='{esc(token)}'>
+                        <input type='hidden' name='tenant' value='{esc(tenant)}'>
+                        <input type='hidden' name='period' value='{esc(panel_period)}'>
+                        <input type='hidden' name='cuil' value='{esc(p["cuil"])}'>
+                        <input type='hidden' name='whatsapp' value='{esc(p["whatsapp"])}'>
+                        <button class='btn small' type='submit'>📝 Recordar</button>
+                    </form>
+                """)
+                html.append("</td>")
+                html.append("</tr>")
+            
+            html.append("</tbody></table></div>")
+            
+            if len(pending_sigs_7d) > 20:
+                html.append(f"<div class='hint'>Mostrando 20 de {len(pending_sigs_7d)} pendientes</div>")
+
+
     html.append("</div>")  # fin card izquierda
 
     # Columna derecha: reportes + herramientas rápidas
@@ -3982,6 +4059,113 @@ def admin_periodos():
     return jsonify({"tenant": tenant, "cuil": cuil, "periodos": periods})
 
 import pandas as pd
+
+def get_pending_views_over_7days(tenant: str, period: str) -> list:
+    """
+    Devuelve personas que recibieron el template hace +7 días pero nunca pidieron el PDF.
+    """
+    conn = get_db_connection()
+    conn.row_factory = sqlite3.Row
+    cur = conn.cursor()
+    
+    seven_days_ago = int(time.time()) - (7 * 24 * 60 * 60)
+    
+    # Buscar templates enviados hace más de 7 días
+    cur.execute("""
+        SELECT 
+            ts.cuil,
+            ts.to_whatsapp,
+            ts.nombre,
+            ts.sent_at,
+            ts.sent_sid
+        FROM sent_templates ts
+        WHERE ts.tenant = ?
+          AND ts.period = ?
+          AND ts.sent_at < ?
+          AND ts.sent_at IS NOT NULL
+          AND NOT EXISTS (
+            SELECT 1 FROM pending_views pv
+            WHERE pv.tenant = ts.tenant
+              AND pv.cuil = ts.cuil
+              AND pv.period = ts.period
+              AND pv.to_whatsapp = ts.to_whatsapp
+              AND pv.step != 'INITIAL'
+          )
+        ORDER BY ts.sent_at ASC
+    """, (tenant, period, seven_days_ago))
+    
+    rows = cur.fetchall()
+    conn.close()
+    
+    result = []
+    for r in rows:
+        days_ago = int((time.time() - r['sent_at']) / 86400) if r['sent_at'] else 0
+        result.append({
+            'cuil': r['cuil'],
+            'whatsapp': r['to_whatsapp'],
+            'nombre': r['nombre'] or '',
+            'sent_at': r['sent_at'],
+            'days_ago': days_ago,
+            'sid': r['sent_sid']
+        })
+    
+    return result
+
+
+def get_pending_signatures_over_7days(tenant: str, period: str) -> list:
+    """
+    Devuelve personas que recibieron el PDF hace +7 días pero nunca firmaron.
+    """
+    conn = get_db_connection()
+    conn.row_factory = sqlite3.Row
+    cur = conn.cursor()
+    
+    seven_days_ago = int(time.time()) - (7 * 24 * 60 * 60)
+    
+    # Buscar PDFs enviados hace más de 7 días sin firma
+    cur.execute("""
+        SELECT 
+            sp.cuil,
+            sp.to_whatsapp,
+            sp.sent_at,
+            sp.sent_sid
+        FROM sent_pdfs sp
+        WHERE sp.tenant = ?
+          AND sp.period = ?
+          AND sp.sent_at < ?
+          AND sp.sent_at IS NOT NULL
+          AND NOT EXISTS (
+            SELECT 1 FROM recibo_estado re
+            WHERE re.tenant = sp.tenant
+              AND re.cuil = sp.cuil
+              AND re.period = sp.period
+              AND re.estado = 'FIRMADO'
+          )
+        ORDER BY sp.sent_at ASC
+    """, (tenant, period, seven_days_ago))
+    
+    rows = cur.fetchall()
+    conn.close()
+    
+    # Enriquecer con datos de envios
+    envios = load_envios_rows(tenant)
+    
+    result = []
+    for r in rows:
+        person = find_person_by_cuil(envios, r['cuil'])
+        days_ago = int((time.time() - r['sent_at']) / 86400) if r['sent_at'] else 0
+        
+        result.append({
+            'cuil': r['cuil'],
+            'whatsapp': r['to_whatsapp'],
+            'nombre': person.get('nombre', '') if person else '',
+            'sent_at': r['sent_at'],
+            'days_ago': days_ago,
+            'sid': r['sent_sid']
+        })
+    
+    return result
+
 
 def get_envios_df_for_tenant(tenant_slug: str, force: bool = False) -> pd.DataFrame:
     """
@@ -4239,6 +4423,7 @@ def _drive_child_file_exists(service, parent_id: str, filename: str) -> bool:
         if (c.get("name") or "").strip() == filename:
             return True
     return False
+
 
 
 def get_tenant_period_folder_id(tenant_slug: str, period_label: str) -> str:
@@ -5014,6 +5199,122 @@ def admin_send_test():
 
     return Response("".join(html) + "</body></html>", mimetype="text/html")
 
+@app.post("/admin/resend_template")
+def admin_resend_template():
+    """
+    Reenvía el template a una persona que no lo vio después de 7+ días.
+    """
+    auth = require_admin()
+    if auth:
+        return auth
+    
+    token = _get_admin_token_from_request()
+    tenant = (request.form.get("tenant") or "").strip().lower()
+    period = (request.form.get("period") or "").strip()
+    cuil = (request.form.get("cuil") or "").strip()
+    whatsapp = (request.form.get("whatsapp") or "").strip()
+    
+    if not all([tenant, period, cuil, whatsapp]):
+        return Response("Faltan parámetros", status=400)
+    
+    # Buscar nombre en envios
+    envios = load_envios_rows(tenant)
+    person = find_person_by_cuil(envios, cuil)
+    nombre = person.get("nombre", "") if person else ""
+    
+    try:
+        # Enviar template
+        sid = send_whatsapp_template(
+            whatsapp,
+            content_vars={
+                "1": nombre or "Hola",
+                "2": period,
+            },
+            template_sid=TWILIO_TEMPLATE_SID or None,
+            status_callback=STATUS_CALLBACK_URL,
+        )
+        
+        # Registrar (sobreescribe el anterior)
+        save_template_sid(tenant, cuil, period, whatsapp, sid, nombre=nombre)
+        
+        # Actualizar pending_view origin a RESEND
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute("""
+            UPDATE pending_views
+            SET origin = 'RESEND', created_at = ?
+            WHERE tenant = ? AND cuil = ? AND period = ? AND to_whatsapp = ?
+        """, (int(time.time()), tenant, cuil, period, whatsapp))
+        
+        # Si no existía, crear uno
+        if cur.rowcount == 0:
+            add_pending_view(whatsapp, tenant, cuil, period, origin="RESEND")
+        
+        conn.commit()
+        conn.close()
+        
+        msg = f"resend_ok&cuil={cuil}"
+        
+    except Exception as e:
+        msg = f"resend_error&error={str(e)[:100]}"
+    
+    return redirect(f"/admin/panel?tenant={tenant}&token={token}&period={period}&msg={msg}")
+
+
+@app.post("/admin/remind_signature")
+def admin_remind_signature():
+    """
+    Envía recordatorio para firmar usando el template aprobado de firma.
+    """
+    auth = require_admin()
+    if auth:
+        return auth
+    
+    token = _get_admin_token_from_request()
+    tenant = (request.form.get("tenant") or "").strip().lower()
+    period = (request.form.get("period") or "").strip()
+    cuil = (request.form.get("cuil") or "").strip()
+    whatsapp = (request.form.get("whatsapp") or "").strip()
+    
+    if not all([tenant, period, cuil, whatsapp]):
+        return Response("Faltan parámetros", status=400)
+    
+    # Buscar nombre
+    envios = load_envios_rows(tenant)
+    person = find_person_by_cuil(envios, cuil)
+    nombre = person.get("nombre", "") if person else ""
+    
+    try:
+        # Enviar template de firma (con botones SIGN_OK/SIGN_OBS)
+        if not TWILIO_SIGN_TEMPLATE_SID:
+            return Response("TWILIO_SIGN_TEMPLATE_SID no configurado", status=500)
+        
+        sid = send_whatsapp_template(
+            whatsapp,
+            content_vars={
+                "1": nombre or "Hola",
+                "2": period,
+            },
+            template_sid=TWILIO_SIGN_TEMPLATE_SID,
+            status_callback=STATUS_CALLBACK_URL,
+        )
+        
+        # Registrar el recordatorio
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute("""
+            INSERT INTO message_status (tenant, cuil, period, kind, message_sid, status, to_whatsapp, created_at)
+            VALUES (?, ?, ?, 'REMIND_SIGN', ?, 'sent', ?, ?)
+        """, (tenant, cuil, period, sid, whatsapp, int(time.time())))
+        conn.commit()
+        conn.close()
+        
+        msg = f"remind_ok&cuil={cuil}"
+        
+    except Exception as e:
+        msg = f"remind_error&error={str(e)[:100]}"
+    
+    return redirect(f"/admin/panel?tenant={tenant}&token={token}&period={period}&msg={msg}")
 
 # =========================
 # Twilio inbound: VIEW_NOW + firma/observa
@@ -5377,7 +5678,7 @@ def twilio_inbound():
         else:
             set_recibo_estado(tenant, cuil, period, "OBSERVADO")
             consume_pending_view(pending["id"])
-            return twiml("📝 Recibo observado. Vamos a revisarlo y te contactamos.")
+            return twiml("📝 Recibo observado. Contacte RRHH para más información.")
 
     return Response("OK", status=200)
 
