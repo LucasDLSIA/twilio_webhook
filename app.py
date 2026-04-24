@@ -4764,6 +4764,9 @@ def admin_send_auto():
     if not period:
         return Response("Falta period", status=400)
     
+    # ✅ CAPTURAR LA URL ANTES DEL THREAD
+    base_url = request.host_url.rstrip('/')
+    
     # Función que corre en el thread
     def process_in_background():
         import requests
@@ -4771,9 +4774,6 @@ def admin_send_auto():
         sent_total = 0
         iterations = 0
         max_iterations = 200  # Límite: 200 iteraciones × 10 envíos = 2,000 envíos máx
-        
-        # URL de esta misma app
-        base_url = request.host_url.rstrip('/')
         
         while iterations < max_iterations:
             iterations += 1
@@ -4830,6 +4830,7 @@ def admin_send_auto():
     )
 
 
+    
 def debug_list_root_pdfs(tenant: str, limit=20):
     t = get_tenant(tenant)
     root_id = t.get("drive_root_id") or t.get("recibos_root_id")
