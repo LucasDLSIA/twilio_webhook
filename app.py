@@ -4,6 +4,7 @@ import re
 import time
 import sqlite3
 import json
+import threading
 from datetime import datetime
 import datetime as _dt
 
@@ -17,6 +18,7 @@ from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload
 
 from twilio.rest import Client
+
 
 # =========================
 # Config
@@ -4612,41 +4614,6 @@ def admin_send_template_queue_start():
         f"&failed={stats.get('FAILED',0)}&skipped={stats.get('SKIPPED',0)}"
     )
 
-@app.post("/admin/send_auto")
-def admin_send_auto():
-    """
-    Dispara el procesamiento automático de la cola usando Celery.
-    No bloquea - devuelve inmediatamente y procesa en background.
-    """
-    token = _get_admin_token_from_request()
-    
-    tenant = (request.form.get("tenant") or "").strip().lower()
-    period = (request.form.get("period") or "").strip()
-    
-    try:
-        batch_size = int(request.form.get("batch_size") or "10")
-    except ValueError:
-        batch_size = 10
-    batch_size = max(1, min(batch_size, 50))
-    
-    if not tenant:
-        return Response("Falta tenant", status=400)
-    if not period:
-        return Response("Falta period", status=400)
-    
-    # Importar la tarea (lazy import para evitar problemas)
-    from task import process_queue_auto
-    
-    # Disparar la tarea en background
-    task = process_queue_auto.delay(tenant, period, batch_size)
-    
-    # Respuesta inmediata
-    return redirect(
-        f"/admin/panel?tenant={tenant}&token={token}&msg=auto_started"
-        f"&period={period}&task_id={task.id}"
-    )
-
-
 def _fetch_queue_batch(tenant: str, period: str, batch_size: int = 10) -> list[dict]:
     conn = get_db_connection()
     cur = conn.cursor()
@@ -4765,6 +4732,93 @@ def admin_send_template_queue_tick():
         f"&pending={stats.get('PENDING',0)}"
     )
 
+
+@app.post("/admin/send_auto")
+def admin_send_auto():
+    """
+    Procesa la cola automáticamente en background usando threading.
+    Versión simple sin Celery - gratis pero con límite de ~30 minutos.
+    """
+    token = _get_admin_token_from_request()
+    
+    tenant = (request.form.get("tenant") or "").strip().lower()
+    period = (request.form.get("period") or "").strip()
+    
+    try:
+        batch_size = int(request.form.get("batch_size") or "10")
+    except ValueError:
+        batch_size = 10
+    batch_size = max(1, min(batch_size, 50))
+    
+    if not tenant:
+        return Response("Falta tenant", status=400)
+    if not period:
+        return Response("Falta period", status=400)
+    
+    # Función que corre en el thread
+    def process_in_background():
+        import requests
+        processed_total = 0
+        sent_total = 0
+        iterations = 0
+        max_iterations = 200  # Límite: 200 iteraciones × 10 envíos = 2,000 envíos máx
+        
+        # URL de esta misma app
+        base_url = request.host_url.rstrip('/')
+        
+        while iterations < max_iterations:
+            iterations += 1
+            
+            try:
+                # Llamar a queue_tick
+                response = requests.post(
+                    f"{base_url}/admin/send_template_queue_tick",
+                    data={
+                        "tenant": tenant,
+                        "period": period,
+                        "batch_size": batch_size,
+                        "mode": "json",
+                        "token": token,
+                    },
+                    timeout=60
+                )
+                
+                if response.status_code != 200:
+                    print(f"[AUTO] Error HTTP {response.status_code}")
+                    break
+                
+                data = response.json()
+                processed = data.get("processed", 0)
+                sent = data.get("sent", 0)
+                
+                processed_total += processed
+                sent_total += sent
+                
+                print(f"[AUTO] Iteración {iterations}: procesados={processed}, enviados={sent}, total={sent_total}")
+                
+                # Si no procesó nada, terminamos
+                if processed == 0:
+                    print(f"[AUTO] Completado. Total enviados: {sent_total}")
+                    break
+                
+                # Pausa de 2 segundos entre lotes
+                time.sleep(2)
+                
+            except Exception as e:
+                print(f"[AUTO] Error: {e}")
+                break
+        
+        print(f"[AUTO] Finalizó. Iteraciones: {iterations}, Total enviado: {sent_total}")
+    
+    # Disparar el thread en background
+    thread = threading.Thread(target=process_in_background, daemon=True)
+    thread.start()
+    
+    # Respuesta inmediata al usuario
+    return redirect(
+        f"/admin/panel?tenant={tenant}&token={token}&msg=auto_started"
+        f"&period={period}"
+    )
 
 
 def debug_list_root_pdfs(tenant: str, limit=20):
