@@ -3594,7 +3594,18 @@ def admin_seguimiento():
     html.append("<div class='card'>")
     html.append(f"<h3>🔴 No vieron el recibo <span class='badge red'>{len(pending_views_7d)}</span></h3>")
     html.append("<div class='muted'>Template enviado hace más de 7 días, nunca hicieron click en VIEW_NOW</div>")
-
+    if pending_views_7d:
+        html.append(f"""
+            <form method='post' action='/admin/resend_all_pending_views' style='margin-top:10px' 
+                onsubmit='return confirm("¿Reenviar template a {len(pending_views_7d)} personas?");'>
+                <input type='hidden' name='token' value='{esc(token)}'>
+                <input type='hidden' name='tenant' value='{esc(tenant)}'>
+                <input type='hidden' name='period' value='{esc(panel_period)}'>
+                <button class='btn' type='submit' style='background:linear-gradient(180deg, rgba(251,113,133,.15), rgba(251,113,133,.08)); border-color:rgba(251,113,133,.4)'>
+                    🔄 Reenviar a TODOS ({len(pending_views_7d)})
+                </button>
+            </form>
+        """)
     if pending_views_7d:
         html.append("<div class='table-wrap'>")
         html.append("<table>")
@@ -3631,7 +3642,18 @@ def admin_seguimiento():
     html.append("<div class='card'>")
     html.append(f"<h3>🟡 No firmaron <span class='badge yellow'>{len(pending_sigs_7d)}</span></h3>")
     html.append("<div class='muted'>PDF recibido hace más de 7 días, nunca firmaron (SIGN_OK/SIGN_OBS)</div>")
-
+    if pending_sigs_7d:
+        html.append(f"""
+            <form method='post' action='/admin/remind_all_pending_signatures' style='margin-top:10px'
+                onsubmit='return confirm("¿Enviar recordatorio de firma a {len(pending_sigs_7d)} personas?");'>
+                <input type='hidden' name='token' value='{esc(token)}'>
+                <input type='hidden' name='tenant' value='{esc(tenant)}'>
+                <input type='hidden' name='period' value='{esc(panel_period)}'>
+                <button class='btn' type='submit' style='background:linear-gradient(180deg, rgba(251,191,36,.15), rgba(251,191,36,.08)); border-color:rgba(251,191,36,.4)'>
+                    📝 Recordar a TODOS ({len(pending_sigs_7d)})
+                </button>
+            </form>
+        """)
     if pending_sigs_7d:
         html.append("<div class='table-wrap'>")
         html.append("<table>")
@@ -4324,6 +4346,161 @@ def get_pending_signatures_over_7days(tenant: str, period: str) -> list:
         })
     
     return result
+
+@app.post("/admin/resend_all_pending_views")
+def admin_resend_all_pending_views():
+    """
+    Reenvía el template a TODOS los que no vieron (>7 días).
+    """
+    auth = require_admin()
+    if auth:
+        return auth
+    
+    token = _get_admin_token_from_request()
+    tenant = (request.form.get("tenant") or "").strip().lower()
+    period = (request.form.get("period") or "").strip()
+    
+    if not tenant or not period:
+        return Response("Faltan parámetros", status=400)
+    
+    # Obtener lista de pendientes
+    pending = get_pending_views_over_7days(tenant, period)
+    
+    if not pending:
+        return redirect(f"/admin/seguimiento?tenant={tenant}&token={token}&period={period}&msg=no_pending")
+    
+    # Encolar todos para envío automático
+    base_url = request.host_url.rstrip('/')
+    
+    def process_in_background():
+        import requests
+        sent = 0
+        failed = 0
+        
+        for p in pending:
+            try:
+                # Reenviar template
+                envios = load_envios_rows(tenant)
+                person = find_person_by_cuil(envios, p['cuil'])
+                nombre = person.get("nombre", "") if person else ""
+                
+                sid = send_whatsapp_template(
+                    p['whatsapp'],
+                    content_vars={
+                        "1": nombre or "Hola",
+                        "2": period,
+                    },
+                    template_sid=TWILIO_TEMPLATE_SID or None,
+                    status_callback=STATUS_CALLBACK_URL,
+                )
+                
+                # Registrar
+                save_template_sid(tenant, p['cuil'], period, p['whatsapp'], sid, nombre=nombre)
+                
+                # Actualizar pending_view
+                conn = get_db_connection()
+                cur = conn.cursor()
+                cur.execute("""
+                    UPDATE pending_views
+                    SET origin = 'RESEND_MASS', created_at = ?
+                    WHERE tenant = ? AND cuil = ? AND period = ? AND to_whatsapp = ?
+                """, (int(time.time()), tenant, p['cuil'], period, p['whatsapp']))
+                
+                if cur.rowcount == 0:
+                    add_pending_view(p['whatsapp'], tenant, p['cuil'], period, origin="RESEND_MASS")
+                
+                conn.commit()
+                conn.close()
+                
+                sent += 1
+                print(f"[RESEND_MASS] Enviado a {p['cuil']}: {sid}")
+                
+                # Pausa entre envíos
+                time.sleep(1)
+                
+            except Exception as e:
+                failed += 1
+                print(f"[RESEND_MASS] Error enviando a {p['cuil']}: {e}")
+        
+        print(f"[RESEND_MASS] Completado. Enviados: {sent}, Fallidos: {failed}")
+    
+    # Disparar en background
+    thread = threading.Thread(target=process_in_background, daemon=True)
+    thread.start()
+    
+    return redirect(f"/admin/seguimiento?tenant={tenant}&token={token}&period={period}&msg=resend_started&total={len(pending)}")
+
+
+@app.post("/admin/remind_all_pending_signatures")
+def admin_remind_all_pending_signatures():
+    """
+    Envía recordatorio de firma a TODOS los que no firmaron (>7 días).
+    """
+    auth = require_admin()
+    if auth:
+        return auth
+    
+    token = _get_admin_token_from_request()
+    tenant = (request.form.get("tenant") or "").strip().lower()
+    period = (request.form.get("period") or "").strip()
+    
+    if not tenant or not period:
+        return Response("Faltan parámetros", status=400)
+    
+    # Obtener lista de pendientes
+    pending = get_pending_signatures_over_7days(tenant, period)
+    
+    if not pending:
+        return redirect(f"/admin/seguimiento?tenant={tenant}&token={token}&period={period}&msg=no_pending")
+    
+    # Verificar que exista el template de firma
+    if not TWILIO_SIGN_TEMPLATE_SID:
+        return Response("TWILIO_SIGN_TEMPLATE_SID no configurado", status=500)
+    
+    def process_in_background():
+        sent = 0
+        failed = 0
+        
+        for p in pending:
+            try:
+                # Enviar template de firma
+                sid = send_whatsapp_template(
+                    p['whatsapp'],
+                    content_vars={
+                        "1": p['nombre'] or "Hola",
+                        "2": period,
+                    },
+                    template_sid=TWILIO_SIGN_TEMPLATE_SID,
+                    status_callback=STATUS_CALLBACK_URL,
+                )
+                
+                # Registrar
+                conn = get_db_connection()
+                cur = conn.cursor()
+                cur.execute("""
+                    INSERT INTO message_status (tenant, cuil, period, kind, message_sid, status, to_whatsapp, created_at)
+                    VALUES (?, ?, ?, 'REMIND_SIGN_MASS', ?, 'sent', ?, ?)
+                """, (tenant, p['cuil'], period, sid, p['whatsapp'], int(time.time())))
+                conn.commit()
+                conn.close()
+                
+                sent += 1
+                print(f"[REMIND_MASS] Enviado a {p['cuil']}: {sid}")
+                
+                # Pausa entre envíos
+                time.sleep(1)
+                
+            except Exception as e:
+                failed += 1
+                print(f"[REMIND_MASS] Error enviando a {p['cuil']}: {e}")
+        
+        print(f"[REMIND_MASS] Completado. Enviados: {sent}, Fallidos: {failed}")
+    
+    # Disparar en background
+    thread = threading.Thread(target=process_in_background, daemon=True)
+    thread.start()
+    
+    return redirect(f"/admin/seguimiento?tenant={tenant}&token={token}&period={period}&msg=remind_started&total={len(pending)}")
 
 def get_envios_df_for_tenant(tenant_slug: str, force: bool = False) -> pd.DataFrame:
     """
