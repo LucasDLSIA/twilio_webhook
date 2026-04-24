@@ -4016,7 +4016,7 @@ def admin_panel():
         html.append(f"<div class='hint mono'><code>/admin/send_template_queue_tick?tenant={esc(tenant)}&period={esc(panel_period)}&batch_size=10&token={esc(token)}&mode=json</code></div>")
     else:
         html.append("<div class='muted'>Elegí un período en Reportes para ver la cola y poder procesarla.</div>")
-        
+
     html.append("</div>")  # fin card izquierda
 
     # Columna derecha: reportes + herramientas rápidas
@@ -4288,13 +4288,13 @@ def get_pending_signatures_over_7days(tenant: str, period: str) -> list:
         SELECT 
             sp.cuil,
             sp.to_whatsapp,
-            sp.sent_at,
-            sp.sent_sid
+            sp.created_at,
+            sp.message_sid
         FROM sent_pdfs sp
         WHERE sp.tenant = ?
           AND sp.period = ?
-          AND sp.sent_at < ?
-          AND sp.sent_at IS NOT NULL
+          AND sp.created_at < ?
+          AND sp.created_at IS NOT NULL
           AND NOT EXISTS (
             SELECT 1 FROM recibo_estado re
             WHERE re.tenant = sp.tenant
@@ -4302,7 +4302,7 @@ def get_pending_signatures_over_7days(tenant: str, period: str) -> list:
               AND re.period = sp.period
               AND re.estado = 'FIRMADO'
           )
-        ORDER BY sp.sent_at ASC
+        ORDER BY sp.created_at ASC
     """, (tenant, period, seven_days_ago))
     
     rows = cur.fetchall()
@@ -4314,15 +4314,15 @@ def get_pending_signatures_over_7days(tenant: str, period: str) -> list:
     result = []
     for r in rows:
         person = find_person_by_cuil(envios, r['cuil'])
-        days_ago = int((time.time() - r['sent_at']) / 86400) if r['sent_at'] else 0
+        days_ago = int((time.time() - r['created_at']) / 86400) if r['created_at'] else 0
         
         result.append({
             'cuil': r['cuil'],
             'whatsapp': r['to_whatsapp'],
             'nombre': person.get('nombre', '') if person else '',
-            'sent_at': r['sent_at'],
+            'sent_at': r['created_at'],  # Para compatibilidad
             'days_ago': days_ago,
-            'sid': r['sent_sid']
+            'sid': r['message_sid']
         })
     
     return result
