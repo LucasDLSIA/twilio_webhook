@@ -4070,28 +4070,29 @@ def get_pending_views_over_7days(tenant: str, period: str) -> list:
     
     seven_days_ago = int(time.time()) - (7 * 24 * 60 * 60)
     
-    # Buscar templates enviados hace más de 7 días
+    # Buscar templates enviados hace más de 7 días en message_status
     cur.execute("""
         SELECT 
-            ts.cuil,
-            ts.to_whatsapp,
-            ts.nombre,
-            ts.sent_at,
-            ts.sent_sid
-        FROM sent_templates ts
-        WHERE ts.tenant = ?
-          AND ts.period = ?
-          AND ts.sent_at < ?
-          AND ts.sent_at IS NOT NULL
+            ms.cuil,
+            ms.to_whatsapp,
+            ms.nombre,
+            ms.created_at as sent_at,
+            ms.message_sid as sent_sid
+        FROM message_status ms
+        WHERE ms.tenant = ?
+          AND ms.period = ?
+          AND ms.kind = 'template'
+          AND ms.created_at < ?
+          AND ms.created_at IS NOT NULL
           AND NOT EXISTS (
             SELECT 1 FROM pending_views pv
-            WHERE pv.tenant = ts.tenant
-              AND pv.cuil = ts.cuil
-              AND pv.period = ts.period
-              AND pv.to_whatsapp = ts.to_whatsapp
+            WHERE pv.tenant = ms.tenant
+              AND pv.cuil = ms.cuil
+              AND pv.period = ms.period
+              AND pv.to_whatsapp = ms.to_whatsapp
               AND pv.step != 'INITIAL'
           )
-        ORDER BY ts.sent_at ASC
+        ORDER BY ms.created_at ASC
     """, (tenant, period, seven_days_ago))
     
     rows = cur.fetchall()
