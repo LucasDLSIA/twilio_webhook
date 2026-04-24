@@ -4298,7 +4298,7 @@ def get_pending_signatures_over_7days(tenant: str, period: str) -> list:
             WHERE re.tenant = sp.tenant
               AND re.cuil = sp.cuil
               AND re.period = sp.period
-              AND re.estado = 'FIRMADO'
+              AND re.estado IN ('FIRMADO', 'OBSERVADO') 
           )
         ORDER BY sp.created_at ASC
     """, (tenant, period, seven_days_ago))
