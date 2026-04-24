@@ -1,5 +1,6 @@
 import os
 import io
+from pydoc import html
 import re
 import time
 import sqlite3
@@ -8,6 +9,7 @@ import threading
 from datetime import datetime
 import datetime as _dt
 
+import token
 from typing import Optional, Dict, List
 
 import pandas as pd
@@ -3439,6 +3441,232 @@ def get_queue_stats(tenant: str, period: str) -> dict:
         d.setdefault(k, 0)
     return d
 
+@app.get("/admin/seguimiento")
+def admin_seguimiento():
+    """
+    Panel de seguimiento de pendientes (+7 días sin acción).
+    """
+    auth = require_admin()
+    if auth:
+        return auth
+
+    token = (request.args.get("token") or "").strip()
+    tenant = (request.args.get("tenant") or "").strip().lower()
+
+    if not tenant:
+        return Response("Falta tenant", status=400)
+
+    t = get_tenant(tenant)
+    if not t:
+        return Response("Tenant inválido", status=400)
+
+    # Períodos disponibles
+    period_folders = list_tenant_period_folders(tenant)
+    period_labels = []
+    for p in period_folders:
+        lbl = period_folder_to_label(p)
+        if lbl:
+            period_labels.append(lbl)
+
+    # Período seleccionado
+    panel_period = (request.args.get("period") or "").strip()
+    if not panel_period and period_labels:
+        panel_period = period_labels[0]
+
+    # Cargar pendientes
+    pending_views_7d = []
+    pending_sigs_7d = []
+    if panel_period:
+        pending_views_7d = get_pending_views_over_7days(tenant, panel_period)
+        pending_sigs_7d = get_pending_signatures_over_7days(tenant, panel_period)
+
+    html = []
+    html.append("""<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Seguimiento de pendientes</title>
+  <style>
+    :root{
+      --bg:#0b1220; --card:#0f1b33; --muted:#9fb2d0; --text:#eaf0ff;
+      --line:rgba(255,255,255,.08); --accent:#5aa7ff; --ok:#34d399;
+      --warn:#fbbf24; --bad:#fb7185; --shadow: 0 10px 25px rgba(0,0,0,.25);
+      --radius:14px;
+      --mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+      --sans: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial;
+    }
+    *{box-sizing:border-box}
+    body{
+      margin:0; font-family:var(--sans);
+      background: radial-gradient(1200px 700px at 20% -20%, rgba(90,167,255,.25), transparent 60%),
+                  radial-gradient(1200px 700px at 90% 0%, rgba(52,211,153,.18), transparent 55%),
+                  var(--bg);
+      color:var(--text);
+    }
+    .wrap{max-width:1100px;margin:0 auto;padding:22px}
+    .topbar{
+      display:flex;gap:14px;align-items:center;justify-content:space-between;
+      padding:16px 18px;border:1px solid var(--line);border-radius:var(--radius);
+      background:rgba(255,255,255,.03);box-shadow:var(--shadow);
+      position:sticky;top:12px;backdrop-filter:blur(8px);z-index:10;
+    }
+    .title h2{margin:0;font-size:18px}
+    .subtitle{font-size:13px;color:var(--muted);margin-top:4px}
+    .card{
+      border:1px solid var(--line); background:rgba(255,255,255,.03);
+      border-radius:var(--radius); padding:16px; box-shadow:var(--shadow);
+      margin-top:16px;
+    }
+    .card h3{margin:0 0 10px 0;font-size:15px}
+    .muted{color:var(--muted);font-size:13px}
+    .row{display:flex;gap:10px;flex-wrap:wrap;align-items:center}
+    .btn{
+      display:inline-flex;align-items:center;gap:8px;
+      padding:10px 12px;border-radius:12px;border:1px solid var(--line);
+      background:linear-gradient(180deg, rgba(255,255,255,.06), rgba(255,255,255,.02));
+      cursor:pointer;font-weight:600;font-size:13px;
+      transition:transform .05s ease;
+    }
+    .btn:hover{transform:translateY(-1px)}
+    .btn.secondary{background:rgba(255,255,255,.02)}
+    .btn.small{padding:7px 10px;font-size:12px;border-radius:10px}
+    select, input{
+      background:rgba(0,0,0,.25);border:1px solid var(--line);
+      color:var(--text);padding:10px;border-radius:12px;outline:none;
+    }
+    .sep{height:1px;background:var(--line);margin:12px 0}
+    table{width:100%;border-collapse:separate;border-spacing:0}
+    th, td{padding:10px;border-bottom:1px solid var(--line);font-size:13px}
+    th{font-size:12px;color:var(--muted);text-align:left}
+    tr:hover td{background:rgba(255,255,255,.02)}
+    .table-wrap{overflow:auto;border:1px solid var(--line);border-radius:14px;margin-top:10px}
+    .mono{font-family:var(--mono)}
+    .hint{font-size:12px;color:var(--muted);margin-top:6px}
+    .badge{
+      display:inline-block;padding:4px 10px;border-radius:999px;
+      border:1px solid var(--line);background:rgba(255,255,255,.03);
+      font-size:12px;font-weight:600;
+    }
+    .badge.red{color:#fb7185;border-color:rgba(251,113,133,.35)}
+    .badge.yellow{color:#fbbf24;border-color:rgba(251,191,36,.35)}
+  </style>
+</head>
+<body>
+""")
+
+    html.append("<div class='wrap'>")
+    html.append("<div class='topbar'>")
+    html.append("<div class='title'>")
+    html.append("<h2>⚠️ Seguimiento de pendientes</h2>")
+    html.append(f"<div class='subtitle'><b>Empresa:</b> {esc(t.get('display_name',''))}</div>")
+    html.append("</div>")
+    html.append("<div class='row'>")
+    html.append(f"<a class='btn secondary' href='/admin/panel?tenant={esc(tenant)}&token={esc(token)}'>← Volver al panel</a>")
+    html.append("</div>")
+    html.append("</div>")
+
+    # Selector de período
+    html.append("<div class='card'>")
+    html.append("<form method='get'>")
+    html.append(f"<input type='hidden' name='token' value='{esc(token)}'>")
+    html.append(f"<input type='hidden' name='tenant' value='{esc(tenant)}'>")
+    html.append("<div class='row'>")
+    html.append("<div>")
+    html.append("<label class='muted'>Período</label><br>")
+    html.append("<select name='period'>")
+    for lbl in period_labels:
+        sel = "selected" if lbl == panel_period else ""
+        html.append(f"<option value='{esc(lbl)}' {sel}>{esc(lbl)}</option>")
+    html.append("</select>")
+    html.append("</div>")
+    html.append("<button class='btn' type='submit' style='margin-top:18px'>Aplicar</button>")
+    html.append("</div>")
+    html.append("</form>")
+    html.append("</div>")
+
+    if not panel_period:
+        html.append("<div class='card'><div class='muted'>Elegí un período para ver los pendientes.</div></div>")
+        html.append("</div></body></html>")
+        return Response("".join(html), mimetype="text/html")
+
+    # No vieron el recibo
+    html.append("<div class='card'>")
+    html.append(f"<h3>🔴 No vieron el recibo <span class='badge red'>{len(pending_views_7d)}</span></h3>")
+    html.append("<div class='muted'>Template enviado hace más de 7 días, nunca hicieron click en VIEW_NOW</div>")
+
+    if pending_views_7d:
+        html.append("<div class='table-wrap'>")
+        html.append("<table>")
+        html.append("<thead><tr><th>Nombre</th><th>CUIL</th><th>WhatsApp</th><th>Días</th><th>Acción</th></tr></thead>")
+        html.append("<tbody>")
+        
+        for p in pending_views_7d:
+            html.append("<tr>")
+            html.append(f"<td>{esc(p['nombre'])}</td>")
+            html.append(f"<td class='mono'>{esc(p['cuil'])}</td>")
+            html.append(f"<td class='mono'>{esc(p['whatsapp'])}</td>")
+            html.append(f"<td>{p['days_ago']} días</td>")
+            html.append("<td>")
+            html.append(f"""
+                <form method='post' action='/admin/resend_template' style='margin:0'>
+                    <input type='hidden' name='token' value='{esc(token)}'>
+                    <input type='hidden' name='tenant' value='{esc(tenant)}'>
+                    <input type='hidden' name='period' value='{esc(panel_period)}'>
+                    <input type='hidden' name='cuil' value='{esc(p["cuil"])}'>
+                    <input type='hidden' name='whatsapp' value='{esc(p["whatsapp"])}'>
+                    <button class='btn small' type='submit'>🔄 Reenviar</button>
+                </form>
+            """)
+            html.append("</td>")
+            html.append("</tr>")
+        
+        html.append("</tbody></table></div>")
+    else:
+        html.append("<div class='muted' style='margin-top:10px'>✅ No hay pendientes en esta categoría</div>")
+
+    html.append("</div>")
+
+    # No firmaron
+    html.append("<div class='card'>")
+    html.append(f"<h3>🟡 No firmaron <span class='badge yellow'>{len(pending_sigs_7d)}</span></h3>")
+    html.append("<div class='muted'>PDF recibido hace más de 7 días, nunca firmaron (SIGN_OK/SIGN_OBS)</div>")
+
+    if pending_sigs_7d:
+        html.append("<div class='table-wrap'>")
+        html.append("<table>")
+        html.append("<thead><tr><th>Nombre</th><th>CUIL</th><th>WhatsApp</th><th>Días</th><th>Acción</th></tr></thead>")
+        html.append("<tbody>")
+        
+        for p in pending_sigs_7d:
+            html.append("<tr>")
+            html.append(f"<td>{esc(p['nombre'])}</td>")
+            html.append(f"<td class='mono'>{esc(p['cuil'])}</td>")
+            html.append(f"<td class='mono'>{esc(p['whatsapp'])}</td>")
+            html.append(f"<td>{p['days_ago']} días</td>")
+            html.append("<td>")
+            html.append(f"""
+                <form method='post' action='/admin/remind_signature' style='margin:0'>
+                    <input type='hidden' name='token' value='{esc(token)}'>
+                    <input type='hidden' name='tenant' value='{esc(tenant)}'>
+                    <input type='hidden' name='period' value='{esc(panel_period)}'>
+                    <input type='hidden' name='cuil' value='{esc(p["cuil"])}'>
+                    <input type='hidden' name='whatsapp' value='{esc(p["whatsapp"])}'>
+                    <button class='btn small' type='submit'>📝 Recordar</button>
+                </form>
+            """)
+            html.append("</td>")
+            html.append("</tr>")
+        
+        html.append("</tbody></table></div>")
+    else:
+        html.append("<div class='muted' style='margin-top:10px'>✅ No hay pendientes en esta categoría</div>")
+
+    html.append("</div>")
+
+    html.append("</div></body></html>")
+    return Response("".join(html), mimetype="text/html")
+
 
 @app.get("/admin/panel")
 def admin_panel():
@@ -3622,7 +3850,9 @@ def admin_panel():
     html.append("</div>")
     html.append("<div class='right'>")
     html.append(f"<a class='btn secondary' href='/admin?token={esc(token)}'>← Volver</a>")
+    html.append(f"<a class='btn' href='/admin/send_test?tenant={esc(tenant)}&token={esc(token)}'> Envio individual</a>")
     html.append(f"<a class='btn' href='/admin/send_test?tenant={esc(tenant)}&token={esc(token)}'>🧪 Envío de prueba</a>")
+    html.append(f"<a class='btn' href='/admin/seguimiento?tenant={esc(tenant)}&token={esc(token)}'>⚠️ Seguimiento</a>")  # ← NUEVO
     html.append("</div>")
     html.append("</div>")
 
@@ -3786,77 +4016,7 @@ def admin_panel():
         html.append(f"<div class='hint mono'><code>/admin/send_template_queue_tick?tenant={esc(tenant)}&period={esc(panel_period)}&batch_size=10&token={esc(token)}&mode=json</code></div>")
     else:
         html.append("<div class='muted'>Elegí un período en Reportes para ver la cola y poder procesarla.</div>")
-
-    # Seguimiento de pendientes
-    if panel_period and (pending_views_7d or pending_sigs_7d):
-        html.append("<div class='sep'></div>")
-        html.append("<h3>⚠️ Seguimiento - Pendientes</h3>")
         
-        # No vieron el recibo (>7 días)
-        if pending_views_7d:
-            html.append(f"<div class='muted' style='margin-top:10px'>🔴 <b>No vieron el recibo</b> (más de 7 días desde envío) - Total: <b>{len(pending_views_7d)}</b></div>")
-            html.append("<div class='table-wrap' style='margin-top:8px'>")
-            html.append("<table>")
-            html.append("<thead><tr><th>Nombre</th><th>CUIL</th><th>Días</th><th>Acción</th></tr></thead>")
-            html.append("<tbody>")
-            
-            for p in pending_views_7d[:20]:  # Mostrar máximo 20
-                html.append("<tr>")
-                html.append(f"<td>{esc(p['nombre'])}</td>")
-                html.append(f"<td class='mono'>{esc(p['cuil'])}</td>")
-                html.append(f"<td>{p['days_ago']} días</td>")
-                html.append("<td>")
-                html.append(f"""
-                    <form method='post' action='/admin/resend_template' style='margin:0'>
-                        <input type='hidden' name='token' value='{esc(token)}'>
-                        <input type='hidden' name='tenant' value='{esc(tenant)}'>
-                        <input type='hidden' name='period' value='{esc(panel_period)}'>
-                        <input type='hidden' name='cuil' value='{esc(p["cuil"])}'>
-                        <input type='hidden' name='whatsapp' value='{esc(p["whatsapp"])}'>
-                        <button class='btn small' type='submit'>🔄 Reenviar</button>
-                    </form>
-                """)
-                html.append("</td>")
-                html.append("</tr>")
-            
-            html.append("</tbody></table></div>")
-            
-            if len(pending_views_7d) > 20:
-                html.append(f"<div class='hint'>Mostrando 20 de {len(pending_views_7d)} pendientes</div>")
-        
-        # No firmaron (>7 días)
-        if pending_sigs_7d:
-            html.append(f"<div class='muted' style='margin-top:15px'>🟡 <b>No firmaron</b> (más de 7 días desde recepción PDF) - Total: <b>{len(pending_sigs_7d)}</b></div>")
-            html.append("<div class='table-wrap' style='margin-top:8px'>")
-            html.append("<table>")
-            html.append("<thead><tr><th>Nombre</th><th>CUIL</th><th>Días</th><th>Acción</th></tr></thead>")
-            html.append("<tbody>")
-            
-            for p in pending_sigs_7d[:20]:  # Mostrar máximo 20
-                html.append("<tr>")
-                html.append(f"<td>{esc(p['nombre'])}</td>")
-                html.append(f"<td class='mono'>{esc(p['cuil'])}</td>")
-                html.append(f"<td>{p['days_ago']} días</td>")
-                html.append("<td>")
-                html.append(f"""
-                    <form method='post' action='/admin/remind_signature' style='margin:0'>
-                        <input type='hidden' name='token' value='{esc(token)}'>
-                        <input type='hidden' name='tenant' value='{esc(tenant)}'>
-                        <input type='hidden' name='period' value='{esc(panel_period)}'>
-                        <input type='hidden' name='cuil' value='{esc(p["cuil"])}'>
-                        <input type='hidden' name='whatsapp' value='{esc(p["whatsapp"])}'>
-                        <button class='btn small' type='submit'>📝 Recordar</button>
-                    </form>
-                """)
-                html.append("</td>")
-                html.append("</tr>")
-            
-            html.append("</tbody></table></div>")
-            
-            if len(pending_sigs_7d) > 20:
-                html.append(f"<div class='hint'>Mostrando 20 de {len(pending_sigs_7d)} pendientes</div>")
-
-
     html.append("</div>")  # fin card izquierda
 
     # Columna derecha: reportes + herramientas rápidas
