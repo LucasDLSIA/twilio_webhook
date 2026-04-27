@@ -2871,11 +2871,6 @@ def admin_home():
                   </div>
                   <button class="eye-btn eye-one" type="button" data-tenant="{esc(slug)}" title="Mostrar solo esta">👁️</button>
                 </div>
-
-                <div class="actions">
-                  <a class="btn" href="{panel_url}">Abrir panel →</a>
-                  <a class="btn secondary small" href="{test_url}">🧪 Prueba</a>
-                </div>
               </div>
             """)
 
@@ -3873,7 +3868,6 @@ def admin_panel():
     html.append("<div class='right'>")
     html.append(f"<a class='btn secondary' href='/admin?token={esc(token)}'>← Volver</a>")
     html.append(f"<a class='btn' href='/admin/send_test?tenant={esc(tenant)}&token={esc(token)}'> Envio individual</a>")
-    html.append(f"<a class='btn' href='/admin/send_test?tenant={esc(tenant)}&token={esc(token)}'>🧪 Envío de prueba</a>")
     html.append(f"<a class='btn' href='/admin/seguimiento?tenant={esc(tenant)}&token={esc(token)}'>⚠️ Seguimiento</a>")  # ← NUEVO
     html.append("</div>")
     html.append("</div>")
