@@ -5226,6 +5226,13 @@ def admin_panel():
     html.append("</div></body></html>")
     return Response("".join(html), mimetype="text/html")
 
+def get_all_tenants():
+    """
+    Obtiene todas las empresas (tenants) del master file.
+    """
+    tenants = load_tenants()
+    return tenants if tenants else []
+
 @app.route("/admin/portal_users", methods=["GET", "POST"])
 def admin_portal_users():
     """
