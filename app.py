@@ -795,7 +795,7 @@ def create_client_user(tenant: str, username: str, email: str, full_name: str, c
     conn.close()
     
     # Enviar email
-    portal_url = "https://twilio-webhook-lddc.onrender.com/portal"
+    portal_url = "https://twilio-webhook-lddc.onrender.com/portal/login"
     email_sent = send_welcome_email(email, username, temp_password, portal_url)
     
     if not email_sent:
@@ -910,7 +910,7 @@ def get_portal_user_by_id(user_id: int):
     conn.row_factory = sqlite3.Row
     cur = conn.cursor()
     cur.execute("""
-        SELECT id, tenant, username, email, full_name, role, active, must_change_password
+        SELECT id, tenant, username, password_hash, email, full_name, role, active, must_change_password
         FROM client_users
         WHERE id = ?
     """, (user_id,))
