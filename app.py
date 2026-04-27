@@ -2871,6 +2871,10 @@ def admin_home():
                   </div>
                   <button class="eye-btn eye-one" type="button" data-tenant="{esc(slug)}" title="Mostrar solo esta">👁️</button>
                 </div>
+
+                <div class="actions">
+                  <a class="btn" href="{panel_url}">Abrir panel →</a>
+                </div>
               </div>
             """)
 
