@@ -1093,6 +1093,246 @@ def portal_login():
     
     return Response("".join(html), mimetype="text/html")
 
+@app.route("/portal")
+def portal_dashboard():
+    """
+    Dashboard principal del portal de clientes.
+    """
+    # Verificar login
+    auth = require_portal_login()
+    if auth:
+        return auth
+    
+    user_id = session.get('portal_user_id')
+    user = get_portal_user_by_id(user_id)
+    tenant = user['tenant']
+    
+    # Obtener períodos disponibles
+    period_folders = list_tenant_period_folders(tenant)
+    period_labels = []
+    for p in period_folders:
+        lbl = period_folder_to_label(p)
+        if lbl:
+            period_labels.append(lbl)
+    
+    # Período seleccionado
+    selected_period = request.args.get("period", "")
+    if not selected_period and period_labels:
+        selected_period = period_labels[0]
+    
+    msg = request.args.get("msg", "")
+    
+    # Si hay período, cargar KPIs
+    kpis = None
+    if selected_period:
+        # Contar enviados
+        conn = get_db_connection()
+        cur = conn.cursor()
+        
+        cur.execute("""
+            SELECT COUNT(DISTINCT cuil) 
+            FROM message_status 
+            WHERE tenant = ? AND period = ? AND kind = 'template'
+        """, (tenant, selected_period))
+        enviados = cur.fetchone()[0] or 0
+        
+        # Contar vistos (tienen PDF enviado)
+        cur.execute("""
+            SELECT COUNT(DISTINCT cuil)
+            FROM sent_pdfs
+            WHERE tenant = ? AND period = ?
+        """, (tenant, selected_period))
+        vistos = cur.fetchone()[0] or 0
+        
+        # Contar firmados
+        cur.execute("""
+            SELECT COUNT(DISTINCT cuil)
+            FROM recibo_estado
+            WHERE tenant = ? AND period = ? AND estado IN ('FIRMADO', 'OBSERVADO')
+        """, (tenant, selected_period))
+        firmados = cur.fetchone()[0] or 0
+        
+        conn.close()
+        
+        pendientes = enviados - firmados
+        pct_vistos = int((vistos / enviados * 100)) if enviados > 0 else 0
+        pct_firmados = int((firmados / enviados * 100)) if enviados > 0 else 0
+        
+        kpis = {
+            'enviados': enviados,
+            'vistos': vistos,
+            'firmados': firmados,
+            'pendientes': pendientes,
+            'pct_vistos': pct_vistos,
+            'pct_firmados': pct_firmados
+        }
+    
+    # Obtener info del tenant
+    t = get_tenant(tenant)
+    empresa_nombre = t.get('display_name', tenant) if t else tenant
+    
+    html = []
+    html.append("""<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Portal - Dashboard</title>
+  <style>
+    :root{
+      --bg:#0b1220; --card:#0f1b33; --text:#eaf0ff; --muted:#9fb2d0;
+      --accent:#5aa7ff; --ok:#34d399; --warn:#fbbf24; --line:rgba(255,255,255,.08);
+    }
+    *{box-sizing:border-box; margin:0; padding:0}
+    body{
+      font-family:system-ui; background:var(--bg); color:var(--text);
+      padding:20px;
+    }
+    .container{max-width:1100px; margin:0 auto}
+    .header{
+      background:rgba(255,255,255,.03); border:1px solid var(--line);
+      border-radius:12px; padding:20px; margin-bottom:20px;
+      display:flex; justify-content:space-between; align-items:center;
+      flex-wrap:wrap; gap:15px;
+    }
+    .header h1{font-size:22px}
+    .subtitle{color:var(--muted); font-size:14px; margin-top:5px}
+    .btn{
+      display:inline-block; padding:10px 16px; border-radius:8px;
+      border:1px solid var(--line); background:rgba(255,255,255,.06);
+      text-decoration:none; color:var(--text); font-weight:600; font-size:13px;
+    }
+    .btn:hover{background:rgba(255,255,255,.1)}
+    .btn.primary{background:var(--accent); border-color:var(--accent); color:white}
+    .card{
+      background:rgba(255,255,255,.03); border:1px solid var(--line);
+      border-radius:12px; padding:20px; margin-bottom:20px;
+    }
+    .card h2{font-size:18px; margin-bottom:15px}
+    .kpis{
+      display:grid; grid-template-columns:repeat(auto-fit, minmax(200px, 1fr));
+      gap:15px; margin-top:15px;
+    }
+    .kpi{
+      background:rgba(0,0,0,.2); border:1px solid var(--line);
+      border-radius:10px; padding:20px; text-align:center;
+    }
+    .kpi-value{font-size:36px; font-weight:bold; margin:10px 0}
+    .kpi-label{color:var(--muted); font-size:13px}
+    .kpi-pct{color:var(--muted); font-size:14px; margin-top:5px}
+    .actions{display:grid; grid-template-columns:repeat(auto-fit, minmax(250px, 1fr)); gap:15px; margin-top:20px}
+    .action-card{
+      background:rgba(255,255,255,.02); border:1px solid var(--line);
+      border-radius:10px; padding:20px; text-align:center; cursor:pointer;
+      transition:all .2s;
+    }
+    .action-card:hover{background:rgba(255,255,255,.06); transform:translateY(-2px)}
+    .action-icon{font-size:32px; margin-bottom:10px}
+    .action-title{font-size:16px; font-weight:600; margin-bottom:5px}
+    .action-desc{font-size:13px; color:var(--muted)}
+    select, input{
+      background:rgba(0,0,0,.25); border:1px solid var(--line);
+      color:var(--text); padding:10px; border-radius:8px;
+    }
+    .success{
+      background:rgba(52,211,153,.1); border:1px solid rgba(52,211,153,.3);
+      padding:12px; border-radius:8px; margin-bottom:20px;
+    }
+  </style>
+</head>
+<body>
+<div class="container">
+  <div class="header">
+    <div>
+      <h1>👋 Hola, """ + esc(user.get('full_name') or user['username']) + """</h1>
+      <div class="subtitle">🏢 """ + esc(empresa_nombre) + """</div>
+    </div>
+    <div style="display:flex; gap:10px; flex-wrap:wrap">
+      <a href="/portal/change_password" class="btn">🔐 Cambiar contraseña</a>
+      <a href="/portal/logout" class="btn">🚪 Salir</a>
+    </div>
+  </div>
+""")
+    
+    if msg == "password_changed":
+        html.append("<div class='success'>✅ Contraseña cambiada correctamente</div>")
+    
+    # Selector de período
+    html.append("<div class='card'>")
+    html.append("<h2>📅 Seleccionar período</h2>")
+    html.append("<form method='get'>")
+    html.append("<select name='period' onchange='this.form.submit()'>")
+    if not period_labels:
+        html.append("<option>No hay períodos disponibles</option>")
+    else:
+        for lbl in period_labels:
+            sel = "selected" if lbl == selected_period else ""
+            html.append(f"<option value='{esc(lbl)}' {sel}>{esc(lbl)}</option>")
+    html.append("</select>")
+    html.append("</form>")
+    html.append("</div>")
+    
+    # KPIs
+    if kpis:
+        html.append("<div class='card'>")
+        html.append(f"<h2>📊 Resumen - {esc(selected_period)}</h2>")
+        html.append("<div class='kpis'>")
+        
+        html.append("<div class='kpi'>")
+        html.append(f"<div class='kpi-value'>{kpis['enviados']}</div>")
+        html.append("<div class='kpi-label'>📤 Enviados</div>")
+        html.append("</div>")
+        
+        html.append("<div class='kpi'>")
+        html.append(f"<div class='kpi-value'>{kpis['vistos']}</div>")
+        html.append("<div class='kpi-label'>👁️ Vieron el recibo</div>")
+        html.append(f"<div class='kpi-pct'>{kpis['pct_vistos']}%</div>")
+        html.append("</div>")
+        
+        html.append("<div class='kpi'>")
+        html.append(f"<div class='kpi-value' style='color:var(--ok)'>{kpis['firmados']}</div>")
+        html.append("<div class='kpi-label'>✅ Firmaron</div>")
+        html.append(f"<div class='kpi-pct'>{kpis['pct_firmados']}%</div>")
+        html.append("</div>")
+        
+        html.append("<div class='kpi'>")
+        html.append(f"<div class='kpi-value' style='color:var(--warn)'>{kpis['pendientes']}</div>")
+        html.append("<div class='kpi-label'>⚠️ Pendientes</div>")
+        html.append("</div>")
+        
+        html.append("</div>")
+        html.append("</div>")
+        
+        # Acciones rápidas
+        html.append("<div class='card'>")
+        html.append("<h2>🎯 Acciones rápidas</h2>")
+        html.append("<div class='actions'>")
+        
+        html.append(f"<a href='/portal/search?period={esc(selected_period)}' class='action-card' style='text-decoration:none; color:inherit'>")
+        html.append("<div class='action-icon'>🔍</div>")
+        html.append("<div class='action-title'>Buscar empleado</div>")
+        html.append("<div class='action-desc'>Por nombre, CUIL o DNI</div>")
+        html.append("</a>")
+        
+        html.append(f"<a href='/admin/seguimiento?tenant={esc(tenant)}&token={request.args.get('admin_token', '')}' class='action-card' style='text-decoration:none; color:inherit'>")
+        html.append("<div class='action-icon'>⚠️</div>")
+        html.append("<div class='action-title'>Ver pendientes</div>")
+        html.append(f"<div class='action-desc'>{kpis['pendientes']} sin firmar</div>")
+        html.append("</a>")
+        
+        html.append(f"<a href='/portal/reports?period={esc(selected_period)}' class='action-card' style='text-decoration:none; color:inherit'>")
+        html.append("<div class='action-icon'>📊</div>")
+        html.append("<div class='action-title'>Reportes</div>")
+        html.append("<div class='action-desc'>Descargar Excel, estadísticas</div>")
+        html.append("</a>")
+        
+        html.append("</div>")
+        html.append("</div>")
+    
+    html.append("</div>")
+    html.append("</body></html>")
+    
+    return Response("".join(html), mimetype="text/html")
 
 @app.route("/portal/logout")
 def portal_logout():
