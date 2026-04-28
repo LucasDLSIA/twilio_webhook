@@ -1539,6 +1539,36 @@ def portal_search():
     
     return Response("".join(html), mimetype="text/html")
 
+@app.get("/portal/report.pdf")
+def portal_report_pdf():
+    """
+    Reporte PDF para el portal de clientes.
+    """
+    # Verificar login
+    auth = require_portal_login()
+    if auth:
+        return auth
+    
+    user_id = session.get('portal_user_id')
+    user = get_portal_user_by_id(user_id)
+    tenant = user['tenant']
+    
+    period = (request.args.get("period") or "").strip()
+    
+    # Generar PDF
+    buf = generate_pdf_report_v2(tenant, period_filter=period)
+    
+    filename = f"reporte_{tenant}_{(norm_period_label(period).replace('/','-') if period else 'todos')}.pdf"
+    
+    from flask import send_file
+    return send_file(
+        buf,
+        as_attachment=True,
+        download_name=filename,
+        mimetype="application/pdf"
+    )
+
+
 @app.route("/portal/reports")
 def portal_reports():
     """
@@ -1561,81 +1591,121 @@ def portal_reports():
     
     # Si se pidió exportar
     action = request.args.get("action", "")
-    if action == "export_all" and period:
-        # Generar Excel con todos los datos
+    if action in ("export_all", "export_pending_sigs", "export_pending_views") and period:
+        # Generar Excel
         import io
         from openpyxl import Workbook
         
         wb = Workbook()
         ws = wb.active
-        ws.title = "Todos"
         
-        # Headers
-        ws.append(["Nombre", "CUIL", "WhatsApp", "Estado", "Enviado", "Visto", "Firmado"])
+        conn = get_db_connection()
+        cur = conn.cursor()
+        
+        if action == "export_all":
+            ws.title = "Todos"
+            ws.append(["Nombre", "CUIL", "WhatsApp", "Estado", "Enviado", "Visto", "Firmado"])
+            
+            # Obtener solo los CUILs que tienen template enviado
+            cur.execute("""
+                SELECT DISTINCT cuil FROM message_status
+                WHERE tenant = ? AND period = ? AND kind = 'template'
+                ORDER BY cuil
+            """, (tenant, period))
+            cuils = [r[0] for r in cur.fetchall()]
+            
+        elif action == "export_pending_views":
+            ws.title = "No vieron"
+            ws.append(["Nombre", "CUIL", "WhatsApp", "Enviado hace", "Días sin ver"])
+            
+            pending = get_pending_views_over_7days(tenant, period)
+            cuils = [p['cuil'] for p in pending]
+            
+        elif action == "export_pending_sigs":
+            ws.title = "No firmaron"
+            ws.append(["Nombre", "CUIL", "WhatsApp", "PDF enviado", "Días sin firmar"])
+            
+            pending = get_pending_signatures_over_7days(tenant, period)
+            cuils = [p['cuil'] for p in pending]
         
         # Cargar envios
         envios = load_envios_rows(tenant)
         
-        conn = get_db_connection()
-        cur = conn.cursor()
-
-        # Obtener solo los CUILs que tienen template enviado en este período
-        cur.execute("""
-            SELECT DISTINCT cuil FROM message_status
-            WHERE tenant = ? AND period = ? AND kind = 'template'
-            ORDER BY cuil
-        """, (tenant, period))
-
-        cuils_enviados = [r[0] for r in cur.fetchall()]
-
-        # Cargar envios para obtener datos
-        envios = load_envios_rows(tenant)
-
-        for cuil in cuils_enviados:
+        for cuil in cuils:
             # Buscar datos del empleado
             person = find_person_by_cuil(envios, cuil)
             nombre = person.get('nombre', '') if person else ''
             whatsapp = person.get('whatsapp', '') if person else ''
             
-            # Ver estado
-            cur.execute("""
-                SELECT created_at FROM message_status
-                WHERE tenant = ? AND cuil = ? AND period = ? AND kind = 'template'
-                LIMIT 1
-            """, (tenant, cuil, period))
-            template_row = cur.fetchone()
+            if action == "export_all":
+                # Ver estado completo
+                cur.execute("""
+                    SELECT created_at FROM message_status
+                    WHERE tenant = ? AND cuil = ? AND period = ? AND kind = 'template'
+                    LIMIT 1
+                """, (tenant, cuil, period))
+                template_row = cur.fetchone()
+                
+                cur.execute("""
+                    SELECT created_at FROM sent_pdfs
+                    WHERE tenant = ? AND cuil = ? AND period = ?
+                    LIMIT 1
+                """, (tenant, cuil, period))
+                pdf_row = cur.fetchone()
+                
+                cur.execute("""
+                    SELECT estado, updated_at FROM recibo_estado
+                    WHERE tenant = ? AND cuil = ? AND period = ?
+                    LIMIT 1
+                """, (tenant, cuil, period))
+                estado_row = cur.fetchone()
+                
+                if estado_row and estado_row[0] in ('FIRMADO', 'OBSERVADO'):
+                    status = estado_row[0]
+                    firmado_fecha = ts_str(estado_row[1]) if estado_row[1] else ""
+                elif pdf_row:
+                    status = "VISTO"
+                    firmado_fecha = ""
+                elif template_row:
+                    status = "ENVIADO"
+                    firmado_fecha = ""
+                else:
+                    status = "NO_ENVIADO"
+                    firmado_fecha = ""
+                
+                enviado_fecha = ts_str(template_row[0]) if template_row else ""
+                visto_fecha = ts_str(pdf_row[0]) if pdf_row else ""
+                
+                ws.append([nombre, cuil, whatsapp, status, enviado_fecha, visto_fecha, firmado_fecha])
             
-            cur.execute("""
-                SELECT created_at FROM sent_pdfs
-                WHERE tenant = ? AND cuil = ? AND period = ?
-                LIMIT 1
-            """, (tenant, cuil, period))
-            pdf_row = cur.fetchone()
+            elif action == "export_pending_views":
+                # Solo los que no vieron
+                cur.execute("""
+                    SELECT created_at FROM message_status
+                    WHERE tenant = ? AND cuil = ? AND period = ? AND kind = 'template'
+                    LIMIT 1
+                """, (tenant, cuil, period))
+                template_row = cur.fetchone()
+                
+                enviado_fecha = ts_str(template_row[0]) if template_row else ""
+                days_ago = int((time.time() - template_row[0]) / 86400) if template_row else 0
+                
+                ws.append([nombre, cuil, whatsapp, enviado_fecha, days_ago])
             
-            cur.execute("""
-                SELECT estado, updated_at FROM recibo_estado
-                WHERE tenant = ? AND cuil = ? AND period = ?
-                LIMIT 1
-            """, (tenant, cuil, period))
-            estado_row = cur.fetchone()
-            
-            if estado_row and estado_row[0] in ('FIRMADO', 'OBSERVADO'):
-                status = estado_row[0]
-                firmado_fecha = ts_str(estado_row[1]) if estado_row[1] else ""
-            elif pdf_row:
-                status = "VISTO"
-                firmado_fecha = ""
-            elif template_row:
-                status = "ENVIADO"
-                firmado_fecha = ""
-            else:
-                status = "NO_ENVIADO"
-                firmado_fecha = ""
-            
-            enviado_fecha = ts_str(template_row[0]) if template_row else ""
-            visto_fecha = ts_str(pdf_row[0]) if pdf_row else ""
-            
-            ws.append([nombre, cuil, whatsapp, status, enviado_fecha, visto_fecha, firmado_fecha])
+            elif action == "export_pending_sigs":
+                # Solo los que no firmaron
+                cur.execute("""
+                    SELECT created_at FROM sent_pdfs
+                    WHERE tenant = ? AND cuil = ? AND period = ?
+                    LIMIT 1
+                """, (tenant, cuil, period))
+                pdf_row = cur.fetchone()
+                
+                pdf_fecha = ts_str(pdf_row[0]) if pdf_row else ""
+                days_ago = int((time.time() - pdf_row[0]) / 86400) if pdf_row else 0
+                
+                ws.append([nombre, cuil, whatsapp, pdf_fecha, days_ago])
+        
         conn.close()
         
         # Guardar en memoria
@@ -1644,11 +1714,17 @@ def portal_reports():
         output.seek(0)
         
         from flask import send_file
+        filename_map = {
+            'export_all': f'reporte_completo_{tenant}_{period.replace("/", "-")}.xlsx',
+            'export_pending_views': f'pendientes_no_vieron_{tenant}_{period.replace("/", "-")}.xlsx',
+            'export_pending_sigs': f'pendientes_no_firmaron_{tenant}_{period.replace("/", "-")}.xlsx'
+        }
+        
         return send_file(
             output,
             mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
             as_attachment=True,
-            download_name=f'reporte_{tenant}_{period.replace("/", "-")}.xlsx'
+            download_name=filename_map.get(action, 'reporte.xlsx')
         )
     
     # KPIs
@@ -1791,10 +1867,34 @@ def portal_reports():
         
         html.append("<div class='download-card'>")
         html.append("<div class='download-info'>")
-        html.append("<h3>📄 Reporte completo</h3>")
-        html.append("<p>Excel con todos los empleados y su estado</p>")
+        html.append("<h3>📑 Reporte PDF completo</h3>")
+        html.append("<p>PDF con KPIs, gráficos y tabla detallada</p>")
+        html.append("</div>")
+        html.append(f"<a href='/portal/report.pdf?period={esc(period)}' class='btn primary'>Descargar PDF</a>")
+        html.append("</div>")
+        
+        html.append("<div class='download-card'>")
+        html.append("<div class='download-info'>")
+        html.append("<h3>📄 Excel - Reporte completo</h3>")
+        html.append("<p>Todos los empleados con su estado</p>")
         html.append("</div>")
         html.append(f"<a href='/portal/reports?period={esc(period)}&action=export_all' class='btn primary'>Descargar Excel</a>")
+        html.append("</div>")
+        
+        html.append("<div class='download-card'>")
+        html.append("<div class='download-info'>")
+        html.append("<h3>🔴 Excel - Solo no vieron</h3>")
+        html.append("<p>Empleados que no pidieron el PDF (>7 días)</p>")
+        html.append("</div>")
+        html.append(f"<a href='/portal/reports?period={esc(period)}&action=export_pending_views' class='btn primary'>Descargar Excel</a>")
+        html.append("</div>")
+        
+        html.append("<div class='download-card'>")
+        html.append("<div class='download-info'>")
+        html.append("<h3>🟡 Excel - Solo no firmaron</h3>")
+        html.append("<p>Empleados que no firmaron (>7 días)</p>")
+        html.append("</div>")
+        html.append(f"<a href='/portal/reports?period={esc(period)}&action=export_pending_sigs' class='btn primary'>Descargar Excel</a>")
         html.append("</div>")
         
         html.append("</div>")
