@@ -1539,6 +1539,262 @@ def portal_search():
     
     return Response("".join(html), mimetype="text/html")
 
+@app.route("/portal/reports")
+def portal_reports():
+    """
+    Reportes y exportación de datos.
+    """
+    # Verificar login
+    auth = require_portal_login()
+    if auth:
+        return auth
+    
+    user_id = session.get('portal_user_id')
+    user = get_portal_user_by_id(user_id)
+    tenant = user['tenant']
+    
+    period = request.args.get("period", "")
+    
+    # Obtener info del tenant
+    t = get_tenant(tenant)
+    empresa_nombre = t.get('display_name', tenant) if t else tenant
+    
+    # Si se pidió exportar
+    action = request.args.get("action", "")
+    if action == "export_all" and period:
+        # Generar Excel con todos los datos
+        import io
+        from openpyxl import Workbook
+        
+        wb = Workbook()
+        ws = wb.active
+        ws.title = "Todos"
+        
+        # Headers
+        ws.append(["Nombre", "CUIL", "WhatsApp", "Estado", "Enviado", "Visto", "Firmado"])
+        
+        # Cargar envios
+        envios = load_envios_rows(tenant)
+        
+        conn = get_db_connection()
+        cur = conn.cursor()
+        
+        for row in envios:
+            cuil = norm_cuil(row.get('cuil', ''))
+            nombre = row.get('nombre', '')
+            whatsapp = row.get('whatsapp', '')
+            
+            # Ver estado
+            cur.execute("""
+                SELECT created_at FROM message_status
+                WHERE tenant = ? AND cuil = ? AND period = ? AND kind = 'template'
+                LIMIT 1
+            """, (tenant, cuil, period))
+            template_row = cur.fetchone()
+            
+            cur.execute("""
+                SELECT created_at FROM sent_pdfs
+                WHERE tenant = ? AND cuil = ? AND period = ?
+                LIMIT 1
+            """, (tenant, cuil, period))
+            pdf_row = cur.fetchone()
+            
+            cur.execute("""
+                SELECT estado FROM recibo_estado
+                WHERE tenant = ? AND cuil = ? AND period = ?
+                LIMIT 1
+            """, (tenant, cuil, period))
+            estado_row = cur.fetchone()
+            
+            if estado_row and estado_row[0] in ('FIRMADO', 'OBSERVADO'):
+                status = estado_row[0]
+            elif pdf_row:
+                status = "VISTO"
+            elif template_row:
+                status = "ENVIADO"
+            else:
+                status = "NO_ENVIADO"
+            
+            enviado_fecha = ts_str(template_row[0]) if template_row else ""
+            visto_fecha = ts_str(pdf_row[0]) if pdf_row else ""
+            firmado_fecha = ""
+            if estado_row:
+                cur.execute("SELECT updated_at FROM recibo_estado WHERE tenant=? AND cuil=? AND period=?", 
+                           (tenant, cuil, period))
+                upd = cur.fetchone()
+                firmado_fecha = ts_str(upd[0]) if upd else ""
+            
+            ws.append([nombre, cuil, whatsapp, status, enviado_fecha, visto_fecha, firmado_fecha])
+        
+        conn.close()
+        
+        # Guardar en memoria
+        output = io.BytesIO()
+        wb.save(output)
+        output.seek(0)
+        
+        from flask import send_file
+        return send_file(
+            output,
+            mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+            as_attachment=True,
+            download_name=f'reporte_{tenant}_{period.replace("/", "-")}.xlsx'
+        )
+    
+    # KPIs
+    stats = None
+    if period:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        
+        cur.execute("""
+            SELECT COUNT(DISTINCT cuil) FROM message_status 
+            WHERE tenant = ? AND period = ? AND kind = 'template'
+        """, (tenant, period))
+        enviados = cur.fetchone()[0] or 0
+        
+        cur.execute("""
+            SELECT COUNT(DISTINCT cuil) FROM sent_pdfs
+            WHERE tenant = ? AND period = ?
+        """, (tenant, period))
+        vistos = cur.fetchone()[0] or 0
+        
+        cur.execute("""
+            SELECT COUNT(DISTINCT cuil) FROM recibo_estado
+            WHERE tenant = ? AND period = ? AND estado IN ('FIRMADO', 'OBSERVADO')
+        """, (tenant, period))
+        firmados = cur.fetchone()[0] or 0
+        
+        # Tiempo promedio de firma
+        cur.execute("""
+            SELECT AVG(re.updated_at - ms.created_at) / 86400.0
+            FROM recibo_estado re
+            JOIN message_status ms ON ms.tenant = re.tenant 
+                AND ms.cuil = re.cuil 
+                AND ms.period = re.period 
+                AND ms.kind = 'template'
+            WHERE re.tenant = ? AND re.period = ? 
+                AND re.estado IN ('FIRMADO', 'OBSERVADO')
+        """, (tenant, period))
+        avg_days = cur.fetchone()[0]
+        avg_days = round(avg_days, 1) if avg_days else 0
+        
+        conn.close()
+        
+        pct_vistos = int((vistos / enviados * 100)) if enviados > 0 else 0
+        pct_firmados = int((firmados / enviados * 100)) if enviados > 0 else 0
+        
+        stats = {
+            'enviados': enviados,
+            'vistos': vistos,
+            'firmados': firmados,
+            'pct_vistos': pct_vistos,
+            'pct_firmados': pct_firmados,
+            'avg_days': avg_days
+        }
+    
+    html = []
+    html.append("""<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Reportes</title>
+  <style>
+    :root{
+      --bg:#0b1220; --card:#0f1b33; --text:#eaf0ff; --muted:#9fb2d0;
+      --accent:#5aa7ff; --ok:#34d399; --line:rgba(255,255,255,.08);
+    }
+    *{box-sizing:border-box; margin:0; padding:0}
+    body{font-family:system-ui; background:var(--bg); color:var(--text); padding:20px}
+    .container{max-width:900px; margin:0 auto}
+    .header{
+      background:rgba(255,255,255,.03); border:1px solid var(--line);
+      border-radius:12px; padding:20px; margin-bottom:20px;
+    }
+    .btn{
+      display:inline-block; padding:10px 16px; border-radius:8px;
+      border:1px solid var(--line); background:rgba(255,255,255,.06);
+      text-decoration:none; color:var(--text); font-weight:600; font-size:13px;
+    }
+    .btn:hover{background:rgba(255,255,255,.1)}
+    .btn.primary{background:var(--accent); border-color:var(--accent); color:white}
+    .card{
+      background:rgba(255,255,255,.03); border:1px solid var(--line);
+      border-radius:12px; padding:20px; margin-bottom:20px;
+    }
+    .stat-grid{display:grid; grid-template-columns:repeat(auto-fit, minmax(200px, 1fr)); gap:15px}
+    .stat{background:rgba(0,0,0,.2); padding:20px; border-radius:10px; text-align:center}
+    .stat-value{font-size:32px; font-weight:bold; margin:10px 0}
+    .stat-label{color:var(--muted); font-size:13px}
+    .download-section{display:grid; gap:15px; margin-top:20px}
+    .download-card{
+      background:rgba(255,255,255,.02); border:1px solid var(--line);
+      border-radius:10px; padding:20px; display:flex; justify-content:space-between; align-items:center;
+    }
+    .download-info h3{font-size:16px; margin-bottom:5px}
+    .download-info p{font-size:13px; color:var(--muted)}
+  </style>
+</head>
+<body>
+<div class="container">
+  <div class="header">
+    <a href="/portal" class="btn">← Volver al dashboard</a>
+  </div>
+  
+  <div class="card">
+    <h2 style="margin-bottom:15px">📊 Reportes</h2>
+    <div style="color:var(--muted); font-size:13px; margin-bottom:15px">
+      🏢 """ + esc(empresa_nombre) + """ · 📅 """ + esc(period) + """
+    </div>
+""")
+    
+    if stats:
+        html.append("<h3 style='margin:20px 0 15px 0'>📈 Estadísticas del período</h3>")
+        html.append("<div class='stat-grid'>")
+        
+        html.append("<div class='stat'>")
+        html.append(f"<div class='stat-value'>{stats['enviados']}</div>")
+        html.append("<div class='stat-label'>📤 Enviados</div>")
+        html.append("</div>")
+        
+        html.append("<div class='stat'>")
+        html.append(f"<div class='stat-value'>{stats['pct_vistos']}%</div>")
+        html.append("<div class='stat-label'>👁️ Tasa de apertura</div>")
+        html.append("</div>")
+        
+        html.append("<div class='stat'>")
+        html.append(f"<div class='stat-value'>{stats['pct_firmados']}%</div>")
+        html.append("<div class='stat-label'>✅ Tasa de firma</div>")
+        html.append("</div>")
+        
+        html.append("<div class='stat'>")
+        html.append(f"<div class='stat-value'>{stats['avg_days']}</div>")
+        html.append("<div class='stat-label'>📅 Días prom. de firma</div>")
+        html.append("</div>")
+        
+        html.append("</div>")
+        
+        # Descargas
+        html.append("<h3 style='margin:30px 0 15px 0'>📥 Descargas</h3>")
+        html.append("<div class='download-section'>")
+        
+        html.append("<div class='download-card'>")
+        html.append("<div class='download-info'>")
+        html.append("<h3>📄 Reporte completo</h3>")
+        html.append("<p>Excel con todos los empleados y su estado</p>")
+        html.append("</div>")
+        html.append(f"<a href='/portal/reports?period={esc(period)}&action=export_all' class='btn primary'>Descargar Excel</a>")
+        html.append("</div>")
+        
+        html.append("</div>")
+    
+    html.append("</div>")
+    html.append("</div>")
+    html.append("</body></html>")
+    
+    return Response("".join(html), mimetype="text/html")
+
 @app.route("/portal/logout")
 def portal_logout():
     """
