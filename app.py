@@ -1578,11 +1578,24 @@ def portal_reports():
         
         conn = get_db_connection()
         cur = conn.cursor()
-        
-        for row in envios:
-            cuil = norm_cuil(row.get('cuil', ''))
-            nombre = row.get('nombre', '')
-            whatsapp = row.get('whatsapp', '')
+
+        # Obtener solo los CUILs que tienen template enviado en este período
+        cur.execute("""
+            SELECT DISTINCT cuil FROM message_status
+            WHERE tenant = ? AND period = ? AND kind = 'template'
+            ORDER BY cuil
+        """, (tenant, period))
+
+        cuils_enviados = [r[0] for r in cur.fetchall()]
+
+        # Cargar envios para obtener datos
+        envios = load_envios_rows(tenant)
+
+        for cuil in cuils_enviados:
+            # Buscar datos del empleado
+            person = find_person_by_cuil(envios, cuil)
+            nombre = person.get('nombre', '') if person else ''
+            whatsapp = person.get('whatsapp', '') if person else ''
             
             # Ver estado
             cur.execute("""
@@ -1600,7 +1613,7 @@ def portal_reports():
             pdf_row = cur.fetchone()
             
             cur.execute("""
-                SELECT estado FROM recibo_estado
+                SELECT estado, updated_at FROM recibo_estado
                 WHERE tenant = ? AND cuil = ? AND period = ?
                 LIMIT 1
             """, (tenant, cuil, period))
@@ -1608,24 +1621,21 @@ def portal_reports():
             
             if estado_row and estado_row[0] in ('FIRMADO', 'OBSERVADO'):
                 status = estado_row[0]
+                firmado_fecha = ts_str(estado_row[1]) if estado_row[1] else ""
             elif pdf_row:
                 status = "VISTO"
+                firmado_fecha = ""
             elif template_row:
                 status = "ENVIADO"
+                firmado_fecha = ""
             else:
                 status = "NO_ENVIADO"
+                firmado_fecha = ""
             
             enviado_fecha = ts_str(template_row[0]) if template_row else ""
             visto_fecha = ts_str(pdf_row[0]) if pdf_row else ""
-            firmado_fecha = ""
-            if estado_row:
-                cur.execute("SELECT updated_at FROM recibo_estado WHERE tenant=? AND cuil=? AND period=?", 
-                           (tenant, cuil, period))
-                upd = cur.fetchone()
-                firmado_fecha = ts_str(upd[0]) if upd else ""
             
             ws.append([nombre, cuil, whatsapp, status, enviado_fecha, visto_fecha, firmado_fecha])
-        
         conn.close()
         
         # Guardar en memoria
