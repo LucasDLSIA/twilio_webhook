@@ -1006,6 +1006,12 @@ def portal_login():
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Portal - Login</title>
+    <link rel="manifest" href="/static/manifest.json">
+    <meta name="theme-color" content="#5aa7ff">
+    <meta name="apple-mobile-web-app-capable" content="yes">
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+    <meta name="apple-mobile-web-app-title" content="Recibos">
+    <link rel="apple-touch-icon" href="/static/icon-192.png">
   <style>
     :root{
       --bg:#0b1220; --card:#0f1b33; --text:#eaf0ff;
@@ -1087,6 +1093,13 @@ def portal_login():
       <a href="/portal/forgot">¿Olvidaste tu contraseña?</a>
     </div>
   </div>
+  <script>
+    if ('serviceWorker' in navigator) {
+      navigator.serviceWorker.register('/static/sw.js')
+        .then(() => console.log('Service Worker registrado'))
+        .catch(err => console.log('Service Worker error:', err));
+    }
+  </script>
 </body>
 </html>
 """)
@@ -1177,7 +1190,13 @@ def portal_dashboard():
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Portal - Dashboard</title>
+<title>Portal - Dashboard</title>
+    <link rel="manifest" href="/static/manifest.json">
+    <meta name="theme-color" content="#5aa7ff">
+    <meta name="apple-mobile-web-app-capable" content="yes">
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+    <meta name="apple-mobile-web-app-title" content="Recibos">
+    <link rel="apple-touch-icon" href="/static/icon-192.png">
   <style>
     :root{
       --bg:#0b1220; --card:#0f1b33; --text:#eaf0ff; --muted:#9fb2d0;
@@ -1445,6 +1464,12 @@ def portal_search():
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Buscar empleado</title>
+<link rel="manifest" href="/static/manifest.json">
+<meta name="theme-color" content="#5aa7ff">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="Recibos">
+<link rel="apple-touch-icon" href="/static/icon-192.png">
   <style>
     :root{
       --bg:#0b1220; --card:#0f1b33; --text:#eaf0ff; --muted:#9fb2d0;
@@ -1786,6 +1811,12 @@ def portal_reports():
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Reportes</title>
+<link rel="manifest" href="/static/manifest.json">
+<meta name="theme-color" content="#5aa7ff">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="Recibos">
+<link rel="apple-touch-icon" href="/static/icon-192.png">
   <style>
     :root{
       --bg:#0b1220; --card:#0f1b33; --text:#eaf0ff; --muted:#9fb2d0;
@@ -1940,6 +1971,12 @@ def portal_pendientes():
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Pendientes</title>
+<link rel="manifest" href="/static/manifest.json">
+<meta name="theme-color" content="#5aa7ff">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="Recibos">
+<link rel="apple-touch-icon" href="/static/icon-192.png">
   <style>
     :root{
       --bg:#0b1220; --card:#0f1b33; --text:#eaf0ff; --muted:#9fb2d0;
@@ -2134,6 +2171,12 @@ def portal_change_password():
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Cambiar contraseña</title>
+<link rel="manifest" href="/static/manifest.json">
+<meta name="theme-color" content="#5aa7ff">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="Recibos">
+<link rel="apple-touch-icon" href="/static/icon-192.png">
   <style>
     :root{
       --bg:#0b1220; --card:#0f1b33; --text:#eaf0ff;
@@ -2336,6 +2379,12 @@ def portal_forgot_password():
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Recuperar contraseña</title>
+<link rel="manifest" href="/static/manifest.json">
+<meta name="theme-color" content="#5aa7ff">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="Recibos">
+<link rel="apple-touch-icon" href="/static/icon-192.png">
   <style>
     :root{
       --bg:#0b1220; --card:#0f1b33; --text:#eaf0ff;
@@ -2433,6 +2482,12 @@ def portal_reset_password(token):
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Link inválido</title>
+<link rel="manifest" href="/static/manifest.json">
+<meta name="theme-color" content="#5aa7ff">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="Recibos">
+<link rel="apple-touch-icon" href="/static/icon-192.png">
   <style>
     body{
       margin:0; font-family:system-ui; background:#0b1220; color:#eaf0ff;
@@ -2491,6 +2546,12 @@ def portal_reset_password(token):
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Nueva contraseña</title>
+    <link rel="manifest" href="/static/manifest.json">
+    <meta name="theme-color" content="#5aa7ff">
+    <meta name="apple-mobile-web-app-capable" content="yes">
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+    <meta name="apple-mobile-web-app-title" content="Recibos">
+    <link rel="apple-touch-icon" href="/static/icon-192.png">
   <style>
     :root{--bg:#0b1220; --accent:#5aa7ff; --error:#fb7185}
     *{box-sizing:border-box}
@@ -2550,6 +2611,17 @@ def portal_reset_password(token):
 """)
     
     return Response("".join(html), mimetype="text/html")
+
+@app.route("/static/<path:filename>")
+def serve_static(filename):
+    """
+    Servir archivos estáticos (manifest, iconos, etc).
+    """
+    import os
+    from flask import send_from_directory
+    
+    static_dir = os.path.join(os.path.dirname(__file__), 'static')
+    return send_from_directory(static_dir, filename)
 
 def send_whatsapp_template(
     to_whatsapp: str,
