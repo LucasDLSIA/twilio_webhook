@@ -1037,9 +1037,14 @@ def portal_login():
     }
   </style>
 </head>
-<body>
+<body class="login-page">
+  <div class="top-logo">
+    <img src="/static/icon-192.png" alt="SIA Sueldos">
+    <span class="top-logo-text">SIA</span>
+  </div>
+  
   <div class="login-card">
-    <h1>📊 Portal de Recibos</h1>
+    <h1>Portal de Recibos</h1>
     <div class="subtitle">Acceso para clientes</div>
 """)
     
@@ -1052,7 +1057,7 @@ def portal_login():
         html.append("<div class='alert alert-info'>✅ Sesión cerrada correctamente.</div>")
     elif msg == "password_reset":
         html.append("<div class='alert alert-info'>✅ Contraseña cambiada correctamente. Ya podés ingresar.</div>")
-        
+
     html.append("""
     <form method="post">
       <label>Usuario</label>
@@ -1235,6 +1240,10 @@ def portal_dashboard():
   </style>
 </head>
 <body>
+  <div class="top-logo">
+    <img src="/static/icon-192.png" alt="SIA Sueldos">
+    <span class="top-logo-text">SIA</span>
+  </div>
 <div class="container">
   <div class="header">
     <div>
