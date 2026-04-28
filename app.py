@@ -1314,7 +1314,7 @@ def portal_dashboard():
         html.append("<div class='action-desc'>Por nombre, CUIL o DNI</div>")
         html.append("</a>")
         
-        html.append(f"<a href='/admin/seguimiento?tenant={esc(tenant)}&token={request.args.get('admin_token', '')}' class='action-card' style='text-decoration:none; color:inherit'>")
+        html.append(f"<a href='/portal/pendientes?period={esc(selected_period)}' class='action-card' style='text-decoration:none; color:inherit'>")
         html.append("<div class='action-icon'>⚠️</div>")
         html.append("<div class='action-title'>Ver pendientes</div>")
         html.append(f"<div class='action-desc'>{kpis['pendientes']} sin firmar</div>")
@@ -1800,6 +1800,173 @@ def portal_reports():
         html.append("</div>")
     
     html.append("</div>")
+    html.append("</div>")
+    html.append("</body></html>")
+    
+    return Response("".join(html), mimetype="text/html")
+
+@app.route("/portal/pendientes")
+def portal_pendientes():
+    """
+    Ver pendientes en el portal de clientes.
+    """
+    # Verificar login
+    auth = require_portal_login()
+    if auth:
+        return auth
+    
+    user_id = session.get('portal_user_id')
+    user = get_portal_user_by_id(user_id)
+    tenant = user['tenant']
+    
+    period = request.args.get("period", "")
+    
+    # Obtener info del tenant
+    t = get_tenant(tenant)
+    empresa_nombre = t.get('display_name', tenant) if t else tenant
+    
+    # Obtener pendientes
+    pending_views = []
+    pending_sigs = []
+    
+    if period:
+        pending_views = get_pending_views_over_7days(tenant, period)
+        pending_sigs = get_pending_signatures_over_7days(tenant, period)
+    
+    html = []
+    html.append("""<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Pendientes</title>
+  <style>
+    :root{
+      --bg:#0b1220; --card:#0f1b33; --text:#eaf0ff; --muted:#9fb2d0;
+      --accent:#5aa7ff; --error:#fb7185; --warn:#fbbf24; --line:rgba(255,255,255,.08);
+    }
+    *{box-sizing:border-box; margin:0; padding:0}
+    body{font-family:system-ui; background:var(--bg); color:var(--text); padding:20px}
+    .container{max-width:1100px; margin:0 auto}
+    .header{
+      background:rgba(255,255,255,.03); border:1px solid var(--line);
+      border-radius:12px; padding:20px; margin-bottom:20px;
+    }
+    .btn{
+      display:inline-block; padding:10px 16px; border-radius:8px;
+      border:1px solid var(--line); background:rgba(255,255,255,.06);
+      text-decoration:none; color:var(--text); font-weight:600; font-size:13px;
+    }
+    .btn:hover{background:rgba(255,255,255,.1)}
+    .card{
+      background:rgba(255,255,255,.03); border:1px solid var(--line);
+      border-radius:12px; padding:20px; margin-bottom:20px;
+    }
+    .card h2{font-size:18px; margin-bottom:10px}
+    .section-header{
+      display:flex; justify-content:space-between; align-items:center;
+      margin-bottom:15px; padding-bottom:10px; border-bottom:1px solid var(--line);
+    }
+    .badge{
+      display:inline-block; padding:4px 10px; border-radius:6px;
+      font-size:13px; font-weight:600;
+    }
+    .badge-error{background:rgba(251,113,133,.15); color:var(--error)}
+    .badge-warn{background:rgba(251,191,36,.15); color:var(--warn)}
+    .pending-item{
+      background:rgba(0,0,0,.2); border:1px solid var(--line);
+      border-radius:8px; padding:15px; margin-bottom:10px;
+      display:flex; justify-content:space-between; align-items:center;
+    }
+    .pending-info{flex:1}
+    .pending-name{font-size:15px; font-weight:600; margin-bottom:5px}
+    .pending-details{font-size:13px; color:var(--muted)}
+    .empty{text-align:center; padding:40px; color:var(--muted)}
+    table{width:100%; border-collapse:collapse}
+    th, td{padding:12px; text-align:left; border-bottom:1px solid var(--line)}
+    th{color:var(--muted); font-size:12px; font-weight:600}
+  </style>
+</head>
+<body>
+<div class="container">
+  <div class="header">
+    <a href="/portal" class="btn">← Volver al dashboard</a>
+  </div>
+  
+  <div class="card">
+    <h2>⚠️ Pendientes</h2>
+    <div style="color:var(--muted); font-size:13px; margin-bottom:15px">
+      🏢 """ + esc(empresa_nombre) + """ · 📅 """ + esc(period) + """
+    </div>
+  </div>
+""")
+    
+    # No vieron (>7 días)
+    html.append("<div class='card'>")
+    html.append("<div class='section-header'>")
+    html.append("<div>")
+    html.append("<h2>🔴 No vieron el recibo</h2>")
+    html.append("<div style='color:var(--muted); font-size:13px'>Template enviado hace más de 7 días, nunca pidieron el PDF</div>")
+    html.append("</div>")
+    html.append(f"<span class='badge badge-error'>{len(pending_views)}</span>")
+    html.append("</div>")
+    
+    if pending_views:
+        html.append("<table>")
+        html.append("<thead><tr>")
+        html.append("<th>Empleado</th><th>CUIL</th><th>WhatsApp</th><th>Hace</th>")
+        html.append("</tr></thead><tbody>")
+        
+        for p in pending_views[:20]:  # Limitar a 20
+            html.append("<tr>")
+            html.append(f"<td>{esc(p.get('nombre', ''))}</td>")
+            html.append(f"<td>{esc(p.get('cuil', ''))}</td>")
+            html.append(f"<td>{esc(p.get('whatsapp', ''))}</td>")
+            html.append(f"<td>{p.get('days_ago', 0)} días</td>")
+            html.append("</tr>")
+        
+        html.append("</tbody></table>")
+        
+        if len(pending_views) > 20:
+            html.append(f"<div style='color:var(--muted); font-size:13px; margin-top:10px; text-align:center'>... y {len(pending_views) - 20} más</div>")
+    else:
+        html.append("<div class='empty'>✅ No hay pendientes en esta categoría</div>")
+    
+    html.append("</div>")
+    
+    # No firmaron (>7 días)
+    html.append("<div class='card'>")
+    html.append("<div class='section-header'>")
+    html.append("<div>")
+    html.append("<h2>🟡 No firmaron</h2>")
+    html.append("<div style='color:var(--muted); font-size:13px'>PDF recibido hace más de 7 días, nunca firmaron</div>")
+    html.append("</div>")
+    html.append(f"<span class='badge badge-warn'>{len(pending_sigs)}</span>")
+    html.append("</div>")
+    
+    if pending_sigs:
+        html.append("<table>")
+        html.append("<thead><tr>")
+        html.append("<th>Empleado</th><th>CUIL</th><th>WhatsApp</th><th>Hace</th>")
+        html.append("</tr></thead><tbody>")
+        
+        for p in pending_sigs[:20]:  # Limitar a 20
+            html.append("<tr>")
+            html.append(f"<td>{esc(p.get('nombre', ''))}</td>")
+            html.append(f"<td>{esc(p.get('cuil', ''))}</td>")
+            html.append(f"<td>{esc(p.get('whatsapp', ''))}</td>")
+            html.append(f"<td>{p.get('days_ago', 0)} días</td>")
+            html.append("</tr>")
+        
+        html.append("</tbody></table>")
+        
+        if len(pending_sigs) > 20:
+            html.append(f"<div style='color:var(--muted); font-size:13px; margin-top:10px; text-align:center'>... y {len(pending_sigs) - 20} más</div>")
+    else:
+        html.append("<div class='empty'>✅ No hay pendientes en esta categoría</div>")
+    
+    html.append("</div>")
+    
     html.append("</div>")
     html.append("</body></html>")
     
