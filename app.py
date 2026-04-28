@@ -60,7 +60,7 @@ CACHE_TTL = int(os.environ.get("CACHE_TTL", "120"))
 # Flask
 # =========================
 app = Flask(__name__)
-app.secret_key = os.environ.get("SECRET_KEY", "123456789")
+app.secret_key = os.environ.get("SECRET_KEY")
 
 
 
