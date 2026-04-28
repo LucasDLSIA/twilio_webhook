@@ -361,3 +361,71 @@ tr:hover {
 .card, .stat {
   animation: fadeIn 0.3s ease;
 }
+
+/* ============================================
+   LOGO FIXED HEADER
+   ============================================ */
+
+.top-logo {
+  position: fixed;
+  top: 16px;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 1000;
+  padding: 8px;
+  background: transparent;
+  border: none;
+  box-shadow: none;
+  transition: all 0.3s ease;
+}
+
+.top-logo:hover {
+  background: transparent;
+  box-shadow: none;
+  transform: translateX(-50%) scale(1.05);
+}
+
+.top-logo img {
+  width: 48px;
+  height: 48px;
+  border-radius: 10px;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.3);
+}
+
+.top-logo-text {
+  display: none;
+}
+
+@media (max-width: 768px) {
+  .top-logo img {
+    width: 40px;
+    height: 40px;
+  }
+}
+
+/* Ajuste para páginas de login (centradas) */
+body.login-page {
+  padding-top: 0;
+}
+
+/* Ajuste para páginas normales */
+body:not(.login-page) .container {
+  padding-top: 80px;
+}
+
+@media (max-width: 768px) {
+  .top-logo {
+    top: 12px;
+    left: 12px;
+    padding: 8px 12px;
+  }
+  
+  .top-logo img {
+    width: 32px;
+    height: 32px;
+  }
+  
+  .top-logo-text {
+    font-size: 14px;
+  }
+}
