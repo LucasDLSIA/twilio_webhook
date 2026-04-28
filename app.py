@@ -1006,60 +1006,35 @@ def portal_login():
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Portal - Login</title>
-    <link rel="manifest" href="/static/manifest.json">
-    <meta name="theme-color" content="#5aa7ff">
-    <meta name="apple-mobile-web-app-capable" content="yes">
-    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
-    <meta name="apple-mobile-web-app-title" content="Recibos">
-    <link rel="apple-touch-icon" href="/static/icon-192.png">
+  <link rel="manifest" href="/static/manifest.json">
+  <meta name="theme-color" content="#2E3B8E">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta name="apple-mobile-web-app-title" content="Recibos">
+  <link rel="apple-touch-icon" href="/static/icon-192.png">
+  <link rel="stylesheet" href="/static/portal-theme.css">
   <style>
-    :root{
-      --bg:#0b1220; --card:#0f1b33; --text:#eaf0ff;
-      --accent:#5aa7ff; --error:#fb7185;
+    /* Solo estilos específicos de esta página si es necesario */
+    body {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      min-height: 100vh;
+      padding: 20px;
     }
-    *{box-sizing:border-box}
-    body{
-      margin:0; font-family:system-ui;
-      background: radial-gradient(1200px 700px at 20% -20%, rgba(90,167,255,.25), transparent 60%),
-                  var(--bg);
-      color:var(--text);
-      display:flex; align-items:center; justify-content:center;
-      min-height:100vh; padding:20px;
+    .forgot {
+      text-align: center;
+      margin-top: 15px;
+      font-size: 13px;
     }
-    .login-card{
-      background:rgba(255,255,255,.03); border:1px solid rgba(255,255,255,.08);
-      border-radius:16px; padding:40px; max-width:400px; width:100%;
-      box-shadow:0 10px 25px rgba(0,0,0,.25);
+    .forgot a {
+      color: var(--accent);
+      text-decoration: none;
+      font-weight: 600;
     }
-    h1{margin:0 0 10px 0; font-size:24px; text-align:center}
-    .subtitle{text-align:center; color:#9fb2d0; font-size:14px; margin-bottom:30px}
-    label{display:block; margin:15px 0 5px 0; font-size:13px; color:#9fb2d0}
-    input{
-      width:100%; padding:12px; border-radius:8px;
-      border:1px solid rgba(255,255,255,.08);
-      background:rgba(0,0,0,.25); color:var(--text);
-      font-size:14px;
+    .forgot a:hover {
+      text-decoration: underline;
     }
-    input:focus{outline:none; border-color:var(--accent)}
-    .btn{
-      width:100%; padding:14px; border-radius:8px; border:none;
-      background:var(--accent); color:white; font-weight:600;
-      font-size:14px; cursor:pointer; margin-top:20px;
-    }
-    .btn:hover{background:#4a96ee}
-    .error{
-      background:rgba(251,113,133,.1); border:1px solid rgba(251,113,133,.3);
-      padding:12px; border-radius:8px; margin-bottom:20px; font-size:13px;
-    }
-    .info{
-      background:rgba(90,167,255,.1); border:1px solid rgba(90,167,255,.3);
-      padding:12px; border-radius:8px; margin-bottom:20px; font-size:13px;
-    }
-    .forgot{
-      text-align:center; margin-top:15px; font-size:13px;
-    }
-    .forgot a{color:var(--accent); text-decoration:none}
-    .forgot a:hover{text-decoration:underline}
   </style>
 </head>
 <body>
@@ -1069,15 +1044,15 @@ def portal_login():
 """)
     
     if error:
-        html.append(f"<div class='error'>❌ {esc(error)}</div>")
-    
+        html.append(f"<div class='alert alert-error'>❌ {esc(error)}</div>")
+
     if msg == "session_expired":
-        html.append("<div class='info'>⚠️ Tu sesión expiró. Ingresá nuevamente.</div>")
+        html.append("<div class='alert alert-info'>⚠️ Tu sesión expiró. Ingresá nuevamente.</div>")
     elif msg == "logout":
-        html.append("<div class='info'>✅ Sesión cerrada correctamente.</div>")
+        html.append("<div class='alert alert-info'>✅ Sesión cerrada correctamente.</div>")
     elif msg == "password_reset":
-        html.append("<div class='info'>✅ Contraseña cambiada correctamente. Ya podés ingresar.</div>")
-    
+        html.append("<div class='alert alert-info'>✅ Contraseña cambiada correctamente. Ya podés ingresar.</div>")
+        
     html.append("""
     <form method="post">
       <label>Usuario</label>
@@ -1086,7 +1061,7 @@ def portal_login():
       <label>Contraseña</label>
       <input type="password" name="password" required placeholder="••••••••">
       
-      <button type="submit" class="btn">Ingresar</button>
+      <button type="submit" class="btn primary">Ingresar</button>
     </form>
     
     <div class="forgot">
