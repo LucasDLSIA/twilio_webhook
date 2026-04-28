@@ -1334,6 +1334,211 @@ def portal_dashboard():
     
     return Response("".join(html), mimetype="text/html")
 
+@app.route("/portal/search")
+def portal_search():
+    """
+    Buscar empleado en el portal.
+    """
+    # Verificar login
+    auth = require_portal_login()
+    if auth:
+        return auth
+    
+    user_id = session.get('portal_user_id')
+    user = get_portal_user_by_id(user_id)
+    tenant = user['tenant']
+    
+    period = request.args.get("period", "")
+    query = request.args.get("q", "").strip()
+    
+    # Obtener info del tenant
+    t = get_tenant(tenant)
+    empresa_nombre = t.get('display_name', tenant) if t else tenant
+    
+    results = []
+    
+    if query and len(query) >= 2:
+        # Cargar envíos
+        envios = load_envios_rows(tenant)
+        
+        # Buscar en envios
+        for row in envios:
+            nombre = row.get('nombre', '').lower()
+            cuil = norm_cuil(row.get('cuil', ''))
+            dni = cuil.replace('-', '')[-8:] if cuil else ''
+            
+            q_lower = query.lower()
+            
+            # Match por nombre, CUIL o DNI
+            if q_lower in nombre or q_lower in cuil or q_lower in dni:
+                # Obtener estado
+                conn = get_db_connection()
+                cur = conn.cursor()
+                
+                # Ver si tiene template enviado
+                cur.execute("""
+                    SELECT created_at FROM message_status
+                    WHERE tenant = ? AND cuil = ? AND period = ? AND kind = 'template'
+                    ORDER BY created_at DESC LIMIT 1
+                """, (tenant, cuil, period))
+                template_row = cur.fetchone()
+                
+                # Ver si vio el recibo (pidió PDF)
+                cur.execute("""
+                    SELECT created_at FROM sent_pdfs
+                    WHERE tenant = ? AND cuil = ? AND period = ?
+                    ORDER BY created_at DESC LIMIT 1
+                """, (tenant, cuil, period))
+                pdf_row = cur.fetchone()
+                
+                # Ver si firmó
+                cur.execute("""
+                    SELECT estado FROM recibo_estado
+                    WHERE tenant = ? AND cuil = ? AND period = ?
+                    LIMIT 1
+                """, (tenant, cuil, period))
+                estado_row = cur.fetchone()
+                
+                conn.close()
+                
+                # Determinar estado
+                if estado_row and estado_row[0] in ('FIRMADO', 'OBSERVADO'):
+                    status = 'firmado'
+                    status_emoji = '✅'
+                    status_text = 'Firmado' if estado_row[0] == 'FIRMADO' else 'Observado'
+                elif pdf_row:
+                    status = 'visto'
+                    status_emoji = '👁️'
+                    status_text = 'Visto, no firmado'
+                    days_ago = int((time.time() - pdf_row[0]) / 86400) if pdf_row[0] else 0
+                    if days_ago > 0:
+                        status_text += f' (hace {days_ago}d)'
+                elif template_row:
+                    status = 'enviado'
+                    status_emoji = '⚠️'
+                    status_text = 'No visto'
+                    days_ago = int((time.time() - template_row[0]) / 86400) if template_row[0] else 0
+                    if days_ago > 0:
+                        status_text += f' (hace {days_ago}d)'
+                else:
+                    status = 'sin_enviar'
+                    status_emoji = '❌'
+                    status_text = 'No enviado'
+                
+                results.append({
+                    'nombre': row.get('nombre', ''),
+                    'cuil': cuil,
+                    'dni': dni,
+                    'whatsapp': row.get('whatsapp', ''),
+                    'status': status,
+                    'status_emoji': status_emoji,
+                    'status_text': status_text
+                })
+        
+        # Limitar a 20 resultados
+        results = results[:20]
+    
+    html = []
+    html.append("""<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Buscar empleado</title>
+  <style>
+    :root{
+      --bg:#0b1220; --card:#0f1b33; --text:#eaf0ff; --muted:#9fb2d0;
+      --accent:#5aa7ff; --ok:#34d399; --warn:#fbbf24; --line:rgba(255,255,255,.08);
+    }
+    *{box-sizing:border-box; margin:0; padding:0}
+    body{font-family:system-ui; background:var(--bg); color:var(--text); padding:20px}
+    .container{max-width:900px; margin:0 auto}
+    .header{
+      background:rgba(255,255,255,.03); border:1px solid var(--line);
+      border-radius:12px; padding:20px; margin-bottom:20px;
+    }
+    .btn{
+      display:inline-block; padding:10px 16px; border-radius:8px;
+      border:1px solid var(--line); background:rgba(255,255,255,.06);
+      text-decoration:none; color:var(--text); font-weight:600; font-size:13px;
+    }
+    .btn:hover{background:rgba(255,255,255,.1)}
+    .card{
+      background:rgba(255,255,255,.03); border:1px solid var(--line);
+      border-radius:12px; padding:20px; margin-bottom:20px;
+    }
+    .search-box{
+      display:flex; gap:10px; margin-bottom:20px;
+    }
+    .search-box input{
+      flex:1; padding:12px; border-radius:8px;
+      border:1px solid var(--line); background:rgba(0,0,0,.25);
+      color:var(--text); font-size:14px;
+    }
+    .search-box button{
+      padding:12px 24px; border-radius:8px; border:none;
+      background:var(--accent); color:white; font-weight:600; cursor:pointer;
+    }
+    .result{
+      background:rgba(0,0,0,.2); border:1px solid var(--line);
+      border-radius:10px; padding:15px; margin-bottom:10px;
+    }
+    .result-header{display:flex; justify-content:space-between; align-items:center; margin-bottom:10px}
+    .result-name{font-size:16px; font-weight:600}
+    .result-status{font-size:13px; padding:4px 10px; border-radius:6px; display:inline-block}
+    .status-firmado{background:rgba(52,211,153,.15); color:var(--ok)}
+    .status-visto{background:rgba(251,191,36,.15); color:var(--warn)}
+    .status-enviado{background:rgba(251,113,133,.15); color:#fb7185}
+    .result-details{font-size:13px; color:var(--muted)}
+    .no-results{text-align:center; padding:40px; color:var(--muted)}
+  </style>
+</head>
+<body>
+<div class="container">
+  <div class="header">
+    <a href="/portal" class="btn">← Volver al dashboard</a>
+  </div>
+  
+  <div class="card">
+    <h2 style="margin-bottom:15px">🔍 Buscar empleado</h2>
+    <div style="color:var(--muted); font-size:13px; margin-bottom:15px">
+      🏢 """ + esc(empresa_nombre) + """ · 📅 """ + esc(period) + """
+    </div>
+    
+    <form method="get" class="search-box">
+      <input type="hidden" name="period" value='""" + esc(period) + """'>
+      <input type="text" name="q" placeholder="Nombre, CUIL o DNI..." 
+             value='""" + esc(query) + """' autofocus>
+      <button type="submit">Buscar</button>
+    </form>
+""")
+    
+    if query and len(query) < 2:
+        html.append("<div class='no-results'>⚠️ Ingresá al menos 2 caracteres para buscar</div>")
+    elif query and not results:
+        html.append("<div class='no-results'>No se encontraron resultados para: <strong>" + esc(query) + "</strong></div>")
+    elif results:
+        html.append(f"<div style='color:var(--muted); font-size:13px; margin-bottom:15px'>✨ {len(results)} resultado(s) encontrado(s)</div>")
+        
+        for r in results:
+            status_class = f"status-{r['status']}"
+            
+            html.append("<div class='result'>")
+            html.append("<div class='result-header'>")
+            html.append(f"<div class='result-name'>{r['status_emoji']} {esc(r['nombre'])}</div>")
+            html.append(f"<span class='result-status {status_class}'>{esc(r['status_text'])}</span>")
+            html.append("</div>")
+            html.append("<div class='result-details'>")
+            html.append(f"CUIL: {esc(r['cuil'])} · DNI: {esc(r['dni'])} · WhatsApp: {esc(r['whatsapp'])}")
+            html.append("</div>")
+            html.append("</div>")
+    
+    html.append("</div>")
+    html.append("</div>")
+    html.append("</body></html>")
+    
+    return Response("".join(html), mimetype="text/html")
+
 @app.route("/portal/logout")
 def portal_logout():
     """
