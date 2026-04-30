@@ -1347,23 +1347,35 @@ def portal_search():
     results = []
     
     if query and len(query) >= 2:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        
+        # Primero obtener los CUILs que tienen template enviado en este período
+        cur.execute("""
+            SELECT DISTINCT cuil FROM message_status
+            WHERE tenant = ? AND period = ? AND kind = 'template'
+        """, (tenant, period))
+        cuils_enviados = [r[0] for r in cur.fetchall()]
+        
         # Cargar envíos
         envios = load_envios_rows(tenant)
         
-        # Buscar en envios
-        for row in envios:
-            nombre = row.get('nombre', '').lower()
-            cuil = norm_cuil(row.get('cuil', ''))
-            dni = cuil.replace('-', '')[-8:] if cuil else ''
+        q_lower = query.lower()
+        
+        # Buscar solo en los que tienen envío
+        for cuil_enviado in cuils_enviados:
+            # Buscar datos del empleado
+            person = find_person_by_cuil(envios, cuil_enviado)
+            if not person:
+                continue
             
-            q_lower = query.lower()
+            nombre = person.get('nombre', '').lower()
+            cuil = norm_cuil(person.get('cuil', ''))
+            dni = cuil.replace('-', '')[-8:] if cuil else ''
+            whatsapp = person.get('whatsapp', '')
             
             # Match por nombre, CUIL o DNI
             if q_lower in nombre or q_lower in cuil or q_lower in dni:
-                # Obtener estado
-                conn = get_db_connection()
-                cur = conn.cursor()
-                
                 # Ver si tiene template enviado
                 cur.execute("""
                     SELECT created_at FROM message_status
@@ -1388,8 +1400,6 @@ def portal_search():
                 """, (tenant, cuil, period))
                 estado_row = cur.fetchone()
                 
-                conn.close()
-                
                 # Determinar estado
                 if estado_row and estado_row[0] in ('FIRMADO', 'OBSERVADO'):
                     status = 'firmado'
@@ -1410,19 +1420,20 @@ def portal_search():
                     if days_ago > 0:
                         status_text += f' (hace {days_ago}d)'
                 else:
-                    status = 'sin_enviar'
-                    status_emoji = '❌'
-                    status_text = 'No enviado'
+                    # No debería pasar porque filtramos por template, pero por si acaso
+                    continue
                 
                 results.append({
-                    'nombre': row.get('nombre', ''),
+                    'nombre': person.get('nombre', ''),
                     'cuil': cuil,
                     'dni': dni,
-                    'whatsapp': row.get('whatsapp', ''),
+                    'whatsapp': whatsapp,
                     'status': status,
                     'status_emoji': status_emoji,
                     'status_text': status_text
                 })
+        
+        conn.close()
         
         # Limitar a 20 resultados
         results = results[:20]
