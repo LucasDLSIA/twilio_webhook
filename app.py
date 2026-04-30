@@ -2020,8 +2020,324 @@ def portal_search():
             html.append("<div class='result-details'>")
             html.append(f"CUIL: {esc(r['cuil'])} · DNI: {esc(r['dni'])} · WhatsApp: {esc(r['whatsapp'])}")
             html.append("</div>")
+            html.append(f"<div style='margin-top:12px'><a href='/portal/historial/{esc(r['cuil'])}' class='btn' style='font-size:13px; padding:8px 16px'>📜 Ver historial</a></div>")
             html.append("</div>")
     
+    html.append("</div>")
+    html.append("</div>")
+    html.append("</body></html>")
+    
+    return Response("".join(html), mimetype="text/html")
+
+@app.route("/portal/historial/<cuil>")
+def portal_historial(cuil):
+    """
+    Ver historial completo de un empleado.
+    """
+    # Verificar login
+    auth = require_portal_login()
+    if auth:
+        return auth
+    
+    user_id = session.get('portal_user_id')
+    user = get_portal_user_by_id(user_id)
+    tenant = user['tenant']
+    
+    cuil = norm_cuil(cuil)
+    
+    # Obtener info del tenant
+    t = get_tenant(tenant)
+    empresa_nombre = t.get('display_name', tenant) if t else tenant
+    
+    # Buscar datos del empleado
+    envios = load_envios_rows(tenant)
+    person = find_person_by_cuil(envios, cuil)
+    
+    if not person:
+        return redirect('/portal/search')
+    
+    nombre = person.get('nombre', '')
+    whatsapp = person.get('whatsapp', '')
+    dni = cuil.replace('-', '')[-8:] if cuil else ''
+    
+    # Obtener historial de todos los períodos
+    conn = get_db_connection()
+    cur = conn.cursor()
+    
+    # Obtener todos los períodos donde tuvo envío
+    cur.execute("""
+        SELECT DISTINCT period FROM message_status
+        WHERE tenant = ? AND cuil = ? AND kind = 'template'
+        ORDER BY period DESC
+    """, (tenant, cuil))
+    periods = [r[0] for r in cur.fetchall()]
+    
+    historial = []
+    for period in periods:
+        # Template enviado
+        cur.execute("""
+            SELECT created_at FROM message_status
+            WHERE tenant = ? AND cuil = ? AND period = ? AND kind = 'template'
+            ORDER BY created_at DESC LIMIT 1
+        """, (tenant, cuil, period))
+        template_row = cur.fetchone()
+        
+        # PDF enviado
+        cur.execute("""
+            SELECT created_at FROM sent_pdfs
+            WHERE tenant = ? AND cuil = ? AND period = ?
+            ORDER BY created_at DESC LIMIT 1
+        """, (tenant, cuil, period))
+        pdf_row = cur.fetchone()
+        
+        # Firmado
+        cur.execute("""
+            SELECT estado, updated_at FROM recibo_estado
+            WHERE tenant = ? AND cuil = ? AND period = ?
+            LIMIT 1
+        """, (tenant, cuil, period))
+        estado_row = cur.fetchone()
+        
+        # Calcular tiempos
+        enviado_ts = template_row[0] if template_row else None
+        visto_ts = pdf_row[0] if pdf_row else None
+        firmado_ts = estado_row[1] if estado_row else None
+        
+        tiempo_ver = None
+        tiempo_firmar = None
+        
+        if enviado_ts and visto_ts:
+            tiempo_ver = int((visto_ts - enviado_ts) / 3600)  # horas
+        
+        if visto_ts and firmado_ts:
+            tiempo_firmar = int((firmado_ts - visto_ts) / 3600)  # horas
+        elif enviado_ts and firmado_ts:
+            tiempo_firmar = int((firmado_ts - enviado_ts) / 3600)  # horas
+        
+        # Determinar estado
+        if estado_row and estado_row[0] in ('FIRMADO', 'OBSERVADO'):
+            status = 'firmado'
+            status_emoji = '✅'
+            status_text = 'Firmado' if estado_row[0] == 'FIRMADO' else 'Observado'
+            status_class = 'success'
+        elif pdf_row:
+            status = 'visto'
+            status_emoji = '👁️'
+            status_text = 'Visto, no firmado'
+            status_class = 'warning'
+        else:
+            status = 'enviado'
+            status_emoji = '⚠️'
+            status_text = 'No visto'
+            status_class = 'error'
+        
+        historial.append({
+            'period': period,
+            'enviado': ts_str(enviado_ts) if enviado_ts else '-',
+            'visto': ts_str(visto_ts) if visto_ts else '-',
+            'firmado': ts_str(firmado_ts) if firmado_ts else '-',
+            'tiempo_ver': tiempo_ver,
+            'tiempo_firmar': tiempo_firmar,
+            'status': status,
+            'status_emoji': status_emoji,
+            'status_text': status_text,
+            'status_class': status_class
+        })
+    
+    conn.close()
+    
+    # Estadísticas generales
+    total_envios = len(historial)
+    firmados = len([h for h in historial if h['status'] == 'firmado'])
+    vistos = len([h for h in historial if h['status'] in ('visto', 'firmado')])
+    
+    tiempos_firmar = [h['tiempo_firmar'] for h in historial if h['tiempo_firmar']]
+    promedio_horas = int(sum(tiempos_firmar) / len(tiempos_firmar)) if tiempos_firmar else 0
+    
+    stats = {
+        'total': total_envios,
+        'firmados': firmados,
+        'vistos': vistos,
+        'pct_firmados': int((firmados / total_envios * 100)) if total_envios > 0 else 0,
+        'promedio_horas': promedio_horas
+    }
+    
+    html = []
+    html.append("""<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Historial empleado</title>
+  <link rel="manifest" href="/static/manifest.json">
+  <meta name="theme-color" content="#2E3B8E">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta name="apple-mobile-web-app-title" content="Recibos">
+  <link rel="apple-touch-icon" href="/static/icon-192.png">
+  <link rel="stylesheet" href="/static/portal-theme.css">
+  <style>
+    .employee-header {
+      background: rgba(0, 0, 0, 0.3);
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      padding: 24px;
+      margin-bottom: 20px;
+    }
+    .employee-name {
+      font-size: 24px;
+      font-weight: 700;
+      margin-bottom: 8px;
+    }
+    .employee-details {
+      color: var(--text-muted);
+      font-size: 14px;
+    }
+    .timeline {
+      position: relative;
+      padding-left: 40px;
+    }
+    .timeline::before {
+      content: '';
+      position: absolute;
+      left: 15px;
+      top: 0;
+      bottom: 0;
+      width: 2px;
+      background: var(--line);
+    }
+    .timeline-item {
+      position: relative;
+      padding-bottom: 32px;
+    }
+    .timeline-dot {
+      position: absolute;
+      left: -29px;
+      top: 6px;
+      width: 12px;
+      height: 12px;
+      border-radius: 50%;
+      border: 2px solid var(--line);
+      background: var(--card);
+    }
+    .timeline-dot.success {
+      border-color: var(--success);
+      background: var(--success);
+    }
+    .timeline-dot.warning {
+      border-color: var(--warning);
+      background: var(--warning);
+    }
+    .timeline-dot.error {
+      border-color: var(--error);
+      background: var(--error);
+    }
+    .timeline-content {
+      background: rgba(0, 0, 0, 0.2);
+      border: 1px solid var(--line);
+      border-radius: var(--radius-sm);
+      padding: 16px;
+    }
+    .timeline-period {
+      font-size: 18px;
+      font-weight: 700;
+      margin-bottom: 12px;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+    }
+    .timeline-details {
+      font-size: 13px;
+      color: var(--text-muted);
+      line-height: 1.8;
+    }
+    .time-badge {
+      display: inline-block;
+      padding: 4px 10px;
+      border-radius: 12px;
+      font-size: 12px;
+      font-weight: 600;
+      background: rgba(244, 196, 48, 0.15);
+      color: var(--accent);
+      margin-left: 8px;
+    }
+  </style>
+</head>
+<body>
+  <div class="top-logo">
+    <img src="/static/icon-192.png" alt="SIA Sueldos">
+    <span class="top-logo-text">SIA</span>
+  </div>
+  
+  <div class="container">
+    <div class="header">
+      <a href="/portal/search" class="btn">← Volver a búsqueda</a>
+    </div>
+    
+    <div class="employee-header">
+      <div class="employee-name">👤 """ + esc(nombre) + """</div>
+      <div class="employee-details">
+        CUIL: """ + esc(cuil) + """ · DNI: """ + esc(dni) + """ · WhatsApp: """ + esc(whatsapp) + """
+      </div>
+    </div>
+    
+    <div class="card">
+      <h2>📊 Estadísticas generales</h2>
+      <div class="stat-grid">
+        <div class="stat">
+          <div class="stat-value">""" + str(stats['total']) + """</div>
+          <div class="stat-label">Total envíos</div>
+        </div>
+        <div class="stat">
+          <div class="stat-value">""" + str(stats['pct_firmados']) + """%</div>
+          <div class="stat-label">Tasa de firma</div>
+        </div>
+        <div class="stat">
+          <div class="stat-value">""" + str(stats['firmados']) + """</div>
+          <div class="stat-label">Firmados</div>
+        </div>
+        <div class="stat">
+          <div class="stat-value">""" + str(stats['promedio_horas']) + """h</div>
+          <div class="stat-label">Promedio de respuesta</div>
+        </div>
+      </div>
+    </div>
+    
+    <div class="card">
+      <h2>📜 Historial completo</h2>
+      <div class="timeline" style="margin-top:24px">
+""")
+    
+    for h in historial:
+        html.append("<div class='timeline-item'>")
+        html.append(f"<div class='timeline-dot {h['status_class']}'></div>")
+        html.append("<div class='timeline-content'>")
+        html.append("<div class='timeline-period'>")
+        html.append(f"<span>{h['status_emoji']} {esc(h['period'])}</span>")
+        html.append(f"<span class='badge badge-{h['status_class']}'>{esc(h['status_text'])}</span>")
+        html.append("</div>")
+        
+        html.append("<div class='timeline-details'>")
+        html.append(f"📤 Enviado: {esc(h['enviado'])}")
+        
+        if h['tiempo_ver']:
+            html.append(f"<br>👁️ Visto: {esc(h['visto'])}")
+            html.append(f"<span class='time-badge'>{h['tiempo_ver']}h después</span>")
+        
+        if h['tiempo_firmar']:
+            html.append(f"<br>✅ Firmado: {esc(h['firmado'])}")
+            html.append(f"<span class='time-badge'>{h['tiempo_firmar']}h después</span>")
+        
+        html.append("</div>")
+        html.append("</div>")
+        html.append("</div>")
+    
+    if not historial:
+        html.append("<div style='text-align:center; padding:60px 20px; color:var(--text-muted)'>")
+        html.append("📭 No hay historial de envíos para este empleado")
+        html.append("</div>")
+    
+    html.append("</div>")
     html.append("</div>")
     html.append("</div>")
     html.append("</body></html>")
