@@ -1408,7 +1408,11 @@ def portal_dashboard():
         html.append("<div class='action-title'>Reportes</div>")
         html.append("<div class='action-desc'>Descargar PDF y Excel</div>")
         html.append("</a>")
-        
+        html.append("<a href='/portal/calendario' class='action-card'>")
+        html.append("<div class='action-icon'>📅</div>")
+        html.append("<div class='action-title'>Calendario</div>")
+        html.append("<div class='action-desc'>Ver todos los períodos</div>")
+        html.append("</a>")
         html.append("</div>")
         html.append("</div>")
     
@@ -1528,7 +1532,275 @@ new Chart(ctx2, {
     html.append("</body></html>")
     
     return Response("".join(html), mimetype="text/html")
+
+@app.route("/portal/calendario")
+def portal_calendario():
+    """
+    Vista de calendario con todos los períodos.
+    """
+    # Verificar login
+    auth = require_portal_login()
+    if auth:
+        return auth
     
+    user_id = session.get('portal_user_id')
+    user = get_portal_user_by_id(user_id)
+    tenant = user['tenant']
+    
+    # Obtener info del tenant
+    t = get_tenant(tenant)
+    empresa_nombre = t.get('display_name', tenant) if t else tenant
+    
+    # Obtener todos los períodos
+    period_folders = list_tenant_period_folders(tenant)
+    period_labels = []
+    for p in period_folders:
+        lbl = period_folder_to_label(p)
+        if lbl:
+            period_labels.append(lbl)
+    
+    # Calcular stats por período
+    conn = get_db_connection()
+    cur = conn.cursor()
+    
+    periods_stats = []
+    for period in period_labels:
+        cur.execute("""
+            SELECT COUNT(DISTINCT cuil) 
+            FROM message_status 
+            WHERE tenant = ? AND period = ? AND kind = 'template'
+        """, (tenant, period))
+        enviados = cur.fetchone()[0] or 0
+        
+        cur.execute("""
+            SELECT COUNT(DISTINCT cuil)
+            FROM recibo_estado
+            WHERE tenant = ? AND period = ? AND estado IN ('FIRMADO', 'OBSERVADO')
+        """, (tenant, period))
+        firmados = cur.fetchone()[0] or 0
+        
+        pct = int((firmados / enviados * 100)) if enviados > 0 else 0
+        
+        # Determinar color
+        if enviados == 0:
+            status = 'empty'
+            color = '#3a4258'
+            emoji = '⚪'
+        elif pct >= 80:
+            status = 'good'
+            color = '#10b981'
+            emoji = '🟢'
+        elif pct >= 50:
+            status = 'warning'
+            color = '#f59e0b'
+            emoji = '🟡'
+        else:
+            status = 'bad'
+            color = '#ef4444'
+            emoji = '🔴'
+        
+        # Parsear mes y año
+        try:
+            parts = period.split('/')
+            mes = int(parts[0])
+            anio = int(parts[1])
+        except:
+            mes = 0
+            anio = 0
+        
+        periods_stats.append({
+            'period': period,
+            'mes': mes,
+            'anio': anio,
+            'enviados': enviados,
+            'firmados': firmados,
+            'pct': pct,
+            'status': status,
+            'color': color,
+            'emoji': emoji
+        })
+    
+    conn.close()
+    
+    # Agrupar por año
+    years = {}
+    for p in periods_stats:
+        if p['anio'] > 0:
+            if p['anio'] not in years:
+                years[p['anio']] = []
+            years[p['anio']].append(p)
+    
+    # Ordenar años descendente
+    sorted_years = sorted(years.keys(), reverse=True)
+    
+    # Nombres de meses
+    month_names = ['', 'Ene', 'Feb', 'Mar', 'Abr', 'May', 'Jun', 
+                   'Jul', 'Ago', 'Sep', 'Oct', 'Nov', 'Dic']
+    
+    html = []
+    html.append("""<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Calendario</title>
+  <link rel="manifest" href="/static/manifest.json">
+  <meta name="theme-color" content="#2E3B8E">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta name="apple-mobile-web-app-title" content="Recibos">
+  <link rel="apple-touch-icon" href="/static/icon-192.png">
+  <link rel="stylesheet" href="/static/portal-theme.css">
+  <style>
+    .calendar-year {
+      margin-bottom: 40px;
+    }
+    .year-title {
+      font-size: 24px;
+      font-weight: 700;
+      margin-bottom: 20px;
+      color: var(--accent);
+    }
+    .months-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
+      gap: 16px;
+    }
+    .month-card {
+      background: var(--card);
+      border: 2px solid var(--line);
+      border-radius: var(--radius);
+      padding: 20px;
+      text-align: center;
+      cursor: pointer;
+      transition: all 0.3s ease;
+      text-decoration: none;
+      color: var(--text);
+    }
+    .month-card:hover {
+      transform: translateY(-4px);
+      box-shadow: 0 8px 24px rgba(0, 0, 0, 0.3);
+    }
+    .month-emoji {
+      font-size: 32px;
+      margin-bottom: 8px;
+    }
+    .month-name {
+      font-size: 18px;
+      font-weight: 700;
+      margin-bottom: 12px;
+    }
+    .month-stats {
+      font-size: 13px;
+      color: var(--text-muted);
+      line-height: 1.6;
+    }
+    .month-pct {
+      font-size: 24px;
+      font-weight: 800;
+      margin: 8px 0;
+    }
+    .legend {
+      display: flex;
+      gap: 24px;
+      flex-wrap: wrap;
+      margin-top: 20px;
+      padding: 16px;
+      background: rgba(0, 0, 0, 0.2);
+      border-radius: var(--radius-sm);
+    }
+    .legend-item {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      font-size: 13px;
+    }
+    @media (max-width: 768px) {
+      .months-grid {
+        grid-template-columns: repeat(auto-fill, minmax(120px, 1fr));
+      }
+    }
+  </style>
+</head>
+<body>
+  <div class="top-logo">
+    <img src="/static/icon-192.png" alt="SIA Sueldos">
+    <span class="top-logo-text">SIA</span>
+  </div>
+  
+  <div class="container">
+    <div class="header">
+      <a href="/portal" class="btn">← Volver al dashboard</a>
+    </div>
+    
+    <div class="card">
+      <h2>📅 Calendario de períodos</h2>
+      <div class="muted" style="margin-bottom:16px">
+        🏢 """ + esc(empresa_nombre) + """
+      </div>
+      
+      <div class="legend">
+        <div class="legend-item">
+          <span style="font-size:20px">🟢</span>
+          <span>Excelente (>80%)</span>
+        </div>
+        <div class="legend-item">
+          <span style="font-size:20px">🟡</span>
+          <span>Bien (50-80%)</span>
+        </div>
+        <div class="legend-item">
+          <span style="font-size:20px">🔴</span>
+          <span>Bajo (<50%)</span>
+        </div>
+        <div class="legend-item">
+          <span style="font-size:20px">⚪</span>
+          <span>Sin envíos</span>
+        </div>
+      </div>
+    </div>
+""")
+    
+    # Mostrar años
+    for year in sorted_years:
+        html.append("<div class='card calendar-year'>")
+        html.append(f"<div class='year-title'>{year}</div>")
+        html.append("<div class='months-grid'>")
+        
+        # Ordenar meses de este año
+        year_months = sorted(years[year], key=lambda x: x['mes'])
+        
+        for p in year_months:
+            month_name = month_names[p['mes']] if p['mes'] < len(month_names) else p['period']
+            
+            html.append(f"<a href='/portal?period={esc(p['period'])}' class='month-card' style='border-color:{p['color']}'>")
+            html.append(f"<div class='month-emoji'>{p['emoji']}</div>")
+            html.append(f"<div class='month-name'>{month_name}</div>")
+            
+            if p['enviados'] > 0:
+                html.append(f"<div class='month-pct' style='color:{p['color']}'>{p['pct']}%</div>")
+                html.append("<div class='month-stats'>")
+                html.append(f"{p['firmados']} / {p['enviados']}<br>firmados")
+                html.append("</div>")
+            else:
+                html.append("<div class='month-stats'>Sin envíos</div>")
+            
+            html.append("</a>")
+        
+        html.append("</div>")
+        html.append("</div>")
+    
+    if not sorted_years:
+        html.append("<div class='card'>")
+        html.append("<div style='text-align:center; padding:60px 20px; color:var(--text-muted)'>")
+        html.append("📅 No hay períodos disponibles todavía")
+        html.append("</div>")
+        html.append("</div>")
+    
+    html.append("</div>")
+    html.append("</body></html>")
+    
+    return Response("".join(html), mimetype="text/html")
+
 
 @app.route("/portal/search")
 def portal_search():
