@@ -1786,63 +1786,65 @@ def portal_reports():
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Reportes</title>
-<link rel="manifest" href="/static/manifest.json">
-<meta name="theme-color" content="#5aa7ff">
-<meta name="apple-mobile-web-app-capable" content="yes">
-<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
-<meta name="apple-mobile-web-app-title" content="Recibos">
-<link rel="apple-touch-icon" href="/static/icon-192.png">
+  <link rel="manifest" href="/static/manifest.json">
+  <meta name="theme-color" content="#2E3B8E">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta name="apple-mobile-web-app-title" content="Recibos">
+  <link rel="apple-touch-icon" href="/static/icon-192.png">
+  <link rel="stylesheet" href="/static/portal-theme.css">
   <style>
-    :root{
-      --bg:#0b1220; --card:#0f1b33; --text:#eaf0ff; --muted:#9fb2d0;
-      --accent:#5aa7ff; --ok:#34d399; --line:rgba(255,255,255,.08);
+    .download-section {
+      display: grid;
+      gap: 16px;
+      margin-top: 20px;
     }
-    *{box-sizing:border-box; margin:0; padding:0}
-    body{font-family:system-ui; background:var(--bg); color:var(--text); padding:20px}
-    .container{max-width:900px; margin:0 auto}
-    .header{
-      background:rgba(255,255,255,.03); border:1px solid var(--line);
-      border-radius:12px; padding:20px; margin-bottom:20px;
+    .download-card {
+      background: rgba(255, 255, 255, 0.02);
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      padding: 20px;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 16px;
+      transition: all 0.3s ease;
     }
-    .btn{
-      display:inline-block; padding:10px 16px; border-radius:8px;
-      border:1px solid var(--line); background:rgba(255,255,255,.06);
-      text-decoration:none; color:var(--text); font-weight:600; font-size:13px;
+    .download-card:hover {
+      background: rgba(255, 255, 255, 0.05);
+      border-color: var(--accent);
     }
-    .btn:hover{background:rgba(255,255,255,.1)}
-    .btn.primary{background:var(--accent); border-color:var(--accent); color:white}
-    .card{
-      background:rgba(255,255,255,.03); border:1px solid var(--line);
-      border-radius:12px; padding:20px; margin-bottom:20px;
+    .download-info h3 {
+      font-size: 16px;
+      margin-bottom: 6px;
     }
-    .stat-grid{display:grid; grid-template-columns:repeat(auto-fit, minmax(200px, 1fr)); gap:15px}
-    .stat{background:rgba(0,0,0,.2); padding:20px; border-radius:10px; text-align:center}
-    .stat-value{font-size:32px; font-weight:bold; margin:10px 0}
-    .stat-label{color:var(--muted); font-size:13px}
-    .download-section{display:grid; gap:15px; margin-top:20px}
-    .download-card{
-      background:rgba(255,255,255,.02); border:1px solid var(--line);
-      border-radius:10px; padding:20px; display:flex; justify-content:space-between; align-items:center;
+    .download-info p {
+      font-size: 13px;
+      color: var(--text-muted);
+      margin: 0;
     }
-    .download-info h3{font-size:16px; margin-bottom:5px}
-    .download-info p{font-size:13px; color:var(--muted)}
   </style>
 </head>
 <body>
-<div class="container">
-  <div class="header">
-    <a href="/portal" class="btn">← Volver al dashboard</a>
+  <div class="top-logo">
+    <img src="/static/icon-192.png" alt="SIA Sueldos">
+    <span class="top-logo-text">SIA</span>
   </div>
   
-  <div class="card">
-    <h2 style="margin-bottom:15px">📊 Reportes</h2>
-    <div style="color:var(--muted); font-size:13px; margin-bottom:15px">
-      🏢 """ + esc(empresa_nombre) + """ · 📅 """ + esc(period) + """
+  <div class="container">
+    <div class="header">
+      <a href="/portal" class="btn">← Volver al dashboard</a>
     </div>
+    
+    <div class="card">
+      <h2>📊 Reportes</h2>
+      <div class="muted" style="margin-bottom:16px">
+        🏢 """ + esc(empresa_nombre) + """ · 📅 """ + esc(period) + """
+      </div>
 """)
     
     if stats:
-        html.append("<h3 style='margin:20px 0 15px 0'>📈 Estadísticas del período</h3>")
+        html.append("<h3 style='margin:24px 0 16px 0'>📈 Estadísticas del período</h3>")
         html.append("<div class='stat-grid'>")
         
         html.append("<div class='stat'>")
@@ -1868,7 +1870,7 @@ def portal_reports():
         html.append("</div>")
         
         # Descargas
-        html.append("<h3 style='margin:30px 0 15px 0'>📥 Descargas</h3>")
+        html.append("<h3 style='margin:32px 0 16px 0'>📥 Descargas</h3>")
         html.append("<div class='download-section'>")
         
         html.append("<div class='download-card'>")
@@ -1911,6 +1913,7 @@ def portal_reports():
     
     return Response("".join(html), mimetype="text/html")
 
+    
 @app.route("/portal/pendientes")
 def portal_pendientes():
     """
