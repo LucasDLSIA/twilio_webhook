@@ -1115,13 +1115,19 @@ def portal_dashboard():
     
     msg = request.args.get("msg", "")
     
-    # Si hay período, cargar KPIs
+    # Obtener info del tenant
+    t = get_tenant(tenant)
+    empresa_nombre = t.get('display_name', tenant) if t else tenant
+    
+    # KPIs del período actual
     kpis = None
+    chart_data = None
+    
     if selected_period:
-        # Contar enviados
         conn = get_db_connection()
         cur = conn.cursor()
         
+        # KPIs actuales
         cur.execute("""
             SELECT COUNT(DISTINCT cuil) 
             FROM message_status 
@@ -1129,7 +1135,6 @@ def portal_dashboard():
         """, (tenant, selected_period))
         enviados = cur.fetchone()[0] or 0
         
-        # Contar vistos (tienen PDF enviado)
         cur.execute("""
             SELECT COUNT(DISTINCT cuil)
             FROM sent_pdfs
@@ -1137,7 +1142,6 @@ def portal_dashboard():
         """, (tenant, selected_period))
         vistos = cur.fetchone()[0] or 0
         
-        # Contar firmados
         cur.execute("""
             SELECT COUNT(DISTINCT cuil)
             FROM recibo_estado
@@ -1145,7 +1149,19 @@ def portal_dashboard():
         """, (tenant, selected_period))
         firmados = cur.fetchone()[0] or 0
         
-        conn.close()
+        # Tiempo promedio de firma
+        cur.execute("""
+            SELECT AVG(re.updated_at - ms.created_at) / 86400.0
+            FROM recibo_estado re
+            JOIN message_status ms ON ms.tenant = re.tenant 
+                AND ms.cuil = re.cuil 
+                AND ms.period = re.period 
+                AND ms.kind = 'template'
+            WHERE re.tenant = ? AND re.period = ? 
+                AND re.estado IN ('FIRMADO', 'OBSERVADO')
+        """, (tenant, selected_period))
+        avg_days = cur.fetchone()[0]
+        avg_days = round(avg_days, 1) if avg_days else 0
         
         pendientes = enviados - firmados
         pct_vistos = int((vistos / enviados * 100)) if enviados > 0 else 0
@@ -1157,12 +1173,56 @@ def portal_dashboard():
             'firmados': firmados,
             'pendientes': pendientes,
             'pct_vistos': pct_vistos,
-            'pct_firmados': pct_firmados
+            'pct_firmados': pct_firmados,
+            'avg_days': avg_days
         }
-    
-    # Obtener info del tenant
-    t = get_tenant(tenant)
-    empresa_nombre = t.get('display_name', tenant) if t else tenant
+        
+        # Datos para gráficos: últimos 6 períodos
+        last_6_periods = period_labels[:6]
+        
+        periods_data = []
+        for p in last_6_periods:
+            cur.execute("""
+                SELECT COUNT(DISTINCT cuil) 
+                FROM message_status 
+                WHERE tenant = ? AND period = ? AND kind = 'template'
+            """, (tenant, p))
+            env = cur.fetchone()[0] or 0
+            
+            cur.execute("""
+                SELECT COUNT(DISTINCT cuil)
+                FROM sent_pdfs
+                WHERE tenant = ? AND period = ?
+            """, (tenant, p))
+            vis = cur.fetchone()[0] or 0
+            
+            cur.execute("""
+                SELECT COUNT(DISTINCT cuil)
+                FROM recibo_estado
+                WHERE tenant = ? AND period = ? AND estado IN ('FIRMADO', 'OBSERVADO')
+            """, (tenant, p))
+            fir = cur.fetchone()[0] or 0
+            
+            periods_data.append({
+                'period': p,
+                'enviados': env,
+                'vistos': vis,
+                'firmados': fir,
+                'pct_firmados': int((fir / env * 100)) if env > 0 else 0
+            })
+        
+        conn.close()
+        
+        # Invertir para que el más reciente esté a la derecha
+        periods_data.reverse()
+        
+        chart_data = {
+            'labels': [d['period'] for d in periods_data],
+            'enviados': [d['enviados'] for d in periods_data],
+            'vistos': [d['vistos'] for d in periods_data],
+            'firmados': [d['firmados'] for d in periods_data],
+            'pct_firmados': [d['pct_firmados'] for d in periods_data]
+        }
     
     html = []
     html.append("""<!doctype html>
@@ -1178,6 +1238,7 @@ def portal_dashboard():
   <meta name="apple-mobile-web-app-title" content="Recibos">
   <link rel="apple-touch-icon" href="/static/icon-192.png">
   <link rel="stylesheet" href="/static/portal-theme.css">
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
   <style>
     .actions {
       display: grid;
@@ -1218,6 +1279,21 @@ def portal_dashboard():
       display: flex;
       gap: 12px;
       flex-wrap: wrap;
+    }
+    .charts-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(400px, 1fr));
+      gap: 20px;
+      margin-top: 20px;
+    }
+    .chart-container {
+      position: relative;
+      height: 300px;
+    }
+    @media (max-width: 768px) {
+      .charts-grid {
+        grid-template-columns: 1fr;
+      }
     }
   </style>
 </head>
@@ -1272,24 +1348,43 @@ def portal_dashboard():
         html.append("</div>")
         
         html.append("<div class='stat'>")
-        html.append(f"<div class='stat-value'>{kpis['vistos']}</div>")
-        html.append("<div class='stat-label'>👁️ Vieron el recibo</div>")
-        html.append(f"<div class='stat-label' style='margin-top:4px'>{kpis['pct_vistos']}%</div>")
+        html.append(f"<div class='stat-value'>{kpis['pct_vistos']}%</div>")
+        html.append("<div class='stat-label'>👁️ Tasa de apertura</div>")
         html.append("</div>")
         
         html.append("<div class='stat'>")
-        html.append(f"<div class='stat-value'>{kpis['firmados']}</div>")
-        html.append("<div class='stat-label'>✅ Firmaron</div>")
-        html.append(f"<div class='stat-label' style='margin-top:4px'>{kpis['pct_firmados']}%</div>")
+        html.append(f"<div class='stat-value'>{kpis['pct_firmados']}%</div>")
+        html.append("<div class='stat-label'>✅ Tasa de firma</div>")
         html.append("</div>")
         
         html.append("<div class='stat'>")
-        html.append(f"<div class='stat-value'>{kpis['pendientes']}</div>")
-        html.append("<div class='stat-label'>⚠️ Pendientes</div>")
+        html.append(f"<div class='stat-value'>{kpis['avg_days']}</div>")
+        html.append("<div class='stat-label'>📅 Días prom. de firma</div>")
         html.append("</div>")
         
         html.append("</div>")
         html.append("</div>")
+        
+        # GRÁFICOS
+        if chart_data and len(chart_data['labels']) > 1:
+            html.append("<div class='card'>")
+            html.append("<h2>📈 Tendencias</h2>")
+            html.append("<div class='charts-grid'>")
+            
+            # Gráfico 1: Evolución de firmas
+            html.append("<div>")
+            html.append("<h3 style='font-size:16px; margin-bottom:16px'>Evolución últimos 6 meses</h3>")
+            html.append("<div class='chart-container'><canvas id='evolutionChart'></canvas></div>")
+            html.append("</div>")
+            
+            # Gráfico 2: Tasa de firma
+            html.append("<div>")
+            html.append("<h3 style='font-size:16px; margin-bottom:16px'>Tasa de firma por mes</h3>")
+            html.append("<div class='chart-container'><canvas id='rateChart'></canvas></div>")
+            html.append("</div>")
+            
+            html.append("</div>")
+            html.append("</div>")
         
         # Acciones rápidas
         html.append("<div class='card'>")
@@ -1318,10 +1413,122 @@ def portal_dashboard():
         html.append("</div>")
     
     html.append("</div>")
+    
+    # JavaScript para los gráficos
+    if chart_data and len(chart_data['labels']) > 1:
+        import json
+        html.append("<script>")
+        html.append(f"const chartData = {json.dumps(chart_data)};")
+        html.append("""
+// Configuración de colores
+const colors = {
+  primary: '#2E3B8E',
+  accent: '#F4C430',
+  success: '#10b981',
+  text: '#c7d0e8'
+};
+
+// Gráfico de evolución
+const ctx1 = document.getElementById('evolutionChart').getContext('2d');
+new Chart(ctx1, {
+  type: 'line',
+  data: {
+    labels: chartData.labels,
+    datasets: [
+      {
+        label: 'Firmados',
+        data: chartData.firmados,
+        borderColor: colors.success,
+        backgroundColor: 'rgba(16, 185, 129, 0.1)',
+        tension: 0.4,
+        fill: true
+      },
+      {
+        label: 'Vistos',
+        data: chartData.vistos,
+        borderColor: colors.accent,
+        backgroundColor: 'rgba(244, 196, 48, 0.1)',
+        tension: 0.4,
+        fill: true
+      },
+      {
+        label: 'Enviados',
+        data: chartData.enviados,
+        borderColor: colors.primary,
+        backgroundColor: 'rgba(46, 59, 142, 0.1)',
+        tension: 0.4,
+        fill: true
+      }
+    ]
+  },
+  options: {
+    responsive: true,
+    maintainAspectRatio: false,
+    plugins: {
+      legend: {
+        labels: { color: colors.text }
+      }
+    },
+    scales: {
+      y: {
+        beginAtZero: true,
+        ticks: { color: colors.text },
+        grid: { color: 'rgba(255, 255, 255, 0.1)' }
+      },
+      x: {
+        ticks: { color: colors.text },
+        grid: { color: 'rgba(255, 255, 255, 0.1)' }
+      }
+    }
+  }
+});
+
+// Gráfico de tasa de firma
+const ctx2 = document.getElementById('rateChart').getContext('2d');
+new Chart(ctx2, {
+  type: 'bar',
+  data: {
+    labels: chartData.labels,
+    datasets: [{
+      label: '% Firmados',
+      data: chartData.pct_firmados,
+      backgroundColor: colors.accent,
+      borderColor: colors.accent,
+      borderWidth: 1
+    }]
+  },
+  options: {
+    responsive: true,
+    maintainAspectRatio: false,
+    plugins: {
+      legend: {
+        labels: { color: colors.text }
+      }
+    },
+    scales: {
+      y: {
+        beginAtZero: true,
+        max: 100,
+        ticks: { 
+          color: colors.text,
+          callback: function(value) { return value + '%'; }
+        },
+        grid: { color: 'rgba(255, 255, 255, 0.1)' }
+      },
+      x: {
+        ticks: { color: colors.text },
+        grid: { color: 'rgba(255, 255, 255, 0.1)' }
+      }
+    }
+  }
+});
+        """)
+        html.append("</script>")
+    
     html.append("</body></html>")
     
     return Response("".join(html), mimetype="text/html")
-
+    
 
 @app.route("/portal/search")
 def portal_search():
