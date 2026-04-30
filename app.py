@@ -1538,7 +1538,7 @@ def portal_search():
     
     return Response("".join(html), mimetype="text/html")
 
-    
+
 @app.get("/portal/report.pdf")
 def portal_report_pdf():
     """
@@ -1946,71 +1946,48 @@ def portal_pendientes():
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Pendientes</title>
-<link rel="manifest" href="/static/manifest.json">
-<meta name="theme-color" content="#5aa7ff">
-<meta name="apple-mobile-web-app-capable" content="yes">
-<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
-<meta name="apple-mobile-web-app-title" content="Recibos">
-<link rel="apple-touch-icon" href="/static/icon-192.png">
+  <link rel="manifest" href="/static/manifest.json">
+  <meta name="theme-color" content="#2E3B8E">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta name="apple-mobile-web-app-title" content="Recibos">
+  <link rel="apple-touch-icon" href="/static/icon-192.png">
+  <link rel="stylesheet" href="/static/portal-theme.css">
   <style>
-    :root{
-      --bg:#0b1220; --card:#0f1b33; --text:#eaf0ff; --muted:#9fb2d0;
-      --accent:#5aa7ff; --error:#fb7185; --warn:#fbbf24; --line:rgba(255,255,255,.08);
+    .section-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-bottom: 16px;
+      padding-bottom: 12px;
+      border-bottom: 1px solid var(--line);
+      flex-wrap: wrap;
+      gap: 12px;
     }
-    *{box-sizing:border-box; margin:0; padding:0}
-    body{font-family:system-ui; background:var(--bg); color:var(--text); padding:20px}
-    .container{max-width:1100px; margin:0 auto}
-    .header{
-      background:rgba(255,255,255,.03); border:1px solid var(--line);
-      border-radius:12px; padding:20px; margin-bottom:20px;
+    .empty {
+      text-align: center;
+      padding: 60px 20px;
+      color: var(--text-muted);
     }
-    .btn{
-      display:inline-block; padding:10px 16px; border-radius:8px;
-      border:1px solid var(--line); background:rgba(255,255,255,.06);
-      text-decoration:none; color:var(--text); font-weight:600; font-size:13px;
-    }
-    .btn:hover{background:rgba(255,255,255,.1)}
-    .card{
-      background:rgba(255,255,255,.03); border:1px solid var(--line);
-      border-radius:12px; padding:20px; margin-bottom:20px;
-    }
-    .card h2{font-size:18px; margin-bottom:10px}
-    .section-header{
-      display:flex; justify-content:space-between; align-items:center;
-      margin-bottom:15px; padding-bottom:10px; border-bottom:1px solid var(--line);
-    }
-    .badge{
-      display:inline-block; padding:4px 10px; border-radius:6px;
-      font-size:13px; font-weight:600;
-    }
-    .badge-error{background:rgba(251,113,133,.15); color:var(--error)}
-    .badge-warn{background:rgba(251,191,36,.15); color:var(--warn)}
-    .pending-item{
-      background:rgba(0,0,0,.2); border:1px solid var(--line);
-      border-radius:8px; padding:15px; margin-bottom:10px;
-      display:flex; justify-content:space-between; align-items:center;
-    }
-    .pending-info{flex:1}
-    .pending-name{font-size:15px; font-weight:600; margin-bottom:5px}
-    .pending-details{font-size:13px; color:var(--muted)}
-    .empty{text-align:center; padding:40px; color:var(--muted)}
-    table{width:100%; border-collapse:collapse}
-    th, td{padding:12px; text-align:left; border-bottom:1px solid var(--line)}
-    th{color:var(--muted); font-size:12px; font-weight:600}
   </style>
 </head>
 <body>
-<div class="container">
-  <div class="header">
-    <a href="/portal" class="btn">← Volver al dashboard</a>
+  <div class="top-logo">
+    <img src="/static/icon-192.png" alt="SIA Sueldos">
+    <span class="top-logo-text">SIA</span>
   </div>
   
-  <div class="card">
-    <h2>⚠️ Pendientes</h2>
-    <div style="color:var(--muted); font-size:13px; margin-bottom:15px">
-      🏢 """ + esc(empresa_nombre) + """ · 📅 """ + esc(period) + """
+  <div class="container">
+    <div class="header">
+      <a href="/portal" class="btn">← Volver al dashboard</a>
     </div>
-  </div>
+    
+    <div class="card">
+      <h2>⚠️ Pendientes</h2>
+      <div class="muted" style="margin-bottom:16px">
+        🏢 """ + esc(empresa_nombre) + """ · 📅 """ + esc(period) + """
+      </div>
+    </div>
 """)
     
     # No vieron (>7 días)
@@ -2018,7 +1995,7 @@ def portal_pendientes():
     html.append("<div class='section-header'>")
     html.append("<div>")
     html.append("<h2>🔴 No vieron el recibo</h2>")
-    html.append("<div style='color:var(--muted); font-size:13px'>Template enviado hace más de 7 días, nunca pidieron el PDF</div>")
+    html.append("<div class='muted'>Template enviado hace más de 7 días, nunca pidieron el PDF</div>")
     html.append("</div>")
     html.append(f"<span class='badge badge-error'>{len(pending_views)}</span>")
     html.append("</div>")
@@ -2040,7 +2017,7 @@ def portal_pendientes():
         html.append("</tbody></table>")
         
         if len(pending_views) > 20:
-            html.append(f"<div style='color:var(--muted); font-size:13px; margin-top:10px; text-align:center'>... y {len(pending_views) - 20} más</div>")
+            html.append(f"<div class='muted' style='margin-top:12px; text-align:center'>... y {len(pending_views) - 20} más</div>")
     else:
         html.append("<div class='empty'>✅ No hay pendientes en esta categoría</div>")
     
@@ -2051,9 +2028,9 @@ def portal_pendientes():
     html.append("<div class='section-header'>")
     html.append("<div>")
     html.append("<h2>🟡 No firmaron</h2>")
-    html.append("<div style='color:var(--muted); font-size:13px'>PDF recibido hace más de 7 días, nunca firmaron</div>")
+    html.append("<div class='muted'>PDF recibido hace más de 7 días, nunca firmaron</div>")
     html.append("</div>")
-    html.append(f"<span class='badge badge-warn'>{len(pending_sigs)}</span>")
+    html.append(f"<span class='badge badge-warning'>{len(pending_sigs)}</span>")
     html.append("</div>")
     
     if pending_sigs:
@@ -2073,7 +2050,7 @@ def portal_pendientes():
         html.append("</tbody></table>")
         
         if len(pending_sigs) > 20:
-            html.append(f"<div style='color:var(--muted); font-size:13px; margin-top:10px; text-align:center'>... y {len(pending_sigs) - 20} más</div>")
+            html.append(f"<div class='muted' style='margin-top:12px; text-align:center'>... y {len(pending_sigs) - 20} más</div>")
     else:
         html.append("<div class='empty'>✅ No hay pendientes en esta categoría</div>")
     
