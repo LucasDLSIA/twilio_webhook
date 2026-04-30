@@ -1434,78 +1434,84 @@ def portal_search():
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Buscar empleado</title>
-<link rel="manifest" href="/static/manifest.json">
-<meta name="theme-color" content="#5aa7ff">
-<meta name="apple-mobile-web-app-capable" content="yes">
-<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
-<meta name="apple-mobile-web-app-title" content="Recibos">
-<link rel="apple-touch-icon" href="/static/icon-192.png">
+  <link rel="manifest" href="/static/manifest.json">
+  <meta name="theme-color" content="#2E3B8E">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta name="apple-mobile-web-app-title" content="Recibos">
+  <link rel="apple-touch-icon" href="/static/icon-192.png">
+  <link rel="stylesheet" href="/static/portal-theme.css">
   <style>
-    :root{
-      --bg:#0b1220; --card:#0f1b33; --text:#eaf0ff; --muted:#9fb2d0;
-      --accent:#5aa7ff; --ok:#34d399; --warn:#fbbf24; --line:rgba(255,255,255,.08);
+    .search-box {
+      display: flex;
+      gap: 12px;
+      margin-bottom: 20px;
     }
-    *{box-sizing:border-box; margin:0; padding:0}
-    body{font-family:system-ui; background:var(--bg); color:var(--text); padding:20px}
-    .container{max-width:900px; margin:0 auto}
-    .header{
-      background:rgba(255,255,255,.03); border:1px solid var(--line);
-      border-radius:12px; padding:20px; margin-bottom:20px;
+    .search-box input {
+      flex: 1;
     }
-    .btn{
-      display:inline-block; padding:10px 16px; border-radius:8px;
-      border:1px solid var(--line); background:rgba(255,255,255,.06);
-      text-decoration:none; color:var(--text); font-weight:600; font-size:13px;
+    .search-box button {
+      padding: 12px 32px;
+      white-space: nowrap;
     }
-    .btn:hover{background:rgba(255,255,255,.1)}
-    .card{
-      background:rgba(255,255,255,.03); border:1px solid var(--line);
-      border-radius:12px; padding:20px; margin-bottom:20px;
+    .result {
+      background: rgba(0, 0, 0, 0.2);
+      border: 1px solid var(--line);
+      border-radius: var(--radius-sm);
+      padding: 16px;
+      margin-bottom: 12px;
+      transition: all 0.2s ease;
     }
-    .search-box{
-      display:flex; gap:10px; margin-bottom:20px;
+    .result:hover {
+      background: rgba(0, 0, 0, 0.3);
+      border-color: var(--accent);
     }
-    .search-box input{
-      flex:1; padding:12px; border-radius:8px;
-      border:1px solid var(--line); background:rgba(0,0,0,.25);
-      color:var(--text); font-size:14px;
+    .result-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-bottom: 8px;
+      flex-wrap: wrap;
+      gap: 8px;
     }
-    .search-box button{
-      padding:12px 24px; border-radius:8px; border:none;
-      background:var(--accent); color:white; font-weight:600; cursor:pointer;
+    .result-name {
+      font-size: 16px;
+      font-weight: 600;
     }
-    .result{
-      background:rgba(0,0,0,.2); border:1px solid var(--line);
-      border-radius:10px; padding:15px; margin-bottom:10px;
+    .result-details {
+      font-size: 13px;
+      color: var(--text-muted);
     }
-    .result-header{display:flex; justify-content:space-between; align-items:center; margin-bottom:10px}
-    .result-name{font-size:16px; font-weight:600}
-    .result-status{font-size:13px; padding:4px 10px; border-radius:6px; display:inline-block}
-    .status-firmado{background:rgba(52,211,153,.15); color:var(--ok)}
-    .status-visto{background:rgba(251,191,36,.15); color:var(--warn)}
-    .status-enviado{background:rgba(251,113,133,.15); color:#fb7185}
-    .result-details{font-size:13px; color:var(--muted)}
-    .no-results{text-align:center; padding:40px; color:var(--muted)}
+    .no-results {
+      text-align: center;
+      padding: 60px 20px;
+      color: var(--text-muted);
+    }
   </style>
 </head>
 <body>
-<div class="container">
-  <div class="header">
-    <a href="/portal" class="btn">← Volver al dashboard</a>
+  <div class="top-logo">
+    <img src="/static/icon-192.png" alt="SIA Sueldos">
+    <span class="top-logo-text">SIA</span>
   </div>
   
-  <div class="card">
-    <h2 style="margin-bottom:15px">🔍 Buscar empleado</h2>
-    <div style="color:var(--muted); font-size:13px; margin-bottom:15px">
-      🏢 """ + esc(empresa_nombre) + """ · 📅 """ + esc(period) + """
+  <div class="container">
+    <div class="header">
+      <a href="/portal" class="btn">← Volver al dashboard</a>
     </div>
     
-    <form method="get" class="search-box">
-      <input type="hidden" name="period" value='""" + esc(period) + """'>
-      <input type="text" name="q" placeholder="Nombre, CUIL o DNI..." 
-             value='""" + esc(query) + """' autofocus>
-      <button type="submit">Buscar</button>
-    </form>
+    <div class="card">
+      <h2>🔍 Buscar empleado</h2>
+      <div class="muted" style="margin-bottom:16px">
+        🏢 """ + esc(empresa_nombre) + """ · 📅 """ + esc(period) + """
+      </div>
+      
+      <form method="get" class="search-box">
+        <input type="hidden" name="period" value='""" + esc(period) + """'>
+        <input type="text" name="q" placeholder="Nombre, CUIL o DNI..." 
+               value='""" + esc(query) + """' autofocus>
+        <button type="submit" class="btn primary">Buscar</button>
+      </form>
 """)
     
     if query and len(query) < 2:
@@ -1513,15 +1519,13 @@ def portal_search():
     elif query and not results:
         html.append("<div class='no-results'>No se encontraron resultados para: <strong>" + esc(query) + "</strong></div>")
     elif results:
-        html.append(f"<div style='color:var(--muted); font-size:13px; margin-bottom:15px'>✨ {len(results)} resultado(s) encontrado(s)</div>")
+        html.append(f"<div class='muted' style='margin-bottom:16px'>✨ {len(results)} resultado(s) encontrado(s)</div>")
         
         for r in results:
-            status_class = f"status-{r['status']}"
-            
             html.append("<div class='result'>")
             html.append("<div class='result-header'>")
             html.append(f"<div class='result-name'>{r['status_emoji']} {esc(r['nombre'])}</div>")
-            html.append(f"<span class='result-status {status_class}'>{esc(r['status_text'])}</span>")
+            html.append(f"<span class='badge badge-{r['status'] if r['status'] != 'sin_enviar' else 'error'}'>{esc(r['status_text'])}</span>")
             html.append("</div>")
             html.append("<div class='result-details'>")
             html.append(f"CUIL: {esc(r['cuil'])} · DNI: {esc(r['dni'])} · WhatsApp: {esc(r['whatsapp'])}")
@@ -1534,6 +1538,7 @@ def portal_search():
     
     return Response("".join(html), mimetype="text/html")
 
+    
 @app.get("/portal/report.pdf")
 def portal_report_pdf():
     """
