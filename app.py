@@ -2141,95 +2141,83 @@ def portal_change_password():
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Cambiar contraseña</title>
-<link rel="manifest" href="/static/manifest.json">
-<meta name="theme-color" content="#5aa7ff">
-<meta name="apple-mobile-web-app-capable" content="yes">
-<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
-<meta name="apple-mobile-web-app-title" content="Recibos">
-<link rel="apple-touch-icon" href="/static/icon-192.png">
+  <link rel="manifest" href="/static/manifest.json">
+  <meta name="theme-color" content="#2E3B8E">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta name="apple-mobile-web-app-title" content="Recibos">
+  <link rel="apple-touch-icon" href="/static/icon-192.png">
+  <link rel="stylesheet" href="/static/portal-theme.css">
   <style>
-    :root{
-      --bg:#0b1220; --card:#0f1b33; --text:#eaf0ff;
-      --accent:#5aa7ff; --error:#fb7185; --warn:#fbbf24;
+    body {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      min-height: 100vh;
+      padding: 20px;
     }
-    *{box-sizing:border-box}
-    body{
-      margin:0; font-family:system-ui;
-      background: radial-gradient(1200px 700px at 20% -20%, rgba(90,167,255,.25), transparent 60%),
-                  var(--bg);
-      color:var(--text);
-      display:flex; align-items:center; justify-content:center;
-      min-height:100vh; padding:20px;
+    .hint {
+      font-size: 12px;
+      color: var(--text-muted);
+      margin-top: 6px;
     }
-    .card{
-      background:rgba(255,255,255,.03); border:1px solid rgba(255,255,255,.08);
-      border-radius:16px; padding:40px; max-width:450px; width:100%;
-      box-shadow:0 10px 25px rgba(0,0,0,.25);
+    .back-link {
+      text-align: center;
+      margin-top: 16px;
+      font-size: 13px;
     }
-    h1{margin:0 0 10px 0; font-size:24px; text-align:center}
-    .subtitle{text-align:center; color:#9fb2d0; font-size:14px; margin-bottom:20px}
-    .warning{
-      background:rgba(251,191,36,.1); border:1px solid rgba(251,191,36,.3);
-      padding:12px; border-radius:8px; margin-bottom:20px; font-size:13px;
+    .back-link a {
+      color: var(--accent);
+      text-decoration: none;
+      font-weight: 600;
     }
-    .error{
-      background:rgba(251,113,133,.1); border:1px solid rgba(251,113,133,.3);
-      padding:12px; border-radius:8px; margin-bottom:20px; font-size:13px;
+    .back-link a:hover {
+      text-decoration: underline;
     }
-    label{display:block; margin:15px 0 5px 0; font-size:13px; color:#9fb2d0}
-    input{
-      width:100%; padding:12px; border-radius:8px;
-      border:1px solid rgba(255,255,255,.08);
-      background:rgba(0,0,0,.25); color:var(--text);
-      font-size:14px;
-    }
-    input:focus{outline:none; border-color:var(--accent)}
-    .btn{
-      width:100%; padding:14px; border-radius:8px; border:none;
-      background:var(--accent); color:white; font-weight:600;
-      font-size:14px; cursor:pointer; margin-top:20px;
-    }
-    .btn:hover{background:#4a96ee}
-    .hint{font-size:12px; color:#9fb2d0; margin-top:5px}
   </style>
 </head>
-<body>
-  <div class="card">
+<body class="login-page">
+  <div class="top-logo">
+    <img src="/static/icon-192.png" alt="SIA Sueldos">
+    <span class="top-logo-text">SIA</span>
+  </div>
+  
+  <div class="login-card">
     <h1>🔐 Cambiar contraseña</h1>
 """)
     
     if first_time:
         html.append("<div class='subtitle'>Hola, " + esc(user['full_name'] or user['username']) + "</div>")
         html.append("""
-        <div class="warning">
+        <div class="alert alert-warning" style="margin-top:16px">
           ⚠️ <strong>Primer ingreso</strong><br>
-          Por seguridad, debés cambiar tu contraseña temporal por una nueva.
+          Por seguridad, debés cambiar tu contraseña temporal.
         </div>
         """)
     else:
         html.append("<div class='subtitle'>Usuario: " + esc(user['username']) + "</div>")
     
     if error:
-        html.append(f"<div class='error'>❌ {esc(error)}</div>")
+        html.append(f"<div class='alert alert-error' style='margin-top:16px'>❌ {esc(error)}</div>")
     
     html.append("""
-    <form method="post">
+    <form method="post" style="margin-top:20px">
       <label>Contraseña actual</label>
       <input type="password" name="current_password" required autofocus>
       
-      <label>Nueva contraseña</label>
+      <label style="margin-top:16px">Nueva contraseña</label>
       <input type="password" name="new_password" required minlength="8">
       <div class="hint">Mínimo 8 caracteres</div>
       
-      <label>Confirmar nueva contraseña</label>
+      <label style="margin-top:16px">Confirmar nueva contraseña</label>
       <input type="password" name="confirm_password" required minlength="8">
       
-      <button type="submit" class="btn">Cambiar contraseña</button>
+      <button type="submit" class="btn primary" style="margin-top:24px; width:100%">Cambiar contraseña</button>
     </form>
 """)
     
     if not first_time:
-        html.append("<div style='text-align:center;margin-top:15px'><a href='/portal' style='color:#5aa7ff;text-decoration:none;font-size:13px'>← Volver al portal</a></div>")
+        html.append("<div class='back-link'><a href='/portal'>← Volver al portal</a></div>")
     
     html.append("</div></body></html>")
     
