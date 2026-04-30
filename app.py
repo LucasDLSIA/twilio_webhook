@@ -1170,72 +1170,54 @@ def portal_dashboard():
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Portal - Dashboard</title>
-    <link rel="manifest" href="/static/manifest.json">
-    <meta name="theme-color" content="#5aa7ff">
-    <meta name="apple-mobile-web-app-capable" content="yes">
-    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
-    <meta name="apple-mobile-web-app-title" content="Recibos">
-    <link rel="apple-touch-icon" href="/static/icon-192.png">
+  <title>Portal - Dashboard</title>
+  <link rel="manifest" href="/static/manifest.json">
+  <meta name="theme-color" content="#2E3B8E">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta name="apple-mobile-web-app-title" content="Recibos">
+  <link rel="apple-touch-icon" href="/static/icon-192.png">
+  <link rel="stylesheet" href="/static/portal-theme.css">
   <style>
-    :root{
-      --bg:#0b1220; --card:#0f1b33; --text:#eaf0ff; --muted:#9fb2d0;
-      --accent:#5aa7ff; --ok:#34d399; --warn:#fbbf24; --line:rgba(255,255,255,.08);
+    .actions {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+      gap: 16px;
+      margin-top: 20px;
     }
-    *{box-sizing:border-box; margin:0; padding:0}
-    body{
-      font-family:system-ui; background:var(--bg); color:var(--text);
-      padding:20px;
+    .action-card {
+      background: var(--card);
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      padding: 24px;
+      text-align: center;
+      text-decoration: none;
+      color: var(--text);
+      transition: all 0.3s ease;
     }
-    .container{max-width:1100px; margin:0 auto}
-    .header{
-      background:rgba(255,255,255,.03); border:1px solid var(--line);
-      border-radius:12px; padding:20px; margin-bottom:20px;
-      display:flex; justify-content:space-between; align-items:center;
-      flex-wrap:wrap; gap:15px;
+    .action-card:hover {
+      background: var(--card-hover);
+      border-color: var(--accent);
+      transform: translateY(-4px);
+      box-shadow: 0 8px 24px rgba(244, 196, 48, 0.15);
     }
-    .header h1{font-size:22px}
-    .subtitle{color:var(--muted); font-size:14px; margin-top:5px}
-    .btn{
-      display:inline-block; padding:10px 16px; border-radius:8px;
-      border:1px solid var(--line); background:rgba(255,255,255,.06);
-      text-decoration:none; color:var(--text); font-weight:600; font-size:13px;
+    .action-icon {
+      font-size: 48px;
+      margin-bottom: 12px;
     }
-    .btn:hover{background:rgba(255,255,255,.1)}
-    .btn.primary{background:var(--accent); border-color:var(--accent); color:white}
-    .card{
-      background:rgba(255,255,255,.03); border:1px solid var(--line);
-      border-radius:12px; padding:20px; margin-bottom:20px;
+    .action-title {
+      font-size: 18px;
+      font-weight: 700;
+      margin-bottom: 8px;
     }
-    .card h2{font-size:18px; margin-bottom:15px}
-    .kpis{
-      display:grid; grid-template-columns:repeat(auto-fit, minmax(200px, 1fr));
-      gap:15px; margin-top:15px;
+    .action-desc {
+      font-size: 14px;
+      color: var(--text-muted);
     }
-    .kpi{
-      background:rgba(0,0,0,.2); border:1px solid var(--line);
-      border-radius:10px; padding:20px; text-align:center;
-    }
-    .kpi-value{font-size:36px; font-weight:bold; margin:10px 0}
-    .kpi-label{color:var(--muted); font-size:13px}
-    .kpi-pct{color:var(--muted); font-size:14px; margin-top:5px}
-    .actions{display:grid; grid-template-columns:repeat(auto-fit, minmax(250px, 1fr)); gap:15px; margin-top:20px}
-    .action-card{
-      background:rgba(255,255,255,.02); border:1px solid var(--line);
-      border-radius:10px; padding:20px; text-align:center; cursor:pointer;
-      transition:all .2s;
-    }
-    .action-card:hover{background:rgba(255,255,255,.06); transform:translateY(-2px)}
-    .action-icon{font-size:32px; margin-bottom:10px}
-    .action-title{font-size:16px; font-weight:600; margin-bottom:5px}
-    .action-desc{font-size:13px; color:var(--muted)}
-    select, input{
-      background:rgba(0,0,0,.25); border:1px solid var(--line);
-      color:var(--text); padding:10px; border-radius:8px;
-    }
-    .success{
-      background:rgba(52,211,153,.1); border:1px solid rgba(52,211,153,.3);
-      padding:12px; border-radius:8px; margin-bottom:20px;
+    .header-actions {
+      display: flex;
+      gap: 12px;
+      flex-wrap: wrap;
     }
   </style>
 </head>
@@ -1244,21 +1226,24 @@ def portal_dashboard():
     <img src="/static/icon-192.png" alt="SIA Sueldos">
     <span class="top-logo-text">SIA</span>
   </div>
-<div class="container">
-  <div class="header">
-    <div>
-      <h1>👋 Hola, """ + esc(user.get('full_name') or user['username']) + """</h1>
-      <div class="subtitle">🏢 """ + esc(empresa_nombre) + """</div>
+  
+  <div class="container">
+    <div class="header">
+      <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:16px">
+        <div>
+          <h1>👋 Hola, """ + esc(user.get('full_name') or user['username']) + """</h1>
+          <div class="subtitle">🏢 """ + esc(empresa_nombre) + """</div>
+        </div>
+        <div class="header-actions">
+          <a href="/portal/change_password" class="btn">🔐 Cambiar contraseña</a>
+          <a href="/portal/logout" class="btn">🚪 Salir</a>
+        </div>
+      </div>
     </div>
-    <div style="display:flex; gap:10px; flex-wrap:wrap">
-      <a href="/portal/change_password" class="btn">🔐 Cambiar contraseña</a>
-      <a href="/portal/logout" class="btn">🚪 Salir</a>
-    </div>
-  </div>
 """)
     
     if msg == "password_changed":
-        html.append("<div class='success'>✅ Contraseña cambiada correctamente</div>")
+        html.append("<div class='alert alert-success'>✅ Contraseña cambiada correctamente</div>")
     
     # Selector de período
     html.append("<div class='card'>")
@@ -1279,28 +1264,28 @@ def portal_dashboard():
     if kpis:
         html.append("<div class='card'>")
         html.append(f"<h2>📊 Resumen - {esc(selected_period)}</h2>")
-        html.append("<div class='kpis'>")
+        html.append("<div class='stat-grid'>")
         
-        html.append("<div class='kpi'>")
-        html.append(f"<div class='kpi-value'>{kpis['enviados']}</div>")
-        html.append("<div class='kpi-label'>📤 Enviados</div>")
+        html.append("<div class='stat'>")
+        html.append(f"<div class='stat-value'>{kpis['enviados']}</div>")
+        html.append("<div class='stat-label'>📤 Enviados</div>")
         html.append("</div>")
         
-        html.append("<div class='kpi'>")
-        html.append(f"<div class='kpi-value'>{kpis['vistos']}</div>")
-        html.append("<div class='kpi-label'>👁️ Vieron el recibo</div>")
-        html.append(f"<div class='kpi-pct'>{kpis['pct_vistos']}%</div>")
+        html.append("<div class='stat'>")
+        html.append(f"<div class='stat-value'>{kpis['vistos']}</div>")
+        html.append("<div class='stat-label'>👁️ Vieron el recibo</div>")
+        html.append(f"<div class='stat-label' style='margin-top:4px'>{kpis['pct_vistos']}%</div>")
         html.append("</div>")
         
-        html.append("<div class='kpi'>")
-        html.append(f"<div class='kpi-value' style='color:var(--ok)'>{kpis['firmados']}</div>")
-        html.append("<div class='kpi-label'>✅ Firmaron</div>")
-        html.append(f"<div class='kpi-pct'>{kpis['pct_firmados']}%</div>")
+        html.append("<div class='stat'>")
+        html.append(f"<div class='stat-value'>{kpis['firmados']}</div>")
+        html.append("<div class='stat-label'>✅ Firmaron</div>")
+        html.append(f"<div class='stat-label' style='margin-top:4px'>{kpis['pct_firmados']}%</div>")
         html.append("</div>")
         
-        html.append("<div class='kpi'>")
-        html.append(f"<div class='kpi-value' style='color:var(--warn)'>{kpis['pendientes']}</div>")
-        html.append("<div class='kpi-label'>⚠️ Pendientes</div>")
+        html.append("<div class='stat'>")
+        html.append(f"<div class='stat-value'>{kpis['pendientes']}</div>")
+        html.append("<div class='stat-label'>⚠️ Pendientes</div>")
         html.append("</div>")
         
         html.append("</div>")
@@ -1311,22 +1296,22 @@ def portal_dashboard():
         html.append("<h2>🎯 Acciones rápidas</h2>")
         html.append("<div class='actions'>")
         
-        html.append(f"<a href='/portal/search?period={esc(selected_period)}' class='action-card' style='text-decoration:none; color:inherit'>")
+        html.append(f"<a href='/portal/search?period={esc(selected_period)}' class='action-card'>")
         html.append("<div class='action-icon'>🔍</div>")
         html.append("<div class='action-title'>Buscar empleado</div>")
         html.append("<div class='action-desc'>Por nombre, CUIL o DNI</div>")
         html.append("</a>")
         
-        html.append(f"<a href='/portal/pendientes?period={esc(selected_period)}' class='action-card' style='text-decoration:none; color:inherit'>")
+        html.append(f"<a href='/portal/pendientes?period={esc(selected_period)}' class='action-card'>")
         html.append("<div class='action-icon'>⚠️</div>")
         html.append("<div class='action-title'>Ver pendientes</div>")
         html.append(f"<div class='action-desc'>{kpis['pendientes']} sin firmar</div>")
         html.append("</a>")
         
-        html.append(f"<a href='/portal/reports?period={esc(selected_period)}' class='action-card' style='text-decoration:none; color:inherit'>")
+        html.append(f"<a href='/portal/reports?period={esc(selected_period)}' class='action-card'>")
         html.append("<div class='action-icon'>📊</div>")
         html.append("<div class='action-title'>Reportes</div>")
-        html.append("<div class='action-desc'>Descargar Excel, estadísticas</div>")
+        html.append("<div class='action-desc'>Descargar PDF y Excel</div>")
         html.append("</a>")
         
         html.append("</div>")
@@ -1336,6 +1321,7 @@ def portal_dashboard():
     html.append("</body></html>")
     
     return Response("".join(html), mimetype="text/html")
+
 
 @app.route("/portal/search")
 def portal_search():
