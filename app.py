@@ -1568,7 +1568,6 @@ def portal_report_pdf():
         mimetype="application/pdf"
     )
 
-
 @app.route("/portal/reports")
 def portal_reports():
     """
@@ -1913,7 +1912,7 @@ def portal_reports():
     
     return Response("".join(html), mimetype="text/html")
 
-    
+
 @app.route("/portal/pendientes")
 def portal_pendientes():
     """
