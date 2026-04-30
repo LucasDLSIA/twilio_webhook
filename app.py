@@ -2337,86 +2337,69 @@ def portal_forgot_password():
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Recuperar contraseña</title>
-<link rel="manifest" href="/static/manifest.json">
-<meta name="theme-color" content="#5aa7ff">
-<meta name="apple-mobile-web-app-capable" content="yes">
-<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
-<meta name="apple-mobile-web-app-title" content="Recibos">
-<link rel="apple-touch-icon" href="/static/icon-192.png">
+  <link rel="manifest" href="/static/manifest.json">
+  <meta name="theme-color" content="#2E3B8E">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta name="apple-mobile-web-app-title" content="Recibos">
+  <link rel="apple-touch-icon" href="/static/icon-192.png">
+  <link rel="stylesheet" href="/static/portal-theme.css">
   <style>
-    :root{
-      --bg:#0b1220; --card:#0f1b33; --text:#eaf0ff;
-      --accent:#5aa7ff;
+    body {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      min-height: 100vh;
+      padding: 20px;
     }
-    *{box-sizing:border-box}
-    body{
-      margin:0; font-family:system-ui;
-      background: radial-gradient(1200px 700px at 20% -20%, rgba(90,167,255,.25), transparent 60%),
-                  var(--bg);
-      color:var(--text);
-      display:flex; align-items:center; justify-content:center;
-      min-height:100vh; padding:20px;
+    .back-link {
+      text-align: center;
+      margin-top: 16px;
+      font-size: 13px;
     }
-    .card{
-      background:rgba(255,255,255,.03); border:1px solid rgba(255,255,255,.08);
-      border-radius:16px; padding:40px; max-width:400px; width:100%;
-      box-shadow:0 10px 25px rgba(0,0,0,.25);
+    .back-link a {
+      color: var(--accent);
+      text-decoration: none;
+      font-weight: 600;
     }
-    h1{margin:0 0 10px 0; font-size:24px; text-align:center}
-    .subtitle{text-align:center; color:#9fb2d0; font-size:14px; margin-bottom:30px}
-    .success{
-      background:rgba(52,211,153,.1); border:1px solid rgba(52,211,153,.3);
-      padding:12px; border-radius:8px; margin-bottom:20px; font-size:13px;
+    .back-link a:hover {
+      text-decoration: underline;
     }
-    label{display:block; margin:15px 0 5px 0; font-size:13px; color:#9fb2d0}
-    input{
-      width:100%; padding:12px; border-radius:8px;
-      border:1px solid rgba(255,255,255,.08);
-      background:rgba(0,0,0,.25); color:var(--text);
-      font-size:14px;
-    }
-    input:focus{outline:none; border-color:var(--accent)}
-    .btn{
-      width:100%; padding:14px; border-radius:8px; border:none;
-      background:var(--accent); color:white; font-weight:600;
-      font-size:14px; cursor:pointer; margin-top:20px;
-    }
-    .btn:hover{background:#4a96ee}
-    .back{
-      text-align:center; margin-top:15px; font-size:13px;
-    }
-    .back a{color:var(--accent); text-decoration:none}
-    .back a:hover{text-decoration:underline}
   </style>
 </head>
-<body>
-  <div class="card">
+<body class="login-page">
+  <div class="top-logo">
+    <img src="/static/icon-192.png" alt="SIA Sueldos">
+    <span class="top-logo-text">SIA</span>
+  </div>
+  
+  <div class="login-card">
     <h1>🔑 Recuperar contraseña</h1>
     <div class="subtitle">Te enviaremos un link para resetear tu contraseña</div>
 """)
     
     if msg == "sent":
         html.append("""
-        <div class="success">
+        <div class="alert alert-success" style="margin-top:20px">
           ✅ <strong>Email enviado</strong><br>
           Si el email existe en nuestro sistema, recibirás un link para resetear tu contraseña.
           <br><br>
           Revisá tu casilla (incluso spam) y seguí las instrucciones.
         </div>
-        <div class="back">
+        <div class="back-link">
           <a href="/portal/login">← Volver al login</a>
         </div>
         """)
     else:
         html.append("""
-        <form method="post">
+        <form method="post" style="margin-top:20px">
           <label>Email</label>
           <input type="email" name="email" required autofocus placeholder="tu@email.com">
           
-          <button type="submit" class="btn">Enviar link de recuperación</button>
+          <button type="submit" class="btn primary" style="margin-top:24px; width:100%">Enviar link de recuperación</button>
         </form>
         
-        <div class="back">
+        <div class="back-link">
           <a href="/portal/login">← Volver al login</a>
         </div>
         """)
@@ -2440,32 +2423,44 @@ def portal_reset_password(token):
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Link inválido</title>
-<link rel="manifest" href="/static/manifest.json">
-<meta name="theme-color" content="#5aa7ff">
-<meta name="apple-mobile-web-app-capable" content="yes">
-<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
-<meta name="apple-mobile-web-app-title" content="Recibos">
-<link rel="apple-touch-icon" href="/static/icon-192.png">
+  <link rel="stylesheet" href="/static/portal-theme.css">
   <style>
-    body{
-      margin:0; font-family:system-ui; background:#0b1220; color:#eaf0ff;
-      display:flex; align-items:center; justify-content:center; min-height:100vh; padding:20px;
+    body {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      min-height: 100vh;
+      padding: 20px;
     }
-    .card{
-      background:rgba(255,255,255,.03); border:1px solid rgba(255,255,255,.08);
-      border-radius:16px; padding:40px; max-width:400px; text-align:center;
+    .links {
+      text-align: center;
+      margin-top: 16px;
+      font-size: 14px;
     }
-    .error{background:rgba(251,113,133,.1); padding:12px; border-radius:8px; margin-bottom:20px}
-    a{color:#5aa7ff; text-decoration:none}
+    .links a {
+      color: var(--accent);
+      text-decoration: none;
+      font-weight: 600;
+    }
+    .links a:hover {
+      text-decoration: underline;
+    }
   </style>
 </head>
-<body>
-  <div class="card">
-    <div class="error">
+<body class="login-page">
+  <div class="top-logo">
+    <img src="/static/icon-192.png" alt="SIA Sueldos">
+    <span class="top-logo-text">SIA</span>
+  </div>
+  
+  <div class="login-card">
+    <div class="alert alert-error">
       ❌ <strong>Link inválido o expirado</strong><br><br>
       Este link ya fue usado o expiró (válido por 1 hora).
     </div>
-    <a href="/portal/forgot">Solicitar nuevo link</a> · <a href="/portal/login">Ir al login</a>
+    <div class="links">
+      <a href="/portal/forgot">Solicitar nuevo link</a> · <a href="/portal/login">Ir al login</a>
+    </div>
   </div>
 </body>
 </html>"""
@@ -2504,64 +2499,52 @@ def portal_reset_password(token):
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Nueva contraseña</title>
-    <link rel="manifest" href="/static/manifest.json">
-    <meta name="theme-color" content="#5aa7ff">
-    <meta name="apple-mobile-web-app-capable" content="yes">
-    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
-    <meta name="apple-mobile-web-app-title" content="Recibos">
-    <link rel="apple-touch-icon" href="/static/icon-192.png">
+  <link rel="manifest" href="/static/manifest.json">
+  <meta name="theme-color" content="#2E3B8E">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta name="apple-mobile-web-app-title" content="Recibos">
+  <link rel="apple-touch-icon" href="/static/icon-192.png">
+  <link rel="stylesheet" href="/static/portal-theme.css">
   <style>
-    :root{--bg:#0b1220; --accent:#5aa7ff; --error:#fb7185}
-    *{box-sizing:border-box}
-    body{
-      margin:0; font-family:system-ui; background:var(--bg); color:#eaf0ff;
-      display:flex; align-items:center; justify-content:center; min-height:100vh; padding:20px;
+    body {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      min-height: 100vh;
+      padding: 20px;
     }
-    .card{
-      background:rgba(255,255,255,.03); border:1px solid rgba(255,255,255,.08);
-      border-radius:16px; padding:40px; max-width:400px; width:100%;
+    .hint {
+      font-size: 12px;
+      color: var(--text-muted);
+      margin-top: 6px;
     }
-    h1{margin:0 0 10px 0; font-size:24px; text-align:center}
-    .subtitle{text-align:center; color:#9fb2d0; font-size:14px; margin-bottom:30px}
-    .error{
-      background:rgba(251,113,133,.1); border:1px solid rgba(251,113,133,.3);
-      padding:12px; border-radius:8px; margin-bottom:20px; font-size:13px;
-    }
-    label{display:block; margin:15px 0 5px 0; font-size:13px; color:#9fb2d0}
-    input{
-      width:100%; padding:12px; border-radius:8px;
-      border:1px solid rgba(255,255,255,.08);
-      background:rgba(0,0,0,.25); color:#eaf0ff; font-size:14px;
-    }
-    input:focus{outline:none; border-color:var(--accent)}
-    .btn{
-      width:100%; padding:14px; border-radius:8px; border:none;
-      background:var(--accent); color:white; font-weight:600;
-      font-size:14px; cursor:pointer; margin-top:20px;
-    }
-    .btn:hover{background:#4a96ee}
-    .hint{font-size:12px; color:#9fb2d0; margin-top:5px}
   </style>
 </head>
-<body>
-  <div class="card">
+<body class="login-page">
+  <div class="top-logo">
+    <img src="/static/icon-192.png" alt="SIA Sueldos">
+    <span class="top-logo-text">SIA</span>
+  </div>
+  
+  <div class="login-card">
     <h1>🔐 Nueva contraseña</h1>
     <div class="subtitle">Usuario: """ + esc(user['username']) + """</div>
 """)
     
     if error:
-        html.append(f"<div class='error'>❌ {esc(error)}</div>")
+        html.append(f"<div class='alert alert-error' style='margin-top:16px'>❌ {esc(error)}</div>")
     
     html.append("""
-    <form method="post">
+    <form method="post" style="margin-top:20px">
       <label>Nueva contraseña</label>
       <input type="password" name="new_password" required autofocus minlength="8">
       <div class="hint">Mínimo 8 caracteres</div>
       
-      <label>Confirmar contraseña</label>
+      <label style="margin-top:16px">Confirmar contraseña</label>
       <input type="password" name="confirm_password" required minlength="8">
       
-      <button type="submit" class="btn">Cambiar contraseña</button>
+      <button type="submit" class="btn primary" style="margin-top:24px; width:100%">Cambiar contraseña</button>
     </form>
   </div>
 </body>
@@ -2569,7 +2552,6 @@ def portal_reset_password(token):
 """)
     
     return Response("".join(html), mimetype="text/html")
-
 @app.route("/static/<path:filename>")
 def serve_static(filename):
     """
