@@ -9019,10 +9019,8 @@ def _send_pdf_flow(from_whatsapp: str, tenant: str, cuil: str, period: str, orig
     if not file_id:
         return None
 
-    pdf_url = (
-        f"{request.host_url.rstrip('/')}/media/pdf"
-        f"?tenant={tenant}&cuil={cuil}&period={period}&token={ADMIN_TOKEN}"
-    )
+    # ✅ URL directa de Google Drive (evita timeout)
+    pdf_url = f"https://drive.google.com/uc?export=download&id={file_id}"
 
     try:
         # ✅ Para controlar el orden:
