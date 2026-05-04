@@ -9064,12 +9064,40 @@ def admin_reenviar_fallidos():
                 resultados.append(f"❌ {cuil}: No encontrado en envíos")
                 continue
             
-            whatsapp = person.get('whatsapp', '')
             nombre = person.get('nombre', '')
-            
+
+            # Buscar WhatsApp en múltiples columnas posibles del Excel
+            whatsapp = (
+                person.get('whatsapp') or 
+                person.get('telefono') or 
+                person.get('celular') or 
+                person.get('phone') or 
+                person.get('numero') or
+                ''
+            ).strip()
+
+            # Si no hay WhatsApp en el Excel, buscar en la BD
             if not whatsapp:
-                resultados.append(f"❌ {cuil} ({nombre}): Sin WhatsApp")
-                continue
+                # Intentar obtener desde message_status
+                conn = get_db_connection()
+                cur = conn.cursor()
+                cur.execute("""
+                    SELECT to_whatsapp FROM message_status 
+                    WHERE tenant = ? AND cuil = ? 
+                    ORDER BY created_at DESC LIMIT 1
+                """, (tenant, cuil))
+                row = cur.fetchone()
+                conn.close()
+                
+                if row and row[0]:
+                    whatsapp = row[0]
+                else:
+                    resultados.append(f"❌ {cuil} ({nombre}): Sin WhatsApp en Excel ni BD")
+                    continue
+
+            # Normalizar formato WhatsApp
+            if not whatsapp.startswith('whatsapp:'):
+                whatsapp = norm_whatsapp(whatsapp)
             
             # Enviar PDF
             try:
