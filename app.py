@@ -9101,7 +9101,7 @@ def admin_reenviar_fallidos():
             
             # Enviar PDF
             try:
-                sid = _send_pdf_flow(whatsapp, tenant, cuil, period, origin="RESEND")
+                sid = _send_pdf_flow(whatsapp, tenant, cuil, period, origin="INITIAL")
                 if sid:
                     resultados.append(f"✅ {cuil} ({nombre}): PDF reenviado - SID: {sid}")
                 else:
