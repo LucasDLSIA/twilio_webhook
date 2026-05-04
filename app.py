@@ -6658,8 +6658,9 @@ def admin_panel():
     html.append("</div>")
     html.append("<div class='right'>")
     html.append(f"<a class='btn secondary' href='/admin?token={esc(token)}'>← Volver</a>")
-    html.append(f"<a class='btn' href='/admin/send_test?tenant={esc(tenant)}&token={esc(token)}'> Envio individual</a>")
-    html.append(f"<a class='btn' href='/admin/seguimiento?tenant={esc(tenant)}&token={esc(token)}'>⚠️ Seguimiento</a>")  # ← NUEVO
+    html.append(f"<a class='btn' href='/admin/send_test?tenant={esc(tenant)}&token={esc(token)}'>📤 Envío individual</a>")
+    html.append(f"<a class='btn' href='/admin/reenviar_fallidos?token={esc(token)}'>🔄 Reenviar fallidos</a>")
+    html.append(f"<a class='btn' href='/admin/seguimiento?tenant={esc(tenant)}&token={esc(token)}'>⚠️ Seguimiento</a>")
     html.append("</div>")
     html.append("</div>")
 
@@ -9008,6 +9009,221 @@ def twilio_inbound():
             return twiml("📝 Recibo observado. Contacte RRHH para más información.")
 
     return Response("OK", status=200)
+
+@app.route("/admin/reenviar_fallidos", methods=["GET", "POST"])
+def admin_reenviar_fallidos():
+    """
+    Reenviar PDFs a empleados específicos.
+    """
+    token = request.args.get("token") or request.form.get("token")
+    if token != ADMIN_TOKEN:
+        return Response("Unauthorized", status=401)
+    
+    if request.method == "POST":
+        tenant = request.form.get("tenant", "").strip()
+        period = request.form.get("period", "").strip()
+        cuils_text = request.form.get("cuils", "").strip()
+        
+        # Parsear CUILs (uno por línea o separados por coma)
+        cuils = []
+        for line in cuils_text.replace(",", "\n").split("\n"):
+            cuil = norm_cuil(line.strip())
+            if cuil and len(cuil) == 11:
+                cuils.append(cuil)
+        
+        if not tenant or not period or not cuils:
+            return Response("Falta tenant, period o CUILs", status=400)
+        
+        # Cargar envios para obtener WhatsApp
+        envios = load_envios_rows(tenant)
+        
+        resultados = []
+        for cuil in cuils:
+            # Buscar datos del empleado
+            person = find_person_by_cuil(envios, cuil)
+            if not person:
+                resultados.append(f"❌ {cuil}: No encontrado en envíos")
+                continue
+            
+            whatsapp = person.get('whatsapp', '')
+            nombre = person.get('nombre', '')
+            
+            if not whatsapp:
+                resultados.append(f"❌ {cuil} ({nombre}): Sin WhatsApp")
+                continue
+            
+            # Enviar PDF
+            try:
+                sid = _send_pdf_flow(whatsapp, tenant, cuil, period, origin="RESEND")
+                if sid:
+                    resultados.append(f"✅ {cuil} ({nombre}): PDF reenviado - SID: {sid}")
+                else:
+                    resultados.append(f"❌ {cuil} ({nombre}): PDF no encontrado en Drive")
+            except Exception as e:
+                resultados.append(f"❌ {cuil} ({nombre}): Error - {str(e)}")
+        
+        # Mostrar resultados
+        html = f"""<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Resultados del reenvío</title>
+  <style>
+    body {{ font-family: monospace; padding: 20px; background: #0f1629; color: #eaf0ff; }}
+    .success {{ color: #10b981; }}
+    .error {{ color: #ef4444; }}
+    a {{ color: #5aa7ff; text-decoration: none; }}
+    a:hover {{ text-decoration: underline; }}
+    .result {{ padding: 8px; border-bottom: 1px solid #333; }}
+  </style>
+</head>
+<body>
+  <h1>📊 Resultados del reenvío</h1>
+  <p><strong>Tenant:</strong> {esc(tenant)}</p>
+  <p><strong>Período:</strong> {esc(period)}</p>
+  <p><strong>Total procesados:</strong> {len(resultados)}</p>
+  <hr>
+"""
+        
+        for r in resultados:
+            css_class = "success" if "✅" in r else "error"
+            html += f"<div class='result {css_class}'>{esc(r)}</div>"
+        
+        html += f"""
+  <hr>
+  <p><a href="/admin/reenviar_fallidos?token={ADMIN_TOKEN}">← Volver</a></p>
+</body>
+</html>
+"""
+        return Response(html, mimetype="text/html")
+    
+    # GET: Mostrar formulario
+    html = f"""<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Reenviar PDFs fallidos</title>
+  <style>
+    body {{
+      font-family: system-ui, sans-serif;
+      background: #0f1629;
+      color: #eaf0ff;
+      padding: 20px;
+      max-width: 800px;
+      margin: 0 auto;
+    }}
+    h1 {{ color: #5aa7ff; }}
+    .card {{
+      background: rgba(255,255,255,0.05);
+      border: 1px solid rgba(255,255,255,0.1);
+      border-radius: 12px;
+      padding: 24px;
+      margin: 20px 0;
+    }}
+    label {{
+      display: block;
+      margin: 16px 0 8px 0;
+      font-weight: 600;
+      color: #9fb2d0;
+    }}
+    input, textarea {{
+      width: 100%;
+      padding: 12px;
+      border: 1px solid rgba(255,255,255,0.2);
+      border-radius: 8px;
+      background: rgba(0,0,0,0.3);
+      color: #eaf0ff;
+      font-family: monospace;
+      font-size: 14px;
+    }}
+    textarea {{
+      min-height: 200px;
+      resize: vertical;
+    }}
+    button {{
+      background: linear-gradient(135deg, #F4C430, #d4a514);
+      color: #1f2766;
+      border: none;
+      padding: 14px 32px;
+      border-radius: 8px;
+      font-weight: 700;
+      font-size: 16px;
+      cursor: pointer;
+      margin-top: 20px;
+    }}
+    button:hover {{
+      background: linear-gradient(135deg, #d4a514, #F4C430);
+    }}
+    .hint {{
+      font-size: 13px;
+      color: #9fb2d0;
+      margin-top: 6px;
+    }}
+    .example {{
+      background: rgba(0,0,0,0.3);
+      padding: 12px;
+      border-radius: 6px;
+      font-family: monospace;
+      font-size: 13px;
+      margin-top: 8px;
+    }}
+    a {{
+      color: #5aa7ff;
+      text-decoration: none;
+    }}
+    a:hover {{
+      text-decoration: underline;
+    }}
+  </style>
+</head>
+<body>
+  <h1>📤 Reenviar PDFs fallidos</h1>
+  
+  <div class="card">
+    <p><strong>⚠️ Importante:</strong></p>
+    <ul>
+      <li>Esto reenviará el PDF a los CUILs especificados</li>
+      <li>Cuando el PDF sea entregado, se enviará automáticamente el botón de firma</li>
+      <li>Solo funciona si el PDF existe en Google Drive</li>
+    </ul>
+  </div>
+  
+  <form method="post">
+    <input type="hidden" name="token" value="{ADMIN_TOKEN}">
+    
+    <div class="card">
+      <label>Tenant</label>
+      <input type="text" name="tenant" placeholder="san-patricio" required>
+      
+      <label>Período</label>
+      <input type="text" name="period" placeholder="04/2026" required>
+      <div class="hint">Formato: MM/YYYY</div>
+      
+      <label>CUILs (uno por línea o separados por coma)</label>
+      <textarea name="cuils" placeholder="27357233831
+27131464563
+20-12345678-9" required></textarea>
+      <div class="hint">Podés pegar desde Excel, uno por línea o separados por comas</div>
+      
+      <div class="example">
+        <strong>Ejemplo:</strong><br>
+        27357233831<br>
+        27131464563<br>
+        20-12345678-9
+      </div>
+      
+      <button type="submit">🚀 Reenviar PDFs</button>
+    </div>
+  </form>
+  
+  <p><a href="/admin?token={ADMIN_TOKEN}">← Volver al admin</a></p>
+</body>
+</html>
+"""
+    
+    return Response(html, mimetype="text/html")
+
 
 def _send_pdf_flow(from_whatsapp: str, tenant: str, cuil: str, period: str, origin: str = "INITIAL") -> str | None:
     """
