@@ -568,24 +568,43 @@ def media_pdf():
     if not (tenant and cuil and period):
         return Response("Faltan parámetros tenant/cuil/period", status=400)
 
-    file_id = find_pdf_file_id_for_cuil_period(tenant, cuil, period)
+    file_id = find_pdf_file_id_for_cuil_period(tenant, cuil, period, quiet=True)
     if not file_id:
         return Response("PDF no encontrado", status=404)
 
-    service = drive_service()
-    req = service.files().get_media(fileId=file_id)
-    fh = io.BytesIO()
-    downloader = MediaIoBaseDownload(fh, req)
-    done = False
-    while not done:
-        _, done = downloader.next_chunk()
-    fh.seek(0)
-
-    data = fh.read()
-    resp = Response(data, mimetype="application/pdf")
-    resp.headers["Content-Disposition"] = f'inline; filename="{strip_pdf(cuil)}.pdf"'
-    return resp
-
+    try:
+        service = drive_service()
+        
+        # ✅ OPTIMIZACIÓN 1: Obtener metadata primero (más rápido)
+        file_metadata = service.files().get(fileId=file_id, fields='size,name').execute()
+        file_size = int(file_metadata.get('size', 0))
+        file_name = file_metadata.get('name', f"{strip_pdf(cuil)}.pdf")
+        
+        # ✅ OPTIMIZACIÓN 2: Descargar con chunks más grandes (más rápido)
+        req = service.files().get_media(fileId=file_id)
+        fh = io.BytesIO()
+        downloader = MediaIoBaseDownload(fh, req, chunksize=5*1024*1024)  # 5MB chunks
+        
+        done = False
+        while not done:
+            status, done = downloader.next_chunk()
+        
+        fh.seek(0)
+        data = fh.read()
+        
+        # ✅ OPTIMIZACIÓN 3: Headers correctos para mejor cache
+        resp = Response(data, mimetype="application/pdf")
+        resp.headers["Content-Disposition"] = f'inline; filename="{file_name}"'
+        resp.headers["Content-Length"] = str(len(data))
+        resp.headers["Cache-Control"] = "public, max-age=300"  # 5 min cache
+        resp.headers["Accept-Ranges"] = "bytes"
+        
+        return resp
+        
+    except Exception as e:
+        print(f"❌ Error descargando PDF: {e}")
+        return Response("Error descargando PDF de Drive", status=500)
+    
 
 # Twilio senders
 # =========================
@@ -9178,7 +9197,7 @@ def admin_reenviar_fallidos():
   </style>
 </head>
 <body>
-  <h1>📤 Reenviar PDFs fallidos</h1>
+  <h1>🔄 Reenviar PDFs fallidos</h1>
   
   <div class="card">
     <p><strong>⚠️ Importante:</strong></p>
@@ -9235,9 +9254,12 @@ def _send_pdf_flow(from_whatsapp: str, tenant: str, cuil: str, period: str, orig
     if not file_id:
         return None
 
-    # ✅ URL directa de Google Drive (evita timeout)
-    pdf_url = f"https://drive.google.com/uc?export=download&id={file_id}"
 
+    # ✅ URL optimizada de nuestro servidor (más rápido con chunks 5MB)
+    pdf_url = (
+        f"{request.host_url.rstrip('/')}/media/pdf"
+        f"?tenant={tenant}&cuil={cuil}&period={period}&token={ADMIN_TOKEN}"
+    )
     try:
         # ✅ Para controlar el orden:
         # - En INITIAL podemos incluir body (si querés).
