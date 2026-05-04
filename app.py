@@ -3490,17 +3490,35 @@ def twilio_status():
             """, (status, now, error_code, error_code, error_message, error_message, sid))
 
     # 3) timestamps por estado
+    # 3) timestamps por estado
     if status == "delivered":
         cur.execute("""
             UPDATE message_status
             SET delivered_at = COALESCE(delivered_at, ?)
             WHERE message_sid = ?
         """, (now, sid))
+        
+        # ✅ TAMBIÉN actualizar sent_pdfs
+        cur.execute("""
+            UPDATE sent_pdfs
+            SET delivered_at = COALESCE(delivered_at, ?),
+                status = 'delivered'
+            WHERE message_sid = ?
+        """, (now, sid))
 
-    if status == "read":
+    # 3) timestamps por estado
+    if status == "delivered":
         cur.execute("""
             UPDATE message_status
-            SET read_at = COALESCE(read_at, ?)
+            SET delivered_at = COALESCE(delivered_at, ?)
+            WHERE message_sid = ?
+        """, (now, sid))
+        
+        # ✅ TAMBIÉN actualizar sent_pdfs
+        cur.execute("""
+            UPDATE sent_pdfs
+            SET delivered_at = COALESCE(delivered_at, ?),
+                status = 'delivered'
             WHERE message_sid = ?
         """, (now, sid))
 
@@ -3510,6 +3528,16 @@ def twilio_status():
             SET failed_at = COALESCE(failed_at, ?),
                 error_code = COALESCE(NULLIF(?, ''), error_code),
                 error_message = COALESCE(NULLIF(?, ''), error_message)
+            WHERE message_sid = ?
+        """, (now, error_code, error_message, sid))
+        
+        # ✅ TAMBIÉN actualizar sent_pdfs
+        cur.execute("""
+            UPDATE sent_pdfs
+            SET failed_at = COALESCE(failed_at, ?),
+                error_code = COALESCE(NULLIF(?, ''), error_code),
+                error_message = COALESCE(NULLIF(?, ''), error_message),
+                status = 'failed'
             WHERE message_sid = ?
         """, (now, error_code, error_message, sid))
 
