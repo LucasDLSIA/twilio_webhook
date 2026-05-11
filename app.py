@@ -2459,7 +2459,16 @@ def portal_reports():
             # Buscar datos del empleado
             person = find_person_by_cuil(envios, cuil)
             nombre = person.get('nombre', '') if person else ''
-            whatsapp = person.get('whatsapp', '') if person else ''
+            whatsapp = ''
+            if person:
+                whatsapp = (
+                    person.get('whatsapp') or 
+                    person.get('telefono') or 
+                    person.get('celular') or 
+                    person.get('phone') or 
+                    person.get('numero') or
+                    ''
+                ).strip()
             
             if action == "export_all":
                 # Ver estado completo
