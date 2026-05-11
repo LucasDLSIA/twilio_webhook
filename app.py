@@ -2461,15 +2461,11 @@ def portal_reports():
             nombre = person.get('nombre', '') if person else ''
             whatsapp = ''
             if person:
-                whatsapp = (
-                    person.get('whatsapp') or 
-                    person.get('telefono') or 
-                    person.get('celular') or 
-                    person.get('phone') or 
-                    person.get('numero') or
-                    ''
-                ).strip()
-            
+                # La función devuelve 'to_whatsapp' ya normalizado
+                whatsapp = person.get('to_whatsapp', '')
+                # Fallback a telefono_raw si to_whatsapp está vacío
+                if not whatsapp:
+                    whatsapp = person.get('telefono_raw', '')
             if action == "export_all":
                 # Ver estado completo
                 cur.execute("""
@@ -9104,13 +9100,14 @@ def admin_reenviar_fallidos():
             nombre = person.get('nombre', '')
 
             # Buscar WhatsApp en múltiples columnas posibles del Excel
-            whatsapp = ''
-            if person:
-                # La función devuelve 'to_whatsapp' ya normalizado
-                whatsapp = person.get('to_whatsapp', '')
-                # Fallback a telefono_raw si to_whatsapp está vacío
-                if not whatsapp:
-                    whatsapp = person.get('telefono_raw', '')
+            whatsapp = (
+                person.get('whatsapp') or 
+                person.get('telefono') or 
+                person.get('celular') or 
+                person.get('phone') or 
+                person.get('numero') or
+                ''
+            ).strip()
 
             # Si no hay WhatsApp en el Excel, buscar en la BD
             if not whatsapp:
