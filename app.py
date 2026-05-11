@@ -9104,14 +9104,13 @@ def admin_reenviar_fallidos():
             nombre = person.get('nombre', '')
 
             # Buscar WhatsApp en múltiples columnas posibles del Excel
-            whatsapp = (
-                person.get('whatsapp') or 
-                person.get('telefono') or 
-                person.get('celular') or 
-                person.get('phone') or 
-                person.get('numero') or
-                ''
-            ).strip()
+            whatsapp = ''
+            if person:
+                # La función devuelve 'to_whatsapp' ya normalizado
+                whatsapp = person.get('to_whatsapp', '')
+                # Fallback a telefono_raw si to_whatsapp está vacío
+                if not whatsapp:
+                    whatsapp = person.get('telefono_raw', '')
 
             # Si no hay WhatsApp en el Excel, buscar en la BD
             if not whatsapp:
