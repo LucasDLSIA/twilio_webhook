@@ -8805,7 +8805,8 @@ def find_all_tenants_for_whatsapp(whatsapp: str) -> List[dict]:
             continue
         
         for row in envios:
-            tel = (
+            # ✅ FIX: Convertir a string antes de strip()
+            tel = str(
                 row.get("telefono") or 
                 row.get("teléfono") or 
                 row.get("Telefono") or 
@@ -8821,20 +8822,23 @@ def find_all_tenants_for_whatsapp(whatsapp: str) -> List[dict]:
             tel_normalized = norm_whatsapp(tel)
             
             if tel_normalized == whatsapp_normalized:
-                archivo = strip_pdf(row.get("archivo") or row.get("Archivo") or "")
+                archivo = strip_pdf(str(row.get("archivo") or row.get("Archivo") or ""))
                 cuil = norm_cuil(archivo)
                 
                 if cuil:
+                    # ✅ FIX: Convertir nombre a string también
+                    nombre = str(row.get("nombre") or row.get("Nombre") or "").strip()
+                    
                     result.append({
                         "tenant": tenant_slug,
                         "display_name": display_name,
                         "cuil": cuil,
-                        "nombre": str(row.get("nombre") or row.get("Nombre") or "").strip()
+                        "nombre": nombre
                     })
                     break
     
     return result
-
+    
 
 def save_multi_tenant_selection_state(whatsapp: str, tenants: List[dict]):
     """Guarda las opciones de tenant disponibles para que el usuario elija."""
