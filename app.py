@@ -4101,6 +4101,24 @@ def init_db():
       );
     """)
 
+    # ========================================
+    # Tabla para selección multi-tenant
+    # ========================================
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS multi_tenant_selection (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            whatsapp TEXT NOT NULL UNIQUE,
+            tenants_json TEXT NOT NULL,
+            created_at INTEGER NOT NULL,
+            expires_at INTEGER NOT NULL
+        )
+    """)
+    
+    _try_alter(cur, """
+        CREATE INDEX IF NOT EXISTS idx_multi_tenant_expires 
+        ON multi_tenant_selection(expires_at)
+    """)
+
 
 
     # índices útiles
@@ -8755,6 +8773,125 @@ def list_previous_periods_excluding_current(tenant: str, cuil: str, limit: int =
     # ahora periods[0] es el último real anterior al mes actual
     return periods[:limit]
 
+# ============================================================================
+# FUNCIONES MULTI-TENANT
+# ============================================================================
+
+def find_all_tenants_for_whatsapp(whatsapp: str) -> List[dict]:
+    """
+    Busca en qué tenants (empresas) aparece este número de WhatsApp.
+    
+    Retorna lista de dicts con:
+    [
+        {"tenant": "san-patricio", "display_name": "San Patricio", "cuil": "27123456789"},
+        ...
+    ]
+    """
+    whatsapp_normalized = norm_whatsapp(whatsapp) if whatsapp else ""
+    if not whatsapp_normalized:
+        return []
+    
+    result = []
+    tenants = load_tenants()
+    
+    for tenant_info in tenants:
+        tenant_slug = tenant_info.get("slug", "")
+        display_name = tenant_info.get("display_name", tenant_slug)
+        
+        try:
+            envios = load_envios_rows(tenant_slug)
+        except Exception as e:
+            print(f"Error loading envios for {tenant_slug}: {e}")
+            continue
+        
+        for row in envios:
+            tel = (
+                row.get("telefono") or 
+                row.get("teléfono") or 
+                row.get("Telefono") or 
+                row.get("whatsapp") or 
+                row.get("celular") or 
+                row.get("phone") or 
+                ""
+            ).strip()
+            
+            if not tel:
+                continue
+            
+            tel_normalized = norm_whatsapp(tel)
+            
+            if tel_normalized == whatsapp_normalized:
+                archivo = strip_pdf(row.get("archivo") or row.get("Archivo") or "")
+                cuil = norm_cuil(archivo)
+                
+                if cuil:
+                    result.append({
+                        "tenant": tenant_slug,
+                        "display_name": display_name,
+                        "cuil": cuil,
+                        "nombre": str(row.get("nombre") or row.get("Nombre") or "").strip()
+                    })
+                    break
+    
+    return result
+
+
+def save_multi_tenant_selection_state(whatsapp: str, tenants: List[dict]):
+    """Guarda las opciones de tenant disponibles para que el usuario elija."""
+    now = int(time.time())
+    expires_at = now + (10 * 60)  # 10 minutos
+    context_json = json.dumps(tenants)
+    
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute("""
+        INSERT INTO multi_tenant_selection (whatsapp, tenants_json, created_at, expires_at)
+        VALUES (?, ?, ?, ?)
+        ON CONFLICT(whatsapp) DO UPDATE SET
+            tenants_json = excluded.tenants_json,
+            created_at = excluded.created_at,
+            expires_at = excluded.expires_at
+    """, (whatsapp, context_json, now, expires_at))
+    conn.commit()
+    conn.close()
+
+
+def get_multi_tenant_selection_state(whatsapp: str) -> Optional[dict]:
+    """Recupera el estado de selección multi-tenant."""
+    conn = get_db_connection()
+    cur = conn.cursor()
+    now = int(time.time())
+    
+    cur.execute("""
+        SELECT tenants_json, created_at
+        FROM multi_tenant_selection
+        WHERE whatsapp = ? AND expires_at > ?
+        LIMIT 1
+    """, (whatsapp, now))
+    
+    row = cur.fetchone()
+    conn.close()
+    
+    if not row:
+        return None
+    
+    try:
+        tenants = json.loads(row[0])
+        return {"tenants": tenants, "created_at": row[1]}
+    except Exception as e:
+        print(f"Error parsing multi_tenant_selection: {e}")
+        return None
+
+
+def clear_multi_tenant_selection_state(whatsapp: str):
+    """Limpia el estado de selección después de que el usuario eligió."""
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute("DELETE FROM multi_tenant_selection WHERE whatsapp = ?", (whatsapp,))
+    conn.commit()
+    conn.close()
+
+
 TWILIO_SIGN_TEMPLATE_SID = os.environ.get("TWILIO_SIGN_TEMPLATE_SID", "").strip()
 
 @app.post("/twilio/inbound")
@@ -8781,7 +8918,8 @@ def twilio_inbound():
 
     pending = get_latest_pending_view(from_whatsapp)
     print("PENDING:", pending)
-        # =========================
+    
+    # =========================
     # SEE_PREVIOUS debe funcionar incluso sin pending
     # y SIEMPRE excluir el mes corriente
     # =========================
@@ -8791,16 +8929,26 @@ def twilio_inbound():
             tenant0 = (pending.get("tenant") or "").strip().lower()
             cuil0 = (pending.get("cuil") or "").strip()
         else:
-            # 2) si no hay pending, reconstruimos desde ctx (SIN resolve_best_period...)
-            ctx = get_latest_context_for_whatsapp(from_whatsapp)
-            if not ctx:
+            # 2) si no hay pending, buscar en qué tenants está
+            tenants_found = find_all_tenants_for_whatsapp(from_whatsapp)
+            
+            if len(tenants_found) == 0:
                 return twiml("👋 Para ver períodos anteriores, necesitás el mensaje inicial de RRHH. Si no lo tenés, avisá a RRHH.")
-
-            tenant0 = (ctx.get("tenant") or "").strip().lower()
-            cuil0 = (ctx.get("cuil") or "").strip()
-
-            if not (tenant0 and cuil0):
-                return twiml("👋 No pude identificar tu recibo. Avisá a RRHH.")
+            
+            elif len(tenants_found) == 1:
+                tenant0 = tenants_found[0]["tenant"]
+                cuil0 = tenants_found[0]["cuil"]
+                
+            elif len(tenants_found) > 1:
+                # Multi-tenant: preguntar primero
+                save_multi_tenant_selection_state(from_whatsapp, tenants_found)
+                
+                msg = "Trabajás en varias empresas. ¿De cuál querés ver los períodos?\n\n"
+                for i, t in enumerate(tenants_found, 1):
+                    msg += f"{i}️⃣ {t['display_name']}\n"
+                msg += "\nRespondé con el número."
+                
+                return twiml(msg)
 
         prev = list_previous_periods_excluding_current(tenant0, cuil0, limit=3)
 
@@ -8818,6 +8966,64 @@ def twilio_inbound():
             msg += f"{i}. {p}\n"
         msg += "\nRespondé con 1, 2 o 3 para elegir."
         return twiml(msg)
+
+    # ============================================================================
+    # MANEJO DE SELECCIÓN MULTI-TENANT (1, 2, 3, 4)
+    # ============================================================================
+    # Verificar si es selección de tenant (no de período)
+    if not button and body.strip() in ("1", "2", "3", "4"):
+        # Primero verificar si NO es selección de período anterior
+        step_now = (pending.get("step") or "READY").upper() if isinstance(pending, dict) else "READY"
+        
+        # Si NO está en modo CHOOSE_PREVIOUS, entonces puede ser multi-tenant
+        if step_now != "CHOOSE_PREVIOUS":
+            multi_state = get_multi_tenant_selection_state(from_whatsapp)
+            
+            if multi_state:
+                try:
+                    idx = int(body.strip()) - 1
+                    tenants_list = multi_state.get("tenants", [])
+                    
+                    if idx < 0 or idx >= len(tenants_list):
+                        return twiml("❌ Opción inválida. Respondé con el número correcto.")
+                    
+                    selected = tenants_list[idx]
+                    tenant = selected["tenant"]
+                    cuil = selected["cuil"]
+                    
+                    clear_multi_tenant_selection_state(from_whatsapp)
+                    
+                    period = resolve_best_period_with_pdf(tenant, cuil)
+                    if not period:
+                        _log_receipt_request_event(tenant, cuil, "", from_whatsapp, "MULTI_SELECT", "NO_PDF")
+                        return twiml("⚠️ No encontré recibos disponibles. Avisá a RRHH.")
+                    
+                    add_pending_view(from_whatsapp, tenant, cuil, period, origin="RESEND_LAST")
+                    pending = get_latest_pending_view(from_whatsapp)
+                    
+                    cnt = get_receipt_request_count(tenant, cuil, period, from_whatsapp)
+                    if cnt >= 3:
+                        _log_receipt_request_event(tenant, cuil, period, from_whatsapp, "MULTI_SELECT", "BLOCKED_LIMIT")
+                        return twiml(f"⚠️ Ya pediste este recibo {cnt}/3 veces para {period}. Si necesitás más, avisá a RRHH.")
+                    
+                    if not is_verified_contact(tenant, cuil, from_whatsapp):
+                        set_pending_step(pending["id"], "AWAIT_DNI")
+                        _log_receipt_request_event(tenant, cuil, period, from_whatsapp, "MULTI_SELECT", "ASK_DNI")
+                        return twiml("🔐 Para reenviar tu recibo, enviá tu DNI (solo números, sin puntos).")
+                    
+                    sid_pdf = _send_pdf_flow(from_whatsapp, tenant, cuil, period, origin="RESEND_LAST")
+                    if not sid_pdf:
+                        _log_receipt_request_event(tenant, cuil, period, from_whatsapp, "MULTI_SELECT", "ERROR")
+                        return twiml("❌ No pude enviar el PDF en este momento. Probá de nuevo o avisá a RRHH.")
+                    
+                    n = inc_receipt_request_count(tenant, cuil, period, from_whatsapp)
+                    _log_receipt_request_event(tenant, cuil, period, from_whatsapp, "MULTI_SELECT", "SENT", message_sid=sid_pdf)
+                    return Response("OK", status=200)
+                    
+                except Exception as e:
+                    print(f"Error en selección multi-tenant: {e}")
+                    clear_multi_tenant_selection_state(from_whatsapp)
+                    return twiml("❌ Hubo un error. Por favor, pedí tu recibo nuevamente.")
 
     # =========================
     # REGLA: cualquier texto (sin botón) dispara menú,
@@ -8859,18 +9065,28 @@ def twilio_inbound():
             return Response("OK", status=200)
 
 
-        # si es pedido de recibo -> reconstruimos contexto desde último envío
-        ctx = get_latest_context_for_whatsapp(from_whatsapp)
-        if not ctx:
+        # si es pedido de recibo -> buscar en qué tenants está
+        tenants_found = find_all_tenants_for_whatsapp(from_whatsapp)
+        
+        if len(tenants_found) == 0:
             _log_receipt_request_event("", "", "", from_whatsapp, "USER_TEXT", "NO_CONTEXT")
             return twiml("👋 Para enviarte tu recibo, primero necesitás el mensaje inicial de RRHH. Si no lo tenés, avisá a RRHH.")
-
-        tenant = (ctx.get("tenant") or "").strip().lower()
-        cuil = (ctx.get("cuil") or "").strip()
-
-        if not (tenant and cuil):
-            _log_receipt_request_event(tenant, cuil, "", from_whatsapp, "USER_TEXT", "NO_CONTEXT")
-            return twiml("👋 No pude identificar tu recibo. Avisá a RRHH.")
+        
+        elif len(tenants_found) == 1:
+            # ✅ Un solo tenant → flow normal
+            tenant = tenants_found[0]["tenant"]
+            cuil = tenants_found[0]["cuil"]
+            
+        elif len(tenants_found) > 1:
+            # ✅ Multi-tenant: guardar estado y preguntar
+            save_multi_tenant_selection_state(from_whatsapp, tenants_found)
+            
+            msg = "Trabajás en varias empresas. ¿De cuál querés el recibo?\n\n"
+            for i, t in enumerate(tenants_found, 1):
+                msg += f"{i}️⃣ {t['display_name']}\n"
+            msg += "\nRespondé con el número."
+            
+            return twiml(msg)
 
         period = resolve_best_period_with_pdf(tenant, cuil)
         if not period:
@@ -9061,6 +9277,7 @@ def twilio_inbound():
             return twiml("📝 Recibo observado. Contacte RRHH para más información.")
 
     return Response("OK", status=200)
+
 
 @app.route("/admin/reenviar_fallidos", methods=["GET", "POST"])
 def admin_reenviar_fallidos():
