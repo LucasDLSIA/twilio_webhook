@@ -8838,13 +8838,25 @@ def find_all_tenants_for_whatsapp(whatsapp: str) -> List[dict]:
                     break
     
     return result
-    
 
-def save_multi_tenant_selection_state(whatsapp: str, tenants: List[dict]):
-    """Guarda las opciones de tenant disponibles para que el usuario elija."""
+
+def save_multi_tenant_selection_state(whatsapp: str, tenants: List[dict], action: str = "RESEND"):
+    """
+    Guarda las opciones de tenant disponibles para que el usuario elija.
+    
+    Args:
+        whatsapp: número de WhatsApp normalizado
+        tenants: lista de dicts con tenant, display_name, cuil
+        action: "RESEND" para pedir recibo, "SEE_PREVIOUS" para ver períodos
+    """
     now = int(time.time())
     expires_at = now + (10 * 60)  # 10 minutos
-    context_json = json.dumps(tenants)
+    
+    context = {
+        "tenants": tenants,
+        "action": action
+    }
+    context_json = json.dumps(context)
     
     conn = get_db_connection()
     cur = conn.cursor()
@@ -8858,7 +8870,6 @@ def save_multi_tenant_selection_state(whatsapp: str, tenants: List[dict]):
     """, (whatsapp, context_json, now, expires_at))
     conn.commit()
     conn.close()
-
 
 def get_multi_tenant_selection_state(whatsapp: str) -> Optional[dict]:
     """Recupera el estado de selección multi-tenant."""
@@ -8880,12 +8891,19 @@ def get_multi_tenant_selection_state(whatsapp: str) -> Optional[dict]:
         return None
     
     try:
-        tenants = json.loads(row[0])
-        return {"tenants": tenants, "created_at": row[1]}
+        data = json.loads(row[0])
+        # Compatibilidad con formato antiguo
+        if isinstance(data, list):
+            return {"tenants": data, "action": "RESEND", "created_at": row[1]}
+        # Formato nuevo
+        return {
+            "tenants": data.get("tenants", []),
+            "action": data.get("action", "RESEND"),
+            "created_at": row[1]
+        }
     except Exception as e:
         print(f"Error parsing multi_tenant_selection: {e}")
         return None
-
 
 def clear_multi_tenant_selection_state(whatsapp: str):
     """Limpia el estado de selección después de que el usuario eligió."""
@@ -8936,7 +8954,7 @@ def twilio_inbound():
         
         elif len(tenants_found) > 1:
             # Multi-tenant: preguntar primero
-            save_multi_tenant_selection_state(from_whatsapp, tenants_found)
+            save_multi_tenant_selection_state(from_whatsapp, tenants_found, action="SEE_PREVIOUS")
             
             msg = "Trabajás en varias empresas. ¿De cuál querés ver los períodos?\n\n"
             for i, t in enumerate(tenants_found, 1):
@@ -8969,12 +8987,9 @@ def twilio_inbound():
     # ============================================================================
     # MANEJO DE SELECCIÓN MULTI-TENANT (1, 2, 3, 4)
     # ============================================================================
-    # Verificar si es selección de tenant (no de período)
     if not button and body.strip() in ("1", "2", "3", "4"):
-        # Primero verificar si NO es selección de período anterior
         step_now = (pending.get("step") or "READY").upper() if isinstance(pending, dict) else "READY"
         
-        # Si NO está en modo CHOOSE_PREVIOUS, entonces puede ser multi-tenant
         if step_now != "CHOOSE_PREVIOUS":
             multi_state = get_multi_tenant_selection_state(from_whatsapp)
             
@@ -8982,6 +8997,7 @@ def twilio_inbound():
                 try:
                     idx = int(body.strip()) - 1
                     tenants_list = multi_state.get("tenants", [])
+                    action = multi_state.get("action", "RESEND")
                     
                     if idx < 0 or idx >= len(tenants_list):
                         return twiml("❌ Opción inválida. Respondé con el número correcto.")
@@ -8992,6 +9008,28 @@ def twilio_inbound():
                     
                     clear_multi_tenant_selection_state(from_whatsapp)
                     
+                    # ============================================================
+                    # ACCIÓN: SEE_PREVIOUS → Mostrar períodos anteriores
+                    # ============================================================
+                    if action == "SEE_PREVIOUS":
+                        prev = list_previous_periods_excluding_current(tenant, cuil, limit=3)
+                        
+                        if not prev:
+                            return twiml("ℹ️ No tengo períodos anteriores disponibles para tu CUIL.")
+                        
+                        add_pending_view(from_whatsapp, tenant, cuil, prev[0], origin="SEE_PREVIOUS")
+                        pending = get_latest_pending_view(from_whatsapp)
+                        set_pending_step(pending["id"], "CHOOSE_PREVIOUS")
+                        
+                        msg = "🗂️ Períodos anteriores:\n\n"
+                        for i, p in enumerate(prev, start=1):
+                            msg += f"{i}. {p}\n"
+                        msg += "\nRespondé con 1, 2 o 3 para elegir."
+                        return twiml(msg)
+                    
+                    # ============================================================
+                    # ACCIÓN: RESEND → Enviar último recibo
+                    # ============================================================
                     period = resolve_best_period_with_pdf(tenant, cuil)
                     if not period:
                         _log_receipt_request_event(tenant, cuil, "", from_whatsapp, "MULTI_SELECT", "NO_PDF")
@@ -9078,7 +9116,7 @@ def twilio_inbound():
             
         elif len(tenants_found) > 1:
             # ✅ Multi-tenant: guardar estado y preguntar
-            save_multi_tenant_selection_state(from_whatsapp, tenants_found)
+            save_multi_tenant_selection_state(from_whatsapp, tenants_found, action="RESEND")
             
             msg = "Trabajás en varias empresas. ¿De cuál querés el recibo?\n\n"
             for i, t in enumerate(tenants_found, 1):
@@ -9276,6 +9314,7 @@ def twilio_inbound():
             return twiml("📝 Recibo observado. Contacte RRHH para más información.")
 
     return Response("OK", status=200)
+
 
 
 @app.route("/admin/reenviar_fallidos", methods=["GET", "POST"])
