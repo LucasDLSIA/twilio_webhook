@@ -8840,21 +8840,31 @@ def find_all_tenants_for_whatsapp(whatsapp: str) -> List[dict]:
     return result
 
 
-def save_multi_tenant_selection_state(whatsapp: str, tenants: List[dict], action: str = "RESEND"):
+def save_multi_tenant_selection_state(whatsapp: str, tenants: List[dict] = None, action: str = "RESEND", period_offset: int = 0):
     """
     Guarda las opciones de tenant disponibles para que el usuario elija.
     
     Args:
         whatsapp: número de WhatsApp normalizado
-        tenants: lista de dicts con tenant, display_name, cuil
+        tenants: lista de dicts con tenant, display_name, cuil (puede ser None si solo guardamos offset)
         action: "RESEND" para pedir recibo, "SEE_PREVIOUS" para ver períodos
+        period_offset: offset de períodos (para paginación)
     """
     now = int(time.time())
     expires_at = now + (10 * 60)  # 10 minutos
     
+    # Si no pasamos tenants, obtener el estado actual para preservarlo
+    if tenants is None:
+        current = get_multi_tenant_selection_state(whatsapp)
+        if current:
+            tenants = current.get("tenants", [])
+        else:
+            tenants = []
+    
     context = {
         "tenants": tenants,
-        "action": action
+        "action": action,
+        "period_offset": period_offset
     }
     context_json = json.dumps(context)
     
@@ -8894,16 +8904,66 @@ def get_multi_tenant_selection_state(whatsapp: str) -> Optional[dict]:
         data = json.loads(row[0])
         # Compatibilidad con formato antiguo
         if isinstance(data, list):
-            return {"tenants": data, "action": "RESEND", "created_at": row[1]}
+            return {
+                "tenants": data, 
+                "action": "RESEND", 
+                "period_offset": 0,
+                "created_at": row[1]
+            }
         # Formato nuevo
         return {
             "tenants": data.get("tenants", []),
             "action": data.get("action", "RESEND"),
+            "period_offset": data.get("period_offset", 0),
             "created_at": row[1]
         }
     except Exception as e:
         print(f"Error parsing multi_tenant_selection: {e}")
         return None
+    
+def show_previous_periods_paginated(from_whatsapp: str, tenant: str, cuil: str, offset: int = 0):
+    """
+    Muestra períodos anteriores con paginación.
+    
+    Args:
+        from_whatsapp: número de WhatsApp
+        tenant: slug del tenant
+        cuil: CUIL del usuario
+        offset: cuántos períodos saltar (para paginación)
+    
+    Returns:
+        tuple: (mensaje, tiene_mas_periodos)
+    """
+    # Obtener más períodos de los que vamos a mostrar para saber si hay más
+    all_prev = list_previous_periods_excluding_current(tenant, cuil, limit=20)
+    
+    # Aplicar offset
+    available = all_prev[offset:]
+    
+    if not available:
+        return ("ℹ️ No hay más períodos anteriores disponibles.", False)
+    
+    # Mostrar hasta 3 períodos
+    to_show = available[:3]
+    has_more = len(available) > 3
+    
+    # Guardar el primer período en pending para manejar la selección
+    add_pending_view(from_whatsapp, tenant, cuil, to_show[0], origin="SEE_PREVIOUS")
+    pending = get_latest_pending_view(from_whatsapp)
+    set_pending_step(pending["id"], "CHOOSE_PREVIOUS")
+    
+    # Construir mensaje
+    msg = "🗂️ Períodos anteriores:\n\n"
+    for i, p in enumerate(to_show, start=1):
+        msg += f"{i}. {p}\n"
+    
+    if has_more:
+        msg += f"\n4️⃣ Ver más períodos anteriores"
+    
+    msg += "\nRespondé con el número para elegir."
+    
+    return (msg, has_more)
+
 
 def clear_multi_tenant_selection_state(whatsapp: str):
     """Limpia el estado de selección después de que el usuario eligió."""
@@ -8954,7 +9014,7 @@ def twilio_inbound():
         
         elif len(tenants_found) > 1:
             # Multi-tenant: preguntar primero
-            save_multi_tenant_selection_state(from_whatsapp, tenants_found, action="SEE_PREVIOUS")
+            save_multi_tenant_selection_state(from_whatsapp, tenants_found, action="SEE_PREVIOUS", period_offset=0)
             
             msg = "Trabajás en varias empresas. ¿De cuál querés ver los períodos?\n\n"
             for i, t in enumerate(tenants_found, 1):
@@ -8967,21 +9027,17 @@ def twilio_inbound():
         tenant0 = tenants_found[0]["tenant"]
         cuil0 = tenants_found[0]["cuil"]
 
-        prev = list_previous_periods_excluding_current(tenant0, cuil0, limit=3)
-
-        if not prev:
-            return twiml("ℹ️ No tengo períodos anteriores disponibles para tu CUIL.")
-
-        # aseguramos pending para que la respuesta 1/2/3 funcione
-        # usamos como period base el primero de prev (el más nuevo anterior al mes actual)
-        add_pending_view(from_whatsapp, tenant0, cuil0, prev[0], origin="SEE_PREVIOUS")
-        pending = get_latest_pending_view(from_whatsapp)
-        set_pending_step(pending["id"], "CHOOSE_PREVIOUS")
-
-        msg = "🗂️ Períodos anteriores:\n\n"
-        for i, p in enumerate(prev, start=1):
-            msg += f"{i}. {p}\n"
-        msg += "\nRespondé con 1, 2 o 3 para elegir."
+        msg, has_more = show_previous_periods_paginated(from_whatsapp, tenant0, cuil0, offset=0)
+        
+        # Guardar estado para manejar "4" (ver más)
+        if has_more:
+            save_multi_tenant_selection_state(
+                from_whatsapp, 
+                tenants=[{"tenant": tenant0, "cuil": cuil0}],
+                action="SEE_PREVIOUS_PAGINATION",
+                period_offset=3
+            )
+        
         return twiml(msg)
 
     # ============================================================================
@@ -8990,6 +9046,33 @@ def twilio_inbound():
     if not button and body.strip() in ("1", "2", "3", "4"):
         step_now = (pending.get("step") or "READY").upper() if isinstance(pending, dict) else "READY"
         
+        # ============================================================
+        # CASO ESPECIAL: "4" cuando está en modo CHOOSE_PREVIOUS
+        # ============================================================
+        if body.strip() == "4" and step_now == "CHOOSE_PREVIOUS":
+            # Verificar si hay paginación activa
+            multi_state = get_multi_tenant_selection_state(from_whatsapp)
+            
+            if multi_state and multi_state.get("action") == "SEE_PREVIOUS_PAGINATION":
+                tenant_info = multi_state.get("tenants", [{}])[0]
+                tenant = tenant_info.get("tenant")
+                cuil = tenant_info.get("cuil")
+                current_offset = multi_state.get("period_offset", 0)
+                
+                msg, has_more = show_previous_periods_paginated(from_whatsapp, tenant, cuil, offset=current_offset)
+                
+                # Actualizar offset para próxima paginación
+                if has_more:
+                    save_multi_tenant_selection_state(
+                        from_whatsapp,
+                        tenants=[{"tenant": tenant, "cuil": cuil}],
+                        action="SEE_PREVIOUS_PAGINATION",
+                        period_offset=current_offset + 3
+                    )
+                
+                return twiml(msg)
+        
+        # Si NO está en modo CHOOSE_PREVIOUS, entonces puede ser multi-tenant
         if step_now != "CHOOSE_PREVIOUS":
             multi_state = get_multi_tenant_selection_state(from_whatsapp)
             
@@ -9012,19 +9095,17 @@ def twilio_inbound():
                     # ACCIÓN: SEE_PREVIOUS → Mostrar períodos anteriores
                     # ============================================================
                     if action == "SEE_PREVIOUS":
-                        prev = list_previous_periods_excluding_current(tenant, cuil, limit=3)
+                        msg, has_more = show_previous_periods_paginated(from_whatsapp, tenant, cuil, offset=0)
                         
-                        if not prev:
-                            return twiml("ℹ️ No tengo períodos anteriores disponibles para tu CUIL.")
+                        # Guardar estado para manejar "4" (ver más)
+                        if has_more:
+                            save_multi_tenant_selection_state(
+                                from_whatsapp,
+                                tenants=[{"tenant": tenant, "cuil": cuil}],
+                                action="SEE_PREVIOUS_PAGINATION",
+                                period_offset=3
+                            )
                         
-                        add_pending_view(from_whatsapp, tenant, cuil, prev[0], origin="SEE_PREVIOUS")
-                        pending = get_latest_pending_view(from_whatsapp)
-                        set_pending_step(pending["id"], "CHOOSE_PREVIOUS")
-                        
-                        msg = "🗂️ Períodos anteriores:\n\n"
-                        for i, p in enumerate(prev, start=1):
-                            msg += f"{i}. {p}\n"
-                        msg += "\nRespondé con 1, 2 o 3 para elegir."
                         return twiml(msg)
                     
                     # ============================================================
@@ -9074,12 +9155,12 @@ def twilio_inbound():
         if step_now == "AWAIT_DNI":
             pass
 
-        # CHOOSE_PREVIOUS: si no es 1/2/3, devolvemos ayuda (no menú)
+        # CHOOSE_PREVIOUS: si no es 1/2/3/4, devolvemos ayuda (no menú)
         elif step_now == "CHOOSE_PREVIOUS":
-            if body_norm in ("1", "2", "3"):
+            if body_norm in ("1", "2", "3", "4"):
                 pass
             else:
-                return twiml("🗂️ Respondé con 1, 2 o 3 para elegir un período anterior.")
+                return twiml("🗂️ Respondé con 1, 2, 3 o 4 para elegir un período anterior.")
 
         else:
             # ✅ Enviar menú y terminar (SIN TwiML al usuario)
@@ -9314,7 +9395,6 @@ def twilio_inbound():
             return twiml("📝 Recibo observado. Contacte RRHH para más información.")
 
     return Response("OK", status=200)
-
 
 
 @app.route("/admin/reenviar_fallidos", methods=["GET", "POST"])
