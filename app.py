@@ -3909,7 +3909,7 @@ def init_db():
     _try_alter(cur, "ALTER TABLE pending_views ADD COLUMN step TEXT;")
     _try_alter(cur, "ALTER TABLE pending_views ADD COLUMN dni_attempts INTEGER;")
     _try_alter(cur, "ALTER TABLE pending_views ADD COLUMN origin TEXT;")
-
+    _try_alter(cur, "ALTER TABLE pending_views ADD COLUMN period_offset INTEGER DEFAULT 0;")  # ← NUEVO
 
     # (opcional pero recomendado) limpiar duplicados por to_whatsapp antes del índice único
     _try_alter(cur, """
@@ -4168,7 +4168,7 @@ def init_db():
             FOREIGN KEY(user_id) REFERENCES client_users(id)
         )
     """)
-    _try_alter(cur, "ALTER TABLE pending_views ADD COLUMN period_offset INTEGER DEFAULT 0;")
+
     # Log de auditoría del portal
     cur.execute("""
         CREATE TABLE IF NOT EXISTS client_audit_log (
@@ -5408,7 +5408,8 @@ def get_latest_pending_view(to_whatsapp: str):
         created_at,
         COALESCE(step, 'READY') AS step,
         COALESCE(dni_attempts, 0) AS dni_attempts,
-        COALESCE(origin, 'INITIAL') AS origin
+        COALESCE(origin, 'INITIAL') AS origin,
+        COALESCE(period_offset, 0) AS period_offset
       FROM pending_views
       WHERE to_whatsapp=?
       ORDER BY created_at DESC
@@ -5419,14 +5420,13 @@ def get_latest_pending_view(to_whatsapp: str):
     if not row:
         return None
 
-    # si usás sqlite3.Row como row_factory, esto funciona:
     try:
         return dict(row)
     except Exception:
         # fallback si fetchone devuelve tuple
-        keys = ["id","to_whatsapp","tenant","cuil","period","created_at","step","dni_attempts"]
+        keys = ["id","to_whatsapp","tenant","cuil","period","created_at","step","dni_attempts","origin","period_offset"]
         return dict(zip(keys, row))
-
+    
 def consume_pending_view(pending_id: int):
     conn = get_db_connection()
     cur = conn.cursor()
@@ -8953,6 +8953,8 @@ def show_previous_periods_paginated(from_whatsapp: str, tenant: str, cuil: str, 
     """, (offset, pending["id"]))
     conn.commit()
     conn.close()
+    
+    print(f"✅ SAVED OFFSET IN PENDING: {offset}")  # Debug
     
     # Construir mensaje
     msg = "🗂️ Períodos anteriores:\n\n"
