@@ -9276,15 +9276,32 @@ def twilio_inbound():
     # =========================
     # SELECCIÓN de período anterior (1/2/3) cuando step=CHOOSE_PREVIOUS
     # =========================
+    # =========================
+    # SELECCIÓN de período anterior (1/2/3) cuando step=CHOOSE_PREVIOUS
+    # =========================
     if step == "CHOOSE_PREVIOUS" and (not button) and (body or "").strip() in ("1", "2", "3"):
         idx = int((body or "").strip()) - 1
 
-        prev = list_previous_periods_excluding_current(tenant, cuil, limit=3)
+        # ✅ Verificar si hay paginación activa para obtener los períodos correctos
+        multi_state = get_multi_tenant_selection_state(from_whatsapp)
+        current_offset = 0
+        
+        if multi_state and multi_state.get("action") == "SEE_PREVIOUS_PAGINATION":
+            current_offset = multi_state.get("period_offset", 0) - 3  # Restar 3 porque ya avanzamos
+        
+        # Obtener períodos con el offset correcto
+        all_prev = list_previous_periods_excluding_current(tenant, cuil, limit=20)
+        available = all_prev[current_offset:]
+        prev = available[:3]
+        
         if idx >= len(prev):
             return twiml("❌ Opción inválida. Respondé con 1, 2 o 3.")
 
         chosen_period = prev[idx]
 
+        # ✅ Limpiar estado de paginación
+        clear_multi_tenant_selection_state(from_whatsapp)
+        
         # volvemos a READY para no quedar pegados en modo selección
         set_pending_step(pending["id"], "READY")
 
