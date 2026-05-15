@@ -9273,36 +9273,43 @@ def twilio_inbound():
         return Response("OK", status=200)
 
 
-    # =========================
-    # SELECCIÓN de período anterior (1/2/3) cuando step=CHOOSE_PREVIOUS
-    # =========================
+
     # =========================
     # SELECCIÓN de período anterior (1/2/3) cuando step=CHOOSE_PREVIOUS
     # =========================
     if step == "CHOOSE_PREVIOUS" and (not button) and (body or "").strip() in ("1", "2", "3"):
         idx = int((body or "").strip()) - 1
 
-        # ✅ Verificar si hay paginación activa para obtener los períodos correctos
+        # ✅ Obtener el offset de la página ACTUAL
         multi_state = get_multi_tenant_selection_state(from_whatsapp)
-        current_offset = 0
         
+        # Si hay paginación activa, el offset guardado es para la PRÓXIMA página
+        # Para obtener el offset de la página ACTUAL, restamos 3
         if multi_state and multi_state.get("action") == "SEE_PREVIOUS_PAGINATION":
-            current_offset = multi_state.get("period_offset", 0) - 3  # Restar 3 porque ya avanzamos
+            next_offset = multi_state.get("period_offset", 0)
+            current_offset = next_offset - 3  # La página actual es 3 atrás
+        else:
+            # Sin paginación = primera página
+            current_offset = 0
         
-        # Obtener períodos con el offset correcto
+        print(f"🔍 PAGINATION DEBUG: current_offset={current_offset}")
+        
+        # Obtener períodos desde el offset correcto
         all_prev = list_previous_periods_excluding_current(tenant, cuil, limit=20)
-        available = all_prev[current_offset:]
-        prev = available[:3]
+        prev = all_prev[current_offset:current_offset + 3]
+        
+        print(f"🔍 PERIODS: all={all_prev[:10]}, showing={prev}")
         
         if idx >= len(prev):
             return twiml("❌ Opción inválida. Respondé con 1, 2 o 3.")
 
         chosen_period = prev[idx]
+        print(f"✅ SELECTED: idx={idx}, period={chosen_period}")
 
-        # ✅ Limpiar estado de paginación
+        # Limpiar estado de paginación
         clear_multi_tenant_selection_state(from_whatsapp)
         
-        # volvemos a READY para no quedar pegados en modo selección
+        # volvemos a READY
         set_pending_step(pending["id"], "READY")
 
         cnt = get_receipt_request_count(tenant, cuil, chosen_period, from_whatsapp)
@@ -9311,11 +9318,9 @@ def twilio_inbound():
             return twiml(f"⚠️ Ya pediste este recibo {cnt}/3 veces para {chosen_period}. Si necesitás más, avisá a RRHH.")
 
         if not is_verified_contact(tenant, cuil, from_whatsapp):
-            # guardamos el período elegido antes de pedir DNI
             add_pending_view(from_whatsapp, tenant, cuil, chosen_period)
             pending = get_latest_pending_view(from_whatsapp)
             set_pending_step(pending["id"], "AWAIT_DNI")
-
             _log_receipt_request_event(tenant, cuil, chosen_period, from_whatsapp, "CHOOSE_PREVIOUS", "ASK_DNI", origin="CHOOSE_PREVIOUS")
             return twiml("🔐 Para reenviar tu recibo, enviá tu DNI (solo números, sin puntos).")
 
@@ -9327,7 +9332,6 @@ def twilio_inbound():
         n = inc_receipt_request_count(tenant, cuil, chosen_period, from_whatsapp)
         _log_receipt_request_event(tenant, cuil, chosen_period, from_whatsapp, "CHOOSE_PREVIOUS", "SENT", message_sid=sid_pdf)
         return twiml(f"📄 Listo. Te reenvié el recibo {chosen_period}. (Pedido {n}/3)")
-
     # =========================
     # AWAIT_DNI
     # =========================
