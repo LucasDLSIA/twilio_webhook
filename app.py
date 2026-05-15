@@ -9284,7 +9284,30 @@ def twilio_inbound():
         return twiml("ℹ️ Esta opción estará disponible próximamente.")
 
     # RESEND_LAST -> envía el último recibo disponible (mes actual si existe, sino el último real)
+    # RESEND_LAST -> envía el último recibo disponible (mes actual si existe, sino el último real)
     if button == "RESEND_LAST":
+        # ✅ NUEVO: Verificar si está en múltiples empresas
+        tenants_found = find_all_tenants_for_whatsapp(from_whatsapp)
+        
+        if len(tenants_found) == 0:
+            _log_receipt_request_event("", "", "", from_whatsapp, "RESEND_LAST", "NO_CONTEXT")
+            return twiml("👋 Para enviarte tu recibo, primero necesitás el mensaje inicial de RRHH. Si no lo tenés, avisá a RRHH.")
+        
+        elif len(tenants_found) > 1:
+            # Multi-tenant: preguntar de cuál empresa quiere el recibo
+            save_multi_tenant_selection_state(from_whatsapp, tenants_found, action="RESEND")
+            
+            msg = "Trabajás en varias empresas. ¿De cuál querés el último recibo?\n\n"
+            for i, t in enumerate(tenants_found, 1):
+                msg += f"{i}️⃣ {t['display_name']}\n"
+            msg += "\nRespondé con el número."
+            
+            return twiml(msg)
+        
+        # Si llegamos acá, solo está en 1 empresa
+        tenant = tenants_found[0]["tenant"]
+        cuil = tenants_found[0]["cuil"]
+        
         best_period = resolve_best_period_with_pdf(tenant, cuil)
         if not best_period:
             _log_receipt_request_event(tenant, cuil, "", from_whatsapp, "RESEND_LAST", "NO_PDF")
