@@ -4168,7 +4168,7 @@ def init_db():
             FOREIGN KEY(user_id) REFERENCES client_users(id)
         )
     """)
-    
+    _try_alter(cur, "ALTER TABLE pending_views ADD COLUMN period_offset INTEGER DEFAULT 0;")
     # Log de auditoría del portal
     cur.execute("""
         CREATE TABLE IF NOT EXISTS client_audit_log (
@@ -8924,15 +8924,6 @@ def get_multi_tenant_selection_state(whatsapp: str) -> Optional[dict]:
 def show_previous_periods_paginated(from_whatsapp: str, tenant: str, cuil: str, offset: int = 0):
     """
     Muestra períodos anteriores con paginación.
-    
-    Args:
-        from_whatsapp: número de WhatsApp
-        tenant: slug del tenant
-        cuil: CUIL del usuario
-        offset: cuántos períodos saltar (para paginación)
-    
-    Returns:
-        tuple: (mensaje, tiene_mas_periodos)
     """
     # Obtener más períodos de los que vamos a mostrar para saber si hay más
     all_prev = list_previous_periods_excluding_current(tenant, cuil, limit=20)
@@ -8951,6 +8942,17 @@ def show_previous_periods_paginated(from_whatsapp: str, tenant: str, cuil: str, 
     add_pending_view(from_whatsapp, tenant, cuil, to_show[0], origin="SEE_PREVIOUS")
     pending = get_latest_pending_view(from_whatsapp)
     set_pending_step(pending["id"], "CHOOSE_PREVIOUS")
+    
+    # ✅ NUEVO: Guardar también el offset en el pending
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute("""
+        UPDATE pending_views 
+        SET period_offset = ? 
+        WHERE id = ?
+    """, (offset, pending["id"]))
+    conn.commit()
+    conn.close()
     
     # Construir mensaje
     msg = "🗂️ Períodos anteriores:\n\n"
@@ -9316,22 +9318,16 @@ def twilio_inbound():
     # =========================
     # SELECCIÓN de período anterior (1/2/3) cuando step=CHOOSE_PREVIOUS
     # =========================
+    # =========================
+    # SELECCIÓN de período anterior (1/2/3) cuando step=CHOOSE_PREVIOUS
+    # =========================
     if step == "CHOOSE_PREVIOUS" and (not button) and (body or "").strip() in ("1", "2", "3"):
         idx = int((body or "").strip()) - 1
 
-        # ✅ Obtener el offset de la página ACTUAL
-        multi_state = get_multi_tenant_selection_state(from_whatsapp)
+        # ✅ Leer offset directamente del pending
+        current_offset = pending.get("period_offset", 0)
         
-        # Si hay paginación activa, el offset guardado es para la PRÓXIMA página
-        # Para obtener el offset de la página ACTUAL, restamos 3
-        if multi_state and multi_state.get("action") == "SEE_PREVIOUS_PAGINATION":
-            next_offset = multi_state.get("period_offset", 0)
-            current_offset = next_offset - 3  # La página actual es 3 atrás
-        else:
-            # Sin paginación = primera página
-            current_offset = 0
-        
-        print(f"🔍 PAGINATION DEBUG: current_offset={current_offset}")
+        print(f"🔍 PAGINATION DEBUG: current_offset={current_offset} (from pending)")
         
         # Obtener períodos desde el offset correcto
         all_prev = list_previous_periods_excluding_current(tenant, cuil, limit=20)
