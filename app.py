@@ -9154,7 +9154,11 @@ def twilio_inbound():
                     # Para RESEND sí limpiamos porque ya no necesitamos el estado
                     clear_multi_tenant_selection_state(from_whatsapp)
                     
+                    print(f"🔍 RESEND: tenant={tenant}, cuil={cuil}")
+                    
                     period = resolve_best_period_with_pdf(tenant, cuil)
+                    print(f"🔍 RESEND: period={period}")
+                    
                     if not period:
                         _log_receipt_request_event(tenant, cuil, "", from_whatsapp, "MULTI_SELECT", "NO_PDF")
                         return twiml("⚠️ No encontré recibos disponibles. Avisá a RRHH.")
@@ -9163,22 +9167,34 @@ def twilio_inbound():
                     pending = get_latest_pending_view(from_whatsapp)
                     
                     cnt = get_receipt_request_count(tenant, cuil, period, from_whatsapp)
+                    print(f"🔍 RESEND: cnt={cnt}")
+                    
                     if cnt >= 3:
                         _log_receipt_request_event(tenant, cuil, period, from_whatsapp, "MULTI_SELECT", "BLOCKED_LIMIT")
                         return twiml(f"⚠️ Ya pediste este recibo {cnt}/3 veces para {period}. Si necesitás más, avisá a RRHH.")
                     
-                    if not is_verified_contact(tenant, cuil, from_whatsapp):
+                    is_verified = is_verified_contact(tenant, cuil, from_whatsapp)
+                    print(f"🔍 RESEND: is_verified={is_verified}")
+                    
+                    if not is_verified:
                         set_pending_step(pending["id"], "AWAIT_DNI")
                         _log_receipt_request_event(tenant, cuil, period, from_whatsapp, "MULTI_SELECT", "ASK_DNI")
                         return twiml("🔐 Para reenviar tu recibo, enviá tu DNI (solo números, sin puntos).")
                     
+                    print(f"🔍 RESEND: Calling _send_pdf_flow...")
+                    
                     sid_pdf = _send_pdf_flow(from_whatsapp, tenant, cuil, period, origin="RESEND_LAST")
+                    print(f"🔍 RESEND: sid_pdf={sid_pdf}")
+                    
                     if not sid_pdf:
                         _log_receipt_request_event(tenant, cuil, period, from_whatsapp, "MULTI_SELECT", "ERROR")
                         return twiml("❌ No pude enviar el PDF en este momento. Probá de nuevo o avisá a RRHH.")
                     
                     n = inc_receipt_request_count(tenant, cuil, period, from_whatsapp)
                     _log_receipt_request_event(tenant, cuil, period, from_whatsapp, "MULTI_SELECT", "SENT", message_sid=sid_pdf)
+                    
+                    print(f"✅ RESEND: PDF sent successfully, sid={sid_pdf}")
+                    
                     return Response("OK", status=200)
                     
                 except Exception as e:
@@ -9284,7 +9300,6 @@ def twilio_inbound():
         return twiml("ℹ️ Esta opción estará disponible próximamente.")
 
     # RESEND_LAST -> envía el último recibo disponible (mes actual si existe, sino el último real)
-    # RESEND_LAST -> envía el último recibo disponible (mes actual si existe, sino el último real)
     if button == "RESEND_LAST":
         # ✅ NUEVO: Verificar si está en múltiples empresas
         tenants_found = find_all_tenants_for_whatsapp(from_whatsapp)
@@ -9340,9 +9355,6 @@ def twilio_inbound():
 
 
 
-    # =========================
-    # SELECCIÓN de período anterior (1/2/3) cuando step=CHOOSE_PREVIOUS
-    # =========================
     # =========================
     # SELECCIÓN de período anterior (1/2/3) cuando step=CHOOSE_PREVIOUS
     # =========================
