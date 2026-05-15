@@ -8928,31 +8928,26 @@ def twilio_inbound():
     # y SIEMPRE excluir el mes corriente
     # =========================
     if button == "SEE_PREVIOUS":
-        # 1) intentamos tomar contexto del pending si existe
-        if pending and isinstance(pending, dict):
-            tenant0 = (pending.get("tenant") or "").strip().lower()
-            cuil0 = (pending.get("cuil") or "").strip()
-        else:
-            # 2) si no hay pending, buscar en qué tenants está
-            tenants_found = find_all_tenants_for_whatsapp(from_whatsapp)
+        # SIEMPRE verificar si el usuario está en múltiples tenants
+        tenants_found = find_all_tenants_for_whatsapp(from_whatsapp)
+        
+        if len(tenants_found) == 0:
+            return twiml("👋 Para ver períodos anteriores, necesitás el mensaje inicial de RRHH. Si no lo tenés, avisá a RRHH.")
+        
+        elif len(tenants_found) > 1:
+            # Multi-tenant: preguntar primero
+            save_multi_tenant_selection_state(from_whatsapp, tenants_found)
             
-            if len(tenants_found) == 0:
-                return twiml("👋 Para ver períodos anteriores, necesitás el mensaje inicial de RRHH. Si no lo tenés, avisá a RRHH.")
+            msg = "Trabajás en varias empresas. ¿De cuál querés ver los períodos?\n\n"
+            for i, t in enumerate(tenants_found, 1):
+                msg += f"{i}️⃣ {t['display_name']}\n"
+            msg += "\nRespondé con el número."
             
-            elif len(tenants_found) == 1:
-                tenant0 = tenants_found[0]["tenant"]
-                cuil0 = tenants_found[0]["cuil"]
-                
-            elif len(tenants_found) > 1:
-                # Multi-tenant: preguntar primero
-                save_multi_tenant_selection_state(from_whatsapp, tenants_found)
-                
-                msg = "Trabajás en varias empresas. ¿De cuál querés ver los períodos?\n\n"
-                for i, t in enumerate(tenants_found, 1):
-                    msg += f"{i}️⃣ {t['display_name']}\n"
-                msg += "\nRespondé con el número."
-                
-                return twiml(msg)
+            return twiml(msg)
+        
+        # Si llegamos acá, es porque hay UN SOLO tenant
+        tenant0 = tenants_found[0]["tenant"]
+        cuil0 = tenants_found[0]["cuil"]
 
         prev = list_previous_periods_excluding_current(tenant0, cuil0, limit=3)
 
