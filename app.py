@@ -3366,6 +3366,7 @@ def portal_reset_password(token):
 """)
     
     return Response("".join(html), mimetype="text/html")
+
 @app.route("/static/<path:filename>")
 def serve_static(filename):
     """
@@ -4560,7 +4561,41 @@ def admin_send_template_preview():
     return jsonify(resp)
 
 
-
+def precache_pdfs_for_period(tenant, period):
+    """
+    Carga todos los PDFs de un período en un dict.
+    Returns: {cuil: file_id, ...}
+    """
+    try:
+        # ✅ USAR LA FUNCIÓN CORRECTA
+        folder_id = get_tenant_period_folder_id(tenant, period)
+        if not folder_id:
+            print(f"⚠️ No se encontró carpeta para {tenant}/{period}")
+            return {}
+        
+        service = drive_service()
+        results = service.files().list(
+            q=f"'{folder_id}' in parents and mimeType='application/pdf'",
+            fields="files(id, name)",
+            pageSize=1000
+        ).execute()
+        
+        files = results.get('files', [])
+        
+        cache = {}
+        for f in files:
+            filename = f['name']
+            cuil = strip_pdf(filename)  # "27-12345678-9.pdf" → "27123456789"
+            cuil = norm_cuil(cuil)
+            if cuil:
+                cache[cuil] = f['id']
+        
+        print(f"✅ Pre-cached {len(cache)} PDFs for {tenant}/{period}")
+        return cache
+        
+    except Exception as e:
+        print(f"❌ Error pre-caching PDFs: {e}")
+        return {}
 
 def set_pending_step(pending_id: int, step: str):
     conn = get_db_connection()
@@ -8248,12 +8283,18 @@ def admin_send_template_queue_tick():
         batch_size = int(request.form.get("batch_size") or request.args.get("batch_size") or "10")
     except ValueError:
         batch_size = 10
-    batch_size = max(1, min(batch_size, 50))  # cap de seguridad
+    batch_size = max(1, min(batch_size, 50))
 
     if not tenant:
         return Response("Falta tenant", status=400)
     if not period:
         return Response("Falta period", status=400)
+
+    # ✅ NUEVO: Recibir cache si send_auto lo pasó
+    use_cache = (request.form.get("use_cache") or request.args.get("use_cache") or "").lower() == "true"
+    pdf_cache = {}
+    if use_cache:
+        pdf_cache = precache_pdfs_for_period(tenant, period)
 
     rows = _fetch_queue_batch(tenant, period, batch_size=batch_size)
 
@@ -8273,7 +8314,12 @@ def admin_send_template_queue_tick():
         try:
             # 1) Si require_pdf, validamos que exista PDF
             if require_pdf:
-                pdf_file_id = find_pdf_with_retry(tenant, cuil, period)
+                # ✅ NUEVO: Usar cache si existe
+                if use_cache and cuil in pdf_cache:
+                    pdf_file_id = pdf_cache[cuil]
+                else:
+                    pdf_file_id = find_pdf_with_retry(tenant, cuil, period)
+                
                 if not pdf_file_id:
                     _mark_queue_row(row_id, "SKIPPED", error="NO_PDF")
                     skipped += 1
@@ -8306,7 +8352,6 @@ def admin_send_template_queue_tick():
 
     stats = count_queue_status(tenant, period)
 
-    # Si lo llamás desde cron, puede devolverte OK sin redirect:
     if (request.form.get("mode") or request.args.get("mode") or "").lower() == "json":
         return {
             "tenant": tenant,
@@ -8323,7 +8368,6 @@ def admin_send_template_queue_tick():
         f"&period={period}&processed={processed}&sent={sent}&skipped={skipped}&failed={failed}"
         f"&pending={stats.get('PENDING',0)}"
     )
-
 
 @app.post("/admin/send_auto")
 def admin_send_auto():
@@ -8353,16 +8397,19 @@ def admin_send_auto():
     # Función que corre en el thread
     def process_in_background():
         import requests
+        
+        # ✅ PRE-CACHE AL INICIO
+        pdf_cache = precache_pdfs_for_period(tenant, period)
+        
         processed_total = 0
         sent_total = 0
         iterations = 0
-        max_iterations = 200  # Límite: 200 iteraciones × 10 envíos = 2,000 envíos máx
+        max_iterations = 200
         
         while iterations < max_iterations:
             iterations += 1
             
             try:
-                # Llamar a queue_tick
                 response = requests.post(
                     f"{base_url}/admin/send_template_queue_tick",
                     data={
@@ -8371,6 +8418,8 @@ def admin_send_auto():
                         "batch_size": batch_size,
                         "mode": "json",
                         "token": token,
+                        # ✅ PASAR EL CACHE
+                        "use_cache": "true",
                     },
                     timeout=60
                 )
@@ -8394,7 +8443,7 @@ def admin_send_auto():
                     break
                 
                 # Pausa de 2 segundos entre lotes
-                time.sleep(2)
+                time.sleep(5)
                 
             except Exception as e:
                 print(f"[AUTO] Error: {e}")
