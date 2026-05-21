@@ -6763,6 +6763,7 @@ def admin_panel():
     html.append("</div>")
     html.append("<div class='right'>")
     html.append(f"<a class='btn secondary' href='/admin?token={esc(token)}'>← Volver</a>")
+    html.append(f"<a class='btn' href='/admin/reenviar_template?token={esc(token)}'>📤 Reenviar template</a>")
     html.append(f"<a class='btn' href='/admin/send_test?tenant={esc(tenant)}&token={esc(token)}'>📤 Envío individual</a>")
     html.append(f"<a class='btn' href='/admin/reenviar_fallidos?token={esc(token)}'>🔄 Reenviar fallidos</a>")
     html.append(f"<a class='btn' href='/admin/seguimiento?tenant={esc(tenant)}&token={esc(token)}'>⚠️ Seguimiento</a>")
@@ -7644,6 +7645,256 @@ def _fmt_ts(ts: int | None) -> str:
         return ""
     # tu server está en UTC, si querés BA: ajustá acá (UTC-3) o dejalo así
     return datetime.datetime.fromtimestamp(int(ts), datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+
+@app.route("/admin/reenviar_template", methods=["GET", "POST"])
+def admin_reenviar_template():
+    """
+    Reenviar template INITIAL a personas específicas (override).
+    """
+    token = request.args.get("token") or request.form.get("token")
+    if token != ADMIN_TOKEN:
+        return Response("Unauthorized", status=401)
+    
+    if request.method == "POST":
+        tenant = request.form.get("tenant", "").strip()
+        period = request.form.get("period", "").strip()
+        cuils_text = request.form.get("cuils", "").strip()
+        
+        # Parsear CUILs
+        cuils = []
+        for line in cuils_text.replace(",", "\n").split("\n"):
+            cuil = norm_cuil(line.strip())
+            if cuil and len(cuil) == 11:
+                cuils.append(cuil)
+        
+        if not tenant or not period or not cuils:
+            return Response("Falta tenant, period o CUILs", status=400)
+        
+        # Cargar envios
+        envios = load_envios_rows(tenant)
+        
+        resultados = []
+        for cuil in cuils:
+            person = find_person_by_cuil(envios, cuil)
+            if not person:
+                resultados.append(f"❌ {cuil}: No encontrado en envíos")
+                continue
+            
+            nombre = person.get('nombre', '')
+            
+            # Buscar WhatsApp
+            whatsapp = person.get('to_whatsapp', '')
+            if not whatsapp:
+                whatsapp = person.get('telefono_raw', '')
+            
+            if not whatsapp:
+                # Fallback a BD
+                conn = get_db_connection()
+                cur = conn.cursor()
+                cur.execute("""
+                    SELECT to_whatsapp FROM message_status 
+                    WHERE tenant = ? AND cuil = ? 
+                    ORDER BY created_at DESC LIMIT 1
+                """, (tenant, cuil))
+                row = cur.fetchone()
+                conn.close()
+                
+                if row and row[0]:
+                    whatsapp = row[0]
+                else:
+                    resultados.append(f"❌ {cuil} ({nombre}): Sin WhatsApp")
+                    continue
+            
+            # Normalizar
+            if not whatsapp.startswith('whatsapp:'):
+                whatsapp = norm_whatsapp(whatsapp)
+            
+            # ✅ ENVIAR TEMPLATE (OVERRIDE - no verificar si ya existe)
+            try:
+                sid = send_whatsapp_template(
+                    whatsapp,
+                    content_vars={"1": (nombre or "Hola")},
+                    template_sid=TWILIO_TEMPLATE_SID,
+                    status_callback=STATUS_CALLBACK_URL,
+                )
+                
+                # Guardar en BD
+                save_template_sid(tenant, cuil, period, whatsapp, sid, nombre=nombre)
+                add_pending_view(whatsapp, tenant, cuil, period, origin="INITIAL")
+                
+                resultados.append(f"✅ {cuil} ({nombre}): Template reenviado - SID: {sid}")
+                
+            except Exception as e:
+                resultados.append(f"❌ {cuil} ({nombre}): Error - {str(e)}")
+        
+        # Mostrar resultados
+        html = f"""<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Resultados reenvío template</title>
+  <style>
+    body {{ font-family: monospace; padding: 20px; background: #0f1629; color: #eaf0ff; }}
+    .success {{ color: #10b981; }}
+    .error {{ color: #ef4444; }}
+    a {{ color: #5aa7ff; text-decoration: none; }}
+    a:hover {{ text-decoration: underline; }}
+    .result {{ padding: 8px; border-bottom: 1px solid #333; }}
+  </style>
+</head>
+<body>
+  <h1>📊 Resultados del reenvío de templates</h1>
+  <p><strong>Tenant:</strong> {esc(tenant)}</p>
+  <p><strong>Período:</strong> {esc(period)}</p>
+  <p><strong>Total procesados:</strong> {len(resultados)}</p>
+  <hr>
+"""
+        
+        for r in resultados:
+            css_class = "success" if "✅" in r else "error"
+            html += f"<div class='result {css_class}'>{esc(r)}</div>"
+        
+        html += f"""
+  <hr>
+  <p><a href="/admin/reenviar_template?token={ADMIN_TOKEN}">← Volver</a></p>
+</body>
+</html>
+"""
+        return Response(html, mimetype="text/html")
+    
+    # GET: Formulario
+    html = f"""<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Reenviar Template</title>
+  <style>
+    body {{
+      font-family: system-ui, sans-serif;
+      background: #0f1629;
+      color: #eaf0ff;
+      padding: 20px;
+      max-width: 800px;
+      margin: 0 auto;
+    }}
+    h1 {{ color: #5aa7ff; }}
+    .card {{
+      background: rgba(255,255,255,0.05);
+      border: 1px solid rgba(255,255,255,0.1);
+      border-radius: 12px;
+      padding: 24px;
+      margin: 20px 0;
+    }}
+    label {{
+      display: block;
+      margin: 16px 0 8px 0;
+      font-weight: 600;
+      color: #9fb2d0;
+    }}
+    input, textarea {{
+      width: 100%;
+      padding: 12px;
+      border: 1px solid rgba(255,255,255,0.2);
+      border-radius: 8px;
+      background: rgba(0,0,0,0.3);
+      color: #eaf0ff;
+      font-family: monospace;
+      font-size: 14px;
+    }}
+    textarea {{
+      min-height: 200px;
+      resize: vertical;
+    }}
+    button {{
+      background: linear-gradient(135deg, #F4C430, #d4a514);
+      color: #1f2766;
+      border: none;
+      padding: 14px 32px;
+      border-radius: 8px;
+      font-weight: 700;
+      font-size: 16px;
+      cursor: pointer;
+      margin-top: 20px;
+    }}
+    button:hover {{
+      background: linear-gradient(135deg, #d4a514, #F4C430);
+    }}
+    .hint {{
+      font-size: 13px;
+      color: #9fb2d0;
+      margin-top: 6px;
+    }}
+    .example {{
+      background: rgba(0,0,0,0.3);
+      padding: 12px;
+      border-radius: 6px;
+      font-family: monospace;
+      font-size: 13px;
+      margin-top: 8px;
+    }}
+    a {{
+      color: #5aa7ff;
+      text-decoration: none;
+    }}
+    a:hover {{
+      text-decoration: underline;
+    }}
+    .warning {{
+      background: rgba(251, 191, 36, 0.1);
+      border: 1px solid rgba(251, 191, 36, 0.3);
+      padding: 16px;
+      border-radius: 8px;
+      margin: 16px 0;
+    }}
+  </style>
+</head>
+<body>
+  <h1>📤 Reenviar Template INITIAL</h1>
+  
+  <div class="card warning">
+    <p><strong>⚠️ IMPORTANTE - Usar solo en emergencias:</strong></p>
+    <ul>
+      <li>Esto reenviará el template INITIAL a personas que YA lo recibieron</li>
+      <li>Úsalo solo si borraron el chat y necesitan volver a iniciar</li>
+      <li>NO verifica si ya tienen template activo (OVERRIDE)</li>
+    </ul>
+  </div>
+  
+  <form method="post">
+    <input type="hidden" name="token" value="{ADMIN_TOKEN}">
+    
+    <div class="card">
+      <label>Tenant</label>
+      <input type="text" name="tenant" placeholder="san-patricio" required>
+      
+      <label>Período</label>
+      <input type="text" name="period" placeholder="04/2026" required>
+      <div class="hint">Formato: MM/YYYY</div>
+      
+      <label>CUILs (uno por línea o separados por coma)</label>
+      <textarea name="cuils" placeholder="27357233831
+27131464563
+20-12345678-9" required></textarea>
+      <div class="hint">Personas que borraron el chat y necesitan el template de nuevo</div>
+      
+      <div class="example">
+        <strong>Ejemplo:</strong><br>
+        27357233831<br>
+        27131464563<br>
+        20-12345678-9
+      </div>
+      
+      <button type="submit">🚀 Reenviar Templates</button>
+    </div>
+  </form>
+  
+  <p><a href="/admin?token={ADMIN_TOKEN}">← Volver al admin</a></p>
+</body>
+</html>
+"""
+    
+    return Response(html, mimetype="text/html")
 
 
 @app.get("/admin/verifications.xlsx")
