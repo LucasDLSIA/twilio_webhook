@@ -8261,6 +8261,8 @@ def admin_reset_tenant():
     conn = get_db_connection()
     cur = conn.cursor()
     cur.execute("DELETE FROM pending_views WHERE tenant=?;", (tenant,))
+    deleted_pending = cur.rowcount
+    print(f"RESET: DELETE FROM pending_views WHERE tenant=?; args= ({tenant},) deleted= {deleted_pending}")
 
     if period_raw:
         p_norm = norm_period_label(period_raw)  # MM/AAAA
@@ -8279,14 +8281,72 @@ def admin_reset_tenant():
         # borramos en todas las tablas por cada candidato
         for p in candidates:
             cur.execute("DELETE FROM recibo_estado WHERE tenant=? AND period=?;", (tenant, p))
+            print(f"RESET: DELETE FROM recibo_estado WHERE tenant=? AND period=?; args= {(tenant, p)} deleted= {cur.rowcount}")
+            
             cur.execute("DELETE FROM message_status WHERE tenant=? AND period=?;", (tenant, p))
+            print(f"RESET: DELETE FROM message_status WHERE tenant=? AND period=?; args= {(tenant, p)} deleted= {cur.rowcount}")
+            
             cur.execute("DELETE FROM sent_pdfs WHERE tenant=? AND period=?;", (tenant, p))
+            print(f"RESET: DELETE FROM sent_pdfs WHERE tenant=? AND period=?; args= {(tenant, p)} deleted= {cur.rowcount}")
+            
             cur.execute("DELETE FROM receipt_request_events WHERE tenant=? AND period=?;", (tenant, p))
+            print(f"RESET: DELETE FROM receipt_request_events WHERE tenant=? AND period=?; args= {(tenant, p)} deleted= {cur.rowcount}")
+            
+            cur.execute("DELETE FROM receipt_requests WHERE tenant=? AND period=?;", (tenant, p))
+            print(f"RESET: DELETE FROM receipt_requests WHERE tenant=? AND period=?; args= {(tenant, p)} deleted= {cur.rowcount}")
+            
+            cur.execute("DELETE FROM template_send_queue WHERE tenant=? AND period=?;", (tenant, p))
+            print(f"RESET: DELETE FROM template_send_queue WHERE tenant=? AND period=?; args= {(tenant, p)} deleted= {cur.rowcount}")
+            
+            # ✅ NUEVO: Borrar pending_terms de este tenant/período
+            cur.execute("DELETE FROM pending_terms WHERE tenant=? AND period=?;", (tenant, p))
+            print(f"RESET: DELETE FROM pending_terms WHERE tenant=? AND period=?; args= {(tenant, p)} deleted= {cur.rowcount}")
+        
+        # ✅ NUEVO: Borrar terms_accepted de usuarios de este tenant/período
+        cur.execute("""
+            DELETE FROM terms_accepted 
+            WHERE whatsapp IN (
+                SELECT DISTINCT to_whatsapp 
+                FROM message_status 
+                WHERE tenant = ? AND period IN ({})
+            )
+        """.format(','.join('?' * len(candidates))), (tenant, *candidates))
+        print(f"RESET: DELETE FROM terms_accepted (tenant={tenant}, periods={candidates}); deleted= {cur.rowcount}")
+        
     else:
+        # Sin período: borrar todo del tenant
         cur.execute("DELETE FROM recibo_estado WHERE tenant=?;", (tenant,))
+        print(f"RESET: DELETE FROM recibo_estado WHERE tenant=?; args= ({tenant},) deleted= {cur.rowcount}")
+        
         cur.execute("DELETE FROM message_status WHERE tenant=?;", (tenant,))
+        print(f"RESET: DELETE FROM message_status WHERE tenant=?; args= ({tenant},) deleted= {cur.rowcount}")
+        
         cur.execute("DELETE FROM sent_pdfs WHERE tenant=?;", (tenant,))
+        print(f"RESET: DELETE FROM sent_pdfs WHERE tenant=?; args= ({tenant},) deleted= {cur.rowcount}")
+        
         cur.execute("DELETE FROM receipt_request_events WHERE tenant=?;", (tenant,))
+        print(f"RESET: DELETE FROM receipt_request_events WHERE tenant=?; args= ({tenant},) deleted= {cur.rowcount}")
+        
+        cur.execute("DELETE FROM receipt_requests WHERE tenant=?;", (tenant,))
+        print(f"RESET: DELETE FROM receipt_requests WHERE tenant=?; args= ({tenant},) deleted= {cur.rowcount}")
+        
+        cur.execute("DELETE FROM template_send_queue WHERE tenant=?;", (tenant,))
+        print(f"RESET: DELETE FROM template_send_queue WHERE tenant=?; args= ({tenant},) deleted= {cur.rowcount}")
+        
+        # ✅ NUEVO: Borrar pending_terms de este tenant (sin período)
+        cur.execute("DELETE FROM pending_terms WHERE tenant=?;", (tenant,))
+        print(f"RESET: DELETE FROM pending_terms WHERE tenant=?; args= ({tenant},) deleted= {cur.rowcount}")
+        
+        # ✅ NUEVO: Borrar terms_accepted de usuarios de este tenant (sin período)
+        cur.execute("""
+            DELETE FROM terms_accepted 
+            WHERE whatsapp IN (
+                SELECT DISTINCT to_whatsapp 
+                FROM message_status 
+                WHERE tenant = ?
+            )
+        """, (tenant,))
+        print(f"RESET: DELETE FROM terms_accepted (tenant={tenant}, all periods); deleted= {cur.rowcount}")
 
     conn.commit()
     conn.close()
@@ -8294,7 +8354,6 @@ def admin_reset_tenant():
     # devolvemos SIEMPRE el normalizado para que el panel quede prolijo
     p_show = norm_period_label(period_raw) if period_raw else ""
     return redirect(f"/admin/panel?tenant={tenant}&token={token}&msg=reset_ok&period={p_show or period_raw}")
-
 
 from flask import redirect
 
@@ -9973,6 +10032,14 @@ def twilio_inbound():
         if cnt >= 3:
             _log_receipt_request_event(tenant, cuil, period, from_whatsapp, "VIEW_NOW", "BLOCKED_LIMIT")
             return twiml(f"⚠️ Ya pediste este recibo {cnt}/3 veces para {period}. Si necesitás más, avisá a RRHH.")
+
+        # ✅ VERIFICAR T&C antes de enviar PDF
+        if not has_accepted_terms(from_whatsapp):
+            origin = (pending.get("origin") or "INITIAL")
+            send_terms_and_conditions(from_whatsapp, tenant, cuil, period)
+            set_pending_terms_acceptance(from_whatsapp, tenant, cuil, period, origin)
+            _log_receipt_request_event(tenant, cuil, period, from_whatsapp, "VIEW_NOW", "SENT_TERMS")
+            return Response("OK", status=200)
 
         sid_pdf = _send_pdf_flow(from_whatsapp, tenant, cuil, period)
         if not sid_pdf:
