@@ -8403,6 +8403,20 @@ def admin_reset():
             _del("DELETE FROM receipt_request_events WHERE tenant=? AND period=?;", (tenant, p))
             _del("DELETE FROM receipt_requests WHERE tenant=? AND period=?;", (tenant, p))
             _del("DELETE FROM template_send_queue WHERE tenant=? AND period=?;", (tenant, p))
+            _del("DELETE FROM pending_terms WHERE tenant=? AND period=?;", (tenant, p))  # ✅ NUEVO
+        
+        # ✅ NUEVO: Borrar terms_accepted de usuarios de este tenant/período
+        placeholders = ','.join('?' for _ in periods)
+        cur.execute(f"""
+            DELETE FROM terms_accepted 
+            WHERE whatsapp IN (
+                SELECT DISTINCT to_whatsapp 
+                FROM message_status 
+                WHERE tenant = ? AND period IN ({placeholders})
+            )
+        """, (tenant, *periods))
+        print(f"RESET: DELETE FROM terms_accepted (tenant={tenant}, periods={periods}); deleted= {cur.rowcount}")
+        
     else:
         _del("DELETE FROM recibo_estado WHERE tenant=?;", (tenant,))
         _del("DELETE FROM message_status WHERE tenant=?;", (tenant,))
@@ -8410,6 +8424,18 @@ def admin_reset():
         _del("DELETE FROM receipt_request_events WHERE tenant=?;", (tenant,))
         _del("DELETE FROM receipt_requests WHERE tenant=?;", (tenant,))
         _del("DELETE FROM template_send_queue WHERE tenant=?;", (tenant,))
+        _del("DELETE FROM pending_terms WHERE tenant=?;", (tenant,))  # ✅ NUEVO
+        
+        # ✅ NUEVO: Borrar terms_accepted de usuarios de este tenant
+        cur.execute("""
+            DELETE FROM terms_accepted 
+            WHERE whatsapp IN (
+                SELECT DISTINCT to_whatsapp 
+                FROM message_status 
+                WHERE tenant = ?
+            )
+        """, (tenant,))
+        print(f"RESET: DELETE FROM terms_accepted (tenant={tenant}, all periods); deleted= {cur.rowcount}")
 
     conn.commit()
     conn.close()
