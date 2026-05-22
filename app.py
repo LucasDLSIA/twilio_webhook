@@ -4091,6 +4091,35 @@ def init_db():
     _try_alter(cur, "ALTER TABLE receipt_request_events ADD COLUMN created_at INTEGER;")
     _try_alter(cur, "CREATE INDEX IF NOT EXISTS idx_rre_key ON receipt_request_events(tenant,cuil,period,to_whatsapp,created_at);")
 
+    # =========
+    # ✅ NUEVO: terms_accepted (registro de aceptación de T&C)
+    # =========
+    cur.execute("""
+      CREATE TABLE IF NOT EXISTS terms_accepted (
+        whatsapp TEXT PRIMARY KEY,
+        accepted_at INTEGER NOT NULL,
+        ip_address TEXT,
+        user_agent TEXT
+      );
+    """)
+
+    # =========
+    # ✅ NUEVO: pending_terms (esperando aceptación de T&C)
+    # =========
+    cur.execute("""
+      CREATE TABLE IF NOT EXISTS pending_terms (
+        whatsapp TEXT PRIMARY KEY,
+        tenant TEXT,
+        cuil TEXT,
+        period TEXT,
+        origin TEXT DEFAULT 'INITIAL',
+        created_at INTEGER
+      );
+    """)
+
+    conn.commit()
+    conn.close()
+
 
     # =========
     # ✅ NUEVO: inbound_dedup (para evitar doble procesamiento)
@@ -4320,6 +4349,7 @@ def get_verifications_rows(tenant: str):
 
 def norm_cuil_digits(x: str) -> str:
     return "".join(ch for ch in (x or "") if ch.isdigit())
+
 
 def is_verified_contact(tenant: str, cuil: str, to_whatsapp: str) -> bool:
     cuil_d = norm_cuil_digits(cuil)
@@ -9032,6 +9062,161 @@ from twilio.rest import Client
 
 WHATSAPP_MENU_CONTENT_SID = os.getenv("WHATSAPP_MENU_CONTENT_SID", "")
 
+# ============================================================================
+
+TERMS_TEMPLATE_SID = os.getenv("TWILIO_TERMS_TEMPLATE_SID", "")
+TERMS_PDF_FILE_ID = os.getenv("TERMS_PDF_FILE_ID", "")
+
+# =========================
+# TÉRMINOS Y CONDICIONES
+# =========================
+
+def has_accepted_terms(whatsapp: str) -> bool:
+    """Verifica si el usuario ya aceptó los T&C."""
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT 1 FROM terms_accepted WHERE whatsapp = ? LIMIT 1", (whatsapp,))
+    exists = cur.fetchone() is not None
+    conn.close()
+    return exists
+
+
+def save_terms_acceptance(whatsapp: str):
+    """Guarda que el usuario aceptó los T&C."""
+    conn = get_db_connection()
+    cur = conn.cursor()
+    now = int(time.time())
+    cur.execute("""
+        INSERT OR REPLACE INTO terms_accepted (whatsapp, accepted_at)
+        VALUES (?, ?)
+    """, (whatsapp, now))
+    conn.commit()
+    conn.close()
+    print(f"✅ T&C aceptados: {whatsapp}")
+
+
+def set_pending_terms_acceptance(whatsapp: str, tenant: str, cuil: str, period: str, origin: str = "INITIAL"):
+    """Marca que el usuario está esperando aceptar T&C."""
+    conn = get_db_connection()
+    cur = conn.cursor()
+    now = int(time.time())
+    cur.execute("""
+        INSERT OR REPLACE INTO pending_terms (whatsapp, tenant, cuil, period, origin, created_at)
+        VALUES (?, ?, ?, ?, ?, ?)
+    """, (whatsapp, tenant, cuil, period, origin, now))
+    conn.commit()
+    conn.close()
+    print(f"✅ Pending T&C: {whatsapp} -> {tenant}/{cuil}/{period}")
+
+
+def get_pending_terms(whatsapp: str):
+    """Obtiene los datos del usuario que está esperando aceptar T&C."""
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT tenant, cuil, period, origin FROM pending_terms WHERE whatsapp = ? LIMIT 1
+    """, (whatsapp,))
+    row = cur.fetchone()
+    conn.close()
+    
+    if row:
+        return {"tenant": row[0], "cuil": row[1], "period": row[2], "origin": row[3]}
+    return None
+
+
+def clear_pending_terms(whatsapp: str):
+    """Limpia el estado de espera después de aceptar."""
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute("DELETE FROM pending_terms WHERE whatsapp = ?", (whatsapp,))
+    conn.commit()
+    conn.close()
+    print(f"✅ Cleared pending T&C: {whatsapp}")
+
+@app.get("/media/terms")
+def media_terms():
+    """Sirve el PDF de Términos y Condiciones."""
+    token = request.args.get("token", "").strip()
+    if ADMIN_TOKEN and token != ADMIN_TOKEN:
+        return Response("Unauthorized", status=401)
+    
+    if not TERMS_PDF_FILE_ID:
+        return Response("T&C PDF no configurado", status=404)
+    
+    try:
+        service = drive_service()
+        
+        # Obtener metadata
+        file_metadata = service.files().get(fileId=TERMS_PDF_FILE_ID, fields='size,name').execute()
+        file_size = int(file_metadata.get('size', 0))
+        
+        # Descargar con chunks
+        req = service.files().get_media(fileId=TERMS_PDF_FILE_ID)
+        fh = io.BytesIO()
+        downloader = MediaIoBaseDownload(fh, req, chunksize=5*1024*1024)
+        
+        done = False
+        while not done:
+            status, done = downloader.next_chunk()
+        
+        fh.seek(0)
+        data = fh.read()
+        
+        resp = Response(data, mimetype="application/pdf")
+        resp.headers["Content-Disposition"] = 'inline; filename="terminos-y-condiciones.pdf"'
+        resp.headers["Content-Length"] = str(len(data))
+        resp.headers["Cache-Control"] = "public, max-age=86400"  # 24h cache
+        
+        return resp
+        
+    except Exception as e:
+        print(f"❌ Error descargando T&C: {e}")
+        return Response("Error descargando PDF de T&C", status=500)
+
+
+def send_terms_and_conditions(to_whatsapp: str, tenant: str, cuil: str, period: str):
+    """Envía el PDF de T&C con template de aceptación."""
+    try:
+        client = _twilio_client()  # ← Corregido
+        
+        # Preparar payload base
+        payload_pdf = {
+            "to": to_whatsapp,
+            "body": "📄 Antes de continuar, por favor leé nuestros Términos y Condiciones adjuntos.",
+            "media_url": [f"{request.host_url.rstrip('/')}/media/terms?token={ADMIN_TOKEN}"],
+        }
+        
+        payload_button = {
+            "to": to_whatsapp,
+            "content_sid": TERMS_TEMPLATE_SID,
+        }
+        
+        # Agregar from_ o messaging_service_sid
+        if TWILIO_MESSAGING_SERVICE_SID:
+            payload_pdf["messaging_service_sid"] = TWILIO_MESSAGING_SERVICE_SID
+            payload_button["messaging_service_sid"] = TWILIO_MESSAGING_SERVICE_SID
+        else:
+            payload_pdf["from_"] = TWILIO_WHATSAPP_FROM
+            payload_button["from_"] = TWILIO_WHATSAPP_FROM
+        
+        # Agregar status callback
+        if STATUS_CALLBACK_URL:
+            payload_pdf["status_callback"] = STATUS_CALLBACK_URL
+            payload_button["status_callback"] = STATUS_CALLBACK_URL
+        
+        # 1. Enviar PDF de T&C
+        msg_pdf = client.messages.create(**payload_pdf)
+        
+        # 2. Enviar template con botón "Acepto"
+        msg_button = client.messages.create(**payload_button)
+        
+        print(f"✅ T&C enviados a {to_whatsapp}: PDF={msg_pdf.sid}, Button={msg_button.sid}")
+        
+    except Exception as e:
+        print(f"❌ Error enviando T&C: {e}")
+        
+# ============================================================================
+
 def send_whatsapp_menu_template(to_whatsapp: str, nombre: str = "") -> str | None:
     """
     Envía la plantilla del menú (Quick Reply) vía Content API.
@@ -9073,7 +9258,7 @@ def list_previous_periods_excluding_current(tenant: str, cuil: str, limit: int =
     # ahora periods[0] es el último real anterior al mes actual
     return periods[:limit]
 
-# ============================================================================
+
 # FUNCIONES MULTI-TENANT
 # ============================================================================
 
@@ -9290,9 +9475,33 @@ def twilio_inbound():
     print("INBOUND:", from_whatsapp, "MessageSid:", in_sid, "ButtonPayload:", button, "Body:", body)
 
     # ✅ DEDUP global: si Twilio reintenta el mismo inbound, no hacemos nada
+    # ✅ DEDUP global
     if inbound_seen(in_sid):
         print("DEDUP inbound:", in_sid)
         return Response("OK", status=200)
+
+    # ============================================================================
+    # ✅ DETECTAR ACEPTACIÓN DE T&C
+    # ============================================================================
+    if button == "ACCEPT_TERMS" or "acepto" in body.lower():
+        pending_terms = get_pending_terms(from_whatsapp)
+        
+        if pending_terms:
+            save_terms_acceptance(from_whatsapp)
+            
+            tenant = pending_terms['tenant']
+            cuil = pending_terms['cuil']
+            period = pending_terms['period']
+            origin = pending_terms.get('origin', 'INITIAL')
+            
+            sid_pdf = _send_pdf_flow(from_whatsapp, tenant, cuil, period, origin=origin)
+            
+            clear_pending_terms(from_whatsapp)
+            
+            if not sid_pdf:
+                return twiml("❌ Hubo un error enviando el PDF. Intentá de nuevo o contactá a RRHH.")
+            
+            return Response("OK", status=200)
 
     def _is_receipt_request_text(t: str) -> bool:
         t = (t or "").strip().lower()
@@ -9735,6 +9944,14 @@ def twilio_inbound():
             _log_receipt_request_event(tenant, cuil, period, from_whatsapp, "DNI_OK", "BLOCKED_LIMIT")
             consume_pending_view(pending["id"])
             return twiml(f"⚠️ Ya pediste este recibo {cnt}/3 veces para {period}. Si necesitás más, avisá a RRHH.")
+
+        # ✅ VERIFICAR T&C antes de enviar PDF
+        if not has_accepted_terms(from_whatsapp):
+            origin = (pending.get("origin") or "INITIAL")
+            send_terms_and_conditions(from_whatsapp, tenant, cuil, period)
+            set_pending_terms_acceptance(from_whatsapp, tenant, cuil, period, origin)
+            _log_receipt_request_event(tenant, cuil, period, from_whatsapp, "DNI_OK", "SENT_TERMS")
+            return twiml("✅ DNI verificado.")
 
         # ✅ usar origin del pending (INITIAL si vino del admin)
         origin = (pending.get("origin") or "INITIAL")
