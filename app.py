@@ -4117,10 +4117,6 @@ def init_db():
       );
     """)
 
-    conn.commit()
-    conn.close()
-
-
     # =========
     # ✅ NUEVO: inbound_dedup (para evitar doble procesamiento)
     # =========
@@ -9214,7 +9210,7 @@ def send_terms_and_conditions(to_whatsapp: str, tenant: str, cuil: str, period: 
         
     except Exception as e:
         print(f"❌ Error enviando T&C: {e}")
-        
+
 # ============================================================================
 
 def send_whatsapp_menu_template(to_whatsapp: str, nombre: str = "") -> str | None:
