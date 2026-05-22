@@ -9258,29 +9258,42 @@ def media_terms():
 def send_terms_and_conditions(to_whatsapp: str, tenant: str, cuil: str, period: str):
     """Envía el PDF de T&C con template de aceptación."""
     try:
-        client = _twilio_client()  # ← Corregido
+        # Validar que estén configuradas las variables
+        if not TERMS_TEMPLATE_SID:
+            print(f"❌ ERROR: TERMS_TEMPLATE_SID no está configurado")
+            return None
         
-        # Preparar payload base
+        if not TERMS_PDF_FILE_ID:
+            print(f"❌ ERROR: TERMS_PDF_FILE_ID no está configurado")
+            return None
+        
+        client = _twilio_client()  # ✅ Usar la función correcta
+        
+        # Preparar payload del PDF
         payload_pdf = {
             "to": to_whatsapp,
             "body": "📄 Antes de continuar, por favor leé nuestros Términos y Condiciones adjuntos.",
             "media_url": [f"{request.host_url.rstrip('/')}/media/terms?token={ADMIN_TOKEN}"],
         }
         
+        # Preparar payload del botón
         payload_button = {
             "to": to_whatsapp,
             "content_sid": TERMS_TEMPLATE_SID,
         }
         
-        # Agregar from_ o messaging_service_sid
+        # Agregar from_ o messaging_service_sid (mismo patrón que send_whatsapp_pdf)
         if TWILIO_MESSAGING_SERVICE_SID:
             payload_pdf["messaging_service_sid"] = TWILIO_MESSAGING_SERVICE_SID
             payload_button["messaging_service_sid"] = TWILIO_MESSAGING_SERVICE_SID
-        else:
+        elif TWILIO_WHATSAPP_FROM:
             payload_pdf["from_"] = TWILIO_WHATSAPP_FROM
             payload_button["from_"] = TWILIO_WHATSAPP_FROM
+        else:
+            print(f"❌ ERROR: No hay TWILIO_WHATSAPP_FROM ni TWILIO_MESSAGING_SERVICE_SID configurado")
+            return None
         
-        # Agregar status callback
+        # Agregar status callback si existe
         if STATUS_CALLBACK_URL:
             payload_pdf["status_callback"] = STATUS_CALLBACK_URL
             payload_button["status_callback"] = STATUS_CALLBACK_URL
@@ -9292,10 +9305,11 @@ def send_terms_and_conditions(to_whatsapp: str, tenant: str, cuil: str, period: 
         msg_button = client.messages.create(**payload_button)
         
         print(f"✅ T&C enviados a {to_whatsapp}: PDF={msg_pdf.sid}, Button={msg_button.sid}")
+        return msg_button.sid
         
     except Exception as e:
-        print(f"❌ Error enviando T&C: {e}")
-
+        print(f"❌ Error enviando T&C: {type(e).__name__}: {e}")
+        return None
 # ============================================================================
 
 def send_whatsapp_menu_template(to_whatsapp: str, nombre: str = "") -> str | None:
