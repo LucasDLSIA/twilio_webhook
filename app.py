@@ -10041,12 +10041,19 @@ def twilio_inbound():
             return twiml(f"⚠️ Ya pediste este recibo {cnt}/3 veces para {period}. Si necesitás más, avisá a RRHH.")
 
         # ✅ VERIFICAR T&C antes de enviar PDF
-        if not has_accepted_terms(from_whatsapp):
+        already_accepted = has_accepted_terms(from_whatsapp)
+        print(f"🔍 T&C CHECK (AWAIT_DNI): whatsapp={from_whatsapp}, already_accepted={already_accepted}")
+        print(f"🔍 T&C CONFIG: TERMS_TEMPLATE_SID={TERMS_TEMPLATE_SID[:10] if TERMS_TEMPLATE_SID else 'EMPTY'}, TERMS_PDF_FILE_ID={TERMS_PDF_FILE_ID[:10] if TERMS_PDF_FILE_ID else 'EMPTY'}")
+        
+        if not already_accepted:
             origin = (pending.get("origin") or "INITIAL")
+            print(f"🔍 T&C: Enviando T&C a {from_whatsapp}")
             send_terms_and_conditions(from_whatsapp, tenant, cuil, period)
             set_pending_terms_acceptance(from_whatsapp, tenant, cuil, period, origin)
             _log_receipt_request_event(tenant, cuil, period, from_whatsapp, "DNI_OK", "SENT_TERMS")
             return twiml("✅ DNI verificado.")
+        else:
+            print(f"🔍 T&C: Ya aceptó, enviando PDF directo")
 
         # ✅ usar origin del pending (INITIAL si vino del admin)
         origin = (pending.get("origin") or "INITIAL")
