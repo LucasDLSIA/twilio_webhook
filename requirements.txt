@@ -54,3 +54,5 @@ yarl==1.22.0
 reportlab==4.4.4
 matplotlib
 Flask-Mail==0.9.1
+psycopg2-binary
+"psycopg2-binary==2.9.9" 
