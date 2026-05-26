@@ -3893,15 +3893,55 @@ def init_db():
     conn = get_db_connection()
     cur = conn.cursor()
     
-    # PRAGMA solo funciona en SQLite, ignorar en PostgreSQL
     DATABASE_URL = os.environ.get("DATABASE_URL")
+    
     if not DATABASE_URL:
+        # SQLite only
         cur.execute("PRAGMA journal_mode=WAL;")
         cur.execute("PRAGMA foreign_keys=ON;")
 
-    # =========
-    # pending_views
-    # =========
+    if DATABASE_URL:
+        # PostgreSQL - tablas ya creadas, solo agregar columnas faltantes
+        _try_alter(cur, "ALTER TABLE pending_views ADD COLUMN IF NOT EXISTS step TEXT;")
+        _try_alter(cur, "ALTER TABLE pending_views ADD COLUMN IF NOT EXISTS dni_attempts INTEGER;")
+        _try_alter(cur, "ALTER TABLE pending_views ADD COLUMN IF NOT EXISTS origin TEXT;")
+        _try_alter(cur, "ALTER TABLE pending_views ADD COLUMN IF NOT EXISTS period_offset INTEGER DEFAULT 0;")
+        _try_alter(cur, "ALTER TABLE message_status ADD COLUMN IF NOT EXISTS to_whatsapp TEXT;")
+        _try_alter(cur, "ALTER TABLE message_status ADD COLUMN IF NOT EXISTS tenant TEXT;")
+        _try_alter(cur, "ALTER TABLE message_status ADD COLUMN IF NOT EXISTS cuil TEXT;")
+        _try_alter(cur, "ALTER TABLE message_status ADD COLUMN IF NOT EXISTS period TEXT;")
+        _try_alter(cur, "ALTER TABLE message_status ADD COLUMN IF NOT EXISTS nombre TEXT;")
+        _try_alter(cur, "ALTER TABLE message_status ADD COLUMN IF NOT EXISTS kind TEXT;")
+        _try_alter(cur, "ALTER TABLE message_status ADD COLUMN IF NOT EXISTS created_at BIGINT;")
+        _try_alter(cur, "ALTER TABLE message_status ADD COLUMN IF NOT EXISTS last_status TEXT;")
+        _try_alter(cur, "ALTER TABLE message_status ADD COLUMN IF NOT EXISTS last_status_at BIGINT;")
+        _try_alter(cur, "ALTER TABLE message_status ADD COLUMN IF NOT EXISTS delivered_at BIGINT;")
+        _try_alter(cur, "ALTER TABLE message_status ADD COLUMN IF NOT EXISTS read_at BIGINT;")
+        _try_alter(cur, "ALTER TABLE message_status ADD COLUMN IF NOT EXISTS failed_at BIGINT;")
+        _try_alter(cur, "ALTER TABLE message_status ADD COLUMN IF NOT EXISTS error_code TEXT;")
+        _try_alter(cur, "ALTER TABLE message_status ADD COLUMN IF NOT EXISTS error_message TEXT;")
+        _try_alter(cur, "ALTER TABLE sent_pdfs ADD COLUMN IF NOT EXISTS sign_sent_at BIGINT;")
+        _try_alter(cur, "ALTER TABLE sent_pdfs ADD COLUMN IF NOT EXISTS origin TEXT;")
+        _try_alter(cur, "ALTER TABLE sent_pdfs ADD COLUMN IF NOT EXISTS delivered_at BIGINT;")
+        _try_alter(cur, "ALTER TABLE sent_pdfs ADD COLUMN IF NOT EXISTS read_at BIGINT;")
+        _try_alter(cur, "ALTER TABLE sent_pdfs ADD COLUMN IF NOT EXISTS failed_at BIGINT;")
+        _try_alter(cur, "ALTER TABLE sent_pdfs ADD COLUMN IF NOT EXISTS error_code TEXT;")
+        _try_alter(cur, "ALTER TABLE sent_pdfs ADD COLUMN IF NOT EXISTS error_message TEXT;")
+        _try_alter(cur, "ALTER TABLE sent_pdfs ADD COLUMN IF NOT EXISTS status TEXT;")
+        _try_alter(cur, "ALTER TABLE recibo_estado ADD COLUMN IF NOT EXISTS to_whatsapp TEXT;")
+        _try_alter(cur, "ALTER TABLE recibo_estado ADD COLUMN IF NOT EXISTS observaciones TEXT;")
+        _try_alter(cur, "ALTER TABLE recibo_estado ADD COLUMN IF NOT EXISTS created_at BIGINT;")
+        _try_alter(cur, "ALTER TABLE receipt_request_events ADD COLUMN IF NOT EXISTS requested_at BIGINT;")
+        _try_alter(cur, "ALTER TABLE receipt_request_events ADD COLUMN IF NOT EXISTS created_at BIGINT;")
+        _try_alter(cur, "ALTER TABLE receipt_request_events ADD COLUMN IF NOT EXISTS whatsapp TEXT;")
+        _try_alter(cur, "ALTER TABLE verifications ADD COLUMN IF NOT EXISTS nombre TEXT;")
+        _try_alter(cur, "ALTER TABLE verifications ADD COLUMN IF NOT EXISTS dni_hash TEXT;")
+        _try_alter(cur, "ALTER TABLE verifications ADD COLUMN IF NOT EXISTS dni_last4 TEXT;")
+        conn.commit()
+        conn.close()
+        return
+
+    # SQLite only - crear tablas
     cur.execute("""
     CREATE TABLE IF NOT EXISTS pending_views (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -3919,9 +3959,8 @@ def init_db():
     _try_alter(cur, "ALTER TABLE pending_views ADD COLUMN step TEXT;")
     _try_alter(cur, "ALTER TABLE pending_views ADD COLUMN dni_attempts INTEGER;")
     _try_alter(cur, "ALTER TABLE pending_views ADD COLUMN origin TEXT;")
-    _try_alter(cur, "ALTER TABLE pending_views ADD COLUMN period_offset INTEGER DEFAULT 0;")  # ← NUEVO
+    _try_alter(cur, "ALTER TABLE pending_views ADD COLUMN period_offset INTEGER DEFAULT 0;")
 
-    # (opcional pero recomendado) limpiar duplicados por to_whatsapp antes del índice único
     _try_alter(cur, """
     DELETE FROM pending_views
     WHERE id NOT IN (
@@ -3941,9 +3980,6 @@ def init_db():
     ON pending_views(to_whatsapp);
     """)
 
-    # =========
-    # recibo_estado
-    # =========
     cur.execute("""
       CREATE TABLE IF NOT EXISTS recibo_estado (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -3956,9 +3992,6 @@ def init_db():
       );
     """)
 
-    # =========
-    # message_status
-    # =========
     cur.execute("""
       CREATE TABLE IF NOT EXISTS message_status (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -3979,18 +4012,7 @@ def init_db():
         error_message TEXT
       );
     """)
-    for col, typ in [
-        ("to_whatsapp","TEXT"),("tenant","TEXT"),("cuil","TEXT"),("period","TEXT"),
-        ("nombre","TEXT"),("kind","TEXT"),("created_at","INTEGER"),
-        ("last_status","TEXT"),("last_status_at","INTEGER"),
-        ("delivered_at","INTEGER"),("read_at","INTEGER"),("failed_at","INTEGER"),
-        ("error_code","TEXT"),("error_message","TEXT"),
-    ]:
-        _try_alter(cur, f"ALTER TABLE message_status ADD COLUMN {col} {typ};")
 
-    # =========
-    # template_send_queue (cola de envíos de templates)
-    # =========
     cur.execute("""
     CREATE TABLE IF NOT EXISTS template_send_queue (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -4000,7 +4022,7 @@ def init_db():
         cuil TEXT NOT NULL,
         nombre TEXT,
         require_pdf INTEGER DEFAULT 1,
-        status TEXT DEFAULT 'PENDING',     -- PENDING | SENT | SKIPPED | FAILED
+        status TEXT DEFAULT 'PENDING',
         error TEXT,
         created_at INTEGER NOT NULL,
         updated_at INTEGER,
@@ -4009,21 +4031,7 @@ def init_db():
         UNIQUE(tenant, period, to_whatsapp, cuil)
     );
     """)
-    _try_alter(cur, "ALTER TABLE template_send_queue ADD COLUMN nombre TEXT;")
-    _try_alter(cur, "ALTER TABLE template_send_queue ADD COLUMN require_pdf INTEGER;")
-    _try_alter(cur, "ALTER TABLE template_send_queue ADD COLUMN status TEXT;")
-    _try_alter(cur, "ALTER TABLE template_send_queue ADD COLUMN error TEXT;")
-    _try_alter(cur, "ALTER TABLE template_send_queue ADD COLUMN created_at INTEGER;")
-    _try_alter(cur, "ALTER TABLE template_send_queue ADD COLUMN updated_at INTEGER;")
-    _try_alter(cur, "ALTER TABLE template_send_queue ADD COLUMN sent_sid TEXT;")
-    _try_alter(cur, "ALTER TABLE template_send_queue ADD COLUMN sent_at INTEGER;")
 
-    _try_alter(cur, "CREATE INDEX IF NOT EXISTS idx_ts_queue_pending ON template_send_queue(status, tenant, period, created_at);")
-
-    
-    # =========
-    # sent_pdfs
-    # =========
     cur.execute("""
       CREATE TABLE IF NOT EXISTS sent_pdfs (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -4037,11 +4045,7 @@ def init_db():
         origin TEXT
       );
     """)
-    _try_alter(cur, "ALTER TABLE sent_pdfs ADD COLUMN sign_sent_at INTEGER;")
-    _try_alter(cur, "ALTER TABLE sent_pdfs ADD COLUMN origin TEXT;")
-    # =========
-    # verifications (ya la usás)
-    # =========
+
     cur.execute("""
       CREATE TABLE IF NOT EXISTS verifications (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -4056,15 +4060,7 @@ def init_db():
         UNIQUE(tenant, cuil, to_whatsapp)
       );
     """)
-    _try_alter(cur, "ALTER TABLE verifications ADD COLUMN nombre TEXT;")
-    _try_alter(cur, "ALTER TABLE verifications ADD COLUMN dni_hash TEXT;")
-    _try_alter(cur, "ALTER TABLE verifications ADD COLUMN dni_last4 TEXT;")
-    _try_alter(cur, "ALTER TABLE verifications ADD COLUMN verified_at INTEGER;")
-    _try_alter(cur, "ALTER TABLE verifications ADD COLUMN updated_at INTEGER;")
 
-    # =========
-    # ✅ NUEVO: receipt_requests (contador por período)
-    # =========
     cur.execute("""
       CREATE TABLE IF NOT EXISTS receipt_requests (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -4079,30 +4075,21 @@ def init_db():
       );
     """)
 
-    #    # =========
-    # ✅ NUEVO: receipt_request_events (log evento por evento)
-    # =========
     cur.execute("""
     CREATE TABLE IF NOT EXISTS receipt_request_events (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    tenant TEXT,
-    cuil TEXT,
-    period TEXT,
-    to_whatsapp TEXT,
-    source TEXT,        -- VIEW_NOW, RESEND_LAST, DNI_OK, CHOOSE_PREVIOUS, USER_TEXT...
-    result TEXT,        -- SENT, ERROR, ASK_DNI, NO_CONTEXT, NO_PDF, BLOCKED_LIMIT...
-    message_sid TEXT,
-    created_at INTEGER, -- timestamp evento
-    origin TEXT         -- INITIAL / RESEND_LAST / CHOOSE_PREVIOUS (o el mismo source)
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        tenant TEXT,
+        cuil TEXT,
+        period TEXT,
+        to_whatsapp TEXT,
+        source TEXT,
+        result TEXT,
+        message_sid TEXT,
+        created_at INTEGER,
+        origin TEXT
     )
     """)
-    
-    _try_alter(cur, "ALTER TABLE receipt_request_events ADD COLUMN created_at INTEGER;")
-    _try_alter(cur, "CREATE INDEX IF NOT EXISTS idx_rre_key ON receipt_request_events(tenant,cuil,period,to_whatsapp,created_at);")
 
-    # =========
-    # ✅ NUEVO: terms_accepted (registro de aceptación de T&C)
-    # =========
     cur.execute("""
       CREATE TABLE IF NOT EXISTS terms_accepted (
         whatsapp TEXT PRIMARY KEY,
@@ -4112,9 +4099,6 @@ def init_db():
       );
     """)
 
-    # =========
-    # ✅ NUEVO: pending_terms (esperando aceptación de T&C)
-    # =========
     cur.execute("""
       CREATE TABLE IF NOT EXISTS pending_terms (
         whatsapp TEXT PRIMARY KEY,
@@ -4126,9 +4110,6 @@ def init_db():
       );
     """)
 
-    # =========
-    # ✅ NUEVO: inbound_dedup (para evitar doble procesamiento)
-    # =========
     cur.execute("""
       CREATE TABLE IF NOT EXISTS inbound_dedup (
         message_sid TEXT PRIMARY KEY,
@@ -4136,9 +4117,6 @@ def init_db():
       );
     """)
 
-    # ========================================
-    # Tabla para selección multi-tenant
-    # ========================================
     cur.execute("""
         CREATE TABLE IF NOT EXISTS multi_tenant_selection (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -4148,30 +4126,7 @@ def init_db():
             expires_at INTEGER NOT NULL
         )
     """)
-    
-    _try_alter(cur, """
-        CREATE INDEX IF NOT EXISTS idx_multi_tenant_expires 
-        ON multi_tenant_selection(expires_at)
-    """)
 
-
-
-    # índices útiles
-    _try_alter(cur, "CREATE INDEX IF NOT EXISTS idx_pending_to_created ON pending_views(to_whatsapp, created_at);")
-    _try_alter(cur, "CREATE INDEX IF NOT EXISTS idx_estado_key ON recibo_estado(tenant, cuil, period);")
-    _try_alter(cur, "CREATE INDEX IF NOT EXISTS idx_msg_key ON message_status(tenant, cuil, period, kind);")
-    _try_alter(cur, "CREATE INDEX IF NOT EXISTS idx_msg_sid ON message_status(message_sid);")
-    _try_alter(cur, "CREATE INDEX IF NOT EXISTS idx_sentpdfs_sid ON sent_pdfs(message_sid);")
-    _try_alter(cur, "CREATE INDEX IF NOT EXISTS idx_verif_tenant_cuil ON verifications(tenant, cuil);")
-    _try_alter(cur, "CREATE INDEX IF NOT EXISTS idx_verif_tenant_wa ON verifications(tenant, to_whatsapp);")
-    _try_alter(cur, "CREATE INDEX IF NOT EXISTS idx_rr_key ON receipt_requests(tenant, cuil, period, to_whatsapp);")
-    _try_alter(cur, "CREATE INDEX IF NOT EXISTS idx_rre_key ON receipt_request_events(tenant, cuil, period, to_whatsapp, created_at);")
-
-    # ========================================
-    # Tablas para portal de clientes
-    # ========================================
-    
-    # Usuarios del portal (uno por empresa)
     cur.execute("""
         CREATE TABLE IF NOT EXISTS client_users (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -4189,8 +4144,7 @@ def init_db():
             UNIQUE(tenant, username)
         )
     """)
-    
-    # Tokens para reset de contraseña
+
     cur.execute("""
         CREATE TABLE IF NOT EXISTS password_reset_tokens (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -4204,7 +4158,6 @@ def init_db():
         )
     """)
 
-    # Log de auditoría del portal
     cur.execute("""
         CREATE TABLE IF NOT EXISTS client_audit_log (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -4216,9 +4169,21 @@ def init_db():
             created_at INTEGER NOT NULL
         )
     """)
+
+    _try_alter(cur, "CREATE INDEX IF NOT EXISTS idx_pending_to_created ON pending_views(to_whatsapp, created_at);")
+    _try_alter(cur, "CREATE INDEX IF NOT EXISTS idx_estado_key ON recibo_estado(tenant, cuil, period);")
+    _try_alter(cur, "CREATE INDEX IF NOT EXISTS idx_msg_key ON message_status(tenant, cuil, period, kind);")
+    _try_alter(cur, "CREATE INDEX IF NOT EXISTS idx_msg_sid ON message_status(message_sid);")
+    _try_alter(cur, "CREATE INDEX IF NOT EXISTS idx_sentpdfs_sid ON sent_pdfs(message_sid);")
+    _try_alter(cur, "CREATE INDEX IF NOT EXISTS idx_verif_tenant_cuil ON verifications(tenant, cuil);")
+    _try_alter(cur, "CREATE INDEX IF NOT EXISTS idx_verif_tenant_wa ON verifications(tenant, to_whatsapp);")
+    _try_alter(cur, "CREATE INDEX IF NOT EXISTS idx_rr_key ON receipt_requests(tenant, cuil, period, to_whatsapp);")
+    _try_alter(cur, "CREATE INDEX IF NOT EXISTS idx_rre_key ON receipt_request_events(tenant, cuil, period, to_whatsapp, created_at);")
+    _try_alter(cur, "CREATE INDEX IF NOT EXISTS idx_multi_tenant_expires ON multi_tenant_selection(expires_at);")
+    _try_alter(cur, "CREATE INDEX IF NOT EXISTS idx_ts_queue_pending ON template_send_queue(status, tenant, period, created_at);")
+
     conn.commit()
     conn.close()
-
 
 init_db()
 
