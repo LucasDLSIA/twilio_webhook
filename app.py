@@ -3643,8 +3643,9 @@ def mark_sign_sent(pdf_sid: str):
     conn.close()
 
 
-
 import psycopg2
+from psycopg2.extras import RealDictCursor
+
 # =========================
 # DB: pending view + estado firma
 # =========================
