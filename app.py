@@ -3644,17 +3644,22 @@ def mark_sign_sent(pdf_sid: str):
 
 
 
-
+import psycopg2
 # =========================
 # DB: pending view + estado firma
 # =========================
 DB_PATH = os.environ.get("DB_PATH", "/data/app.db")
 
-
 def get_db_connection():
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    return conn
+    DATABASE_URL = os.environ.get("DATABASE_URL")
+    if DATABASE_URL:
+        conn = psycopg2.connect(DATABASE_URL)
+        conn.cursor_factory = RealDictCursor
+        return conn
+    else:
+        conn = sqlite3.connect(DB_PATH)
+        conn.row_factory = sqlite3.Row
+        return conn
 
 def get_latest_context_for_whatsapp(to_whatsapp: str) -> dict | None:
     """
