@@ -6325,7 +6325,7 @@ def get_queue_stats(tenant: str, period: str) -> dict:
       WHERE tenant=%s AND period=%s
       GROUP BY status
     """, (tenant, period))
-    d = {r[0]: r[1] for r in cur.fetchall()}
+    d = {r['status']: r['n'] for r in cur.fetchall()}
     conn.close()
     # asegurar claves
     for k in ("PENDING","SENT","FAILED","SKIPPED"):
@@ -8478,7 +8478,7 @@ def count_queue_status(tenant: str, period: str) -> dict:
       WHERE tenant=%s AND period=%s
       GROUP BY status
     """, (tenant, period))
-    d = {r[0]: r[1] for r in cur.fetchall()}
+    d = {r['status']: r['n'] for r in cur.fetchall()}
     conn.close()
     return d
 
