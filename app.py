@@ -3892,9 +3892,12 @@ def _try_alter(cur, sql: str):
 def init_db():
     conn = get_db_connection()
     cur = conn.cursor()
-
-    cur.execute("PRAGMA journal_mode=WAL;")
-    cur.execute("PRAGMA synchronous=NORMAL;")
+    
+    # PRAGMA solo funciona en SQLite, ignorar en PostgreSQL
+    DATABASE_URL = os.environ.get("DATABASE_URL")
+    if not DATABASE_URL:
+        cur.execute("PRAGMA journal_mode=WAL;")
+        cur.execute("PRAGMA foreign_keys=ON;")
 
     # =========
     # pending_views
