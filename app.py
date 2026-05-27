@@ -4221,6 +4221,7 @@ def inbound_seen(message_sid: str) -> bool:
     cur = conn.cursor()
     cur.execute("INSERT INTO inbound_dedup(message_sid, created_at) VALUES (%s, %s) ON CONFLICT (message_sid) DO NOTHING", (message_sid, now))
     conn.commit()
+    
     inserted = (cur.rowcount == 1)
     conn.close()
     return (not inserted)  # True si ya existía
