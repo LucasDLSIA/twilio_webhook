@@ -1412,19 +1412,19 @@ def portal_dashboard():
         html.append("<h2>🎯 Acciones rápidas</h2>")
         html.append("<div class='actions'>")
         
-        html.append(f"<a href='/portal/search%speriod={esc(selected_period)}' class='action-card'>")
+        html.append(f"<a href='/portal/search?period={esc(selected_period)}' class='action-card'>")
         html.append("<div class='action-icon'>🔍</div>")
         html.append("<div class='action-title'>Buscar empleado</div>")
         html.append("<div class='action-desc'>Por nombre, CUIL o DNI</div>")
         html.append("</a>")
-        
-        html.append(f"<a href='/portal/pendientes%speriod={esc(selected_period)}' class='action-card'>")
+
+        html.append(f"<a href='/portal/pendientes?period={esc(selected_period)}' class='action-card'>")
         html.append("<div class='action-icon'>⚠️</div>")
         html.append("<div class='action-title'>Ver pendientes</div>")
         html.append(f"<div class='action-desc'>{kpis['pendientes']} sin firmar</div>")
         html.append("</a>")
-        
-        html.append(f"<a href='/portal/reports%speriod={esc(selected_period)}' class='action-card'>")
+
+        html.append(f"<a href='/portal/reports?period={esc(selected_period)}' class='action-card'>")
         html.append("<div class='action-icon'>📊</div>")
         html.append("<div class='action-title'>Reportes</div>")
         html.append("<div class='action-desc'>Descargar PDF y Excel</div>")
@@ -6068,7 +6068,7 @@ def admin_verifications_import():
 def admin_verifications_update():
     token = _get_admin_token_from_request()
     tenant = (request.form.get("tenant") or "").strip().lower()
-    return redirect(f"/admin/panel%stenant={tenant}&token={token}&msg=verif_update_disabled")
+    return redirect(f"/admin/panel?tenant={tenant}&token={token}&msg=verif_update_disabled")
 
 
 @app.post("/admin/verifications_delete")
@@ -6092,7 +6092,7 @@ def admin_verifications_delete():
     conn.commit()
     conn.close()
 
-    return redirect(f"/admin/panel%stenant={tenant}&token={token}&msg=verif_deleted")
+    return redirect(f"/admin/panel?tenant={tenant}&token={token}&msg=verif_deleted")
 
 from io import BytesIO
 from openpyxl import Workbook
@@ -7136,7 +7136,7 @@ def admin_panel():
     html.append("<h3>👀 Preview Excel de envíos</h3>")
     html.append(f"<div class='muted'>Filas: <b>{len(envios_rows)}</b></div>")
     html.append("</div>")
-    html.append(f"<a class='btn secondary' href='/admin/panel%stenant={esc(tenant)}&token={esc(token)}&refresh=1&period={esc(selected_period or '')}'>🔄 Refrescar</a>")
+    html.append(f"<a class='btn secondary' href='/admin/panel?tenant={esc(tenant)}&token={esc(token)}&refresh=1&period={esc(selected_period or '')}'>🔄 Refrescar</a>")
     html.append("</div>")
     html.append("<div class='sep'></div>")
 
@@ -7203,7 +7203,7 @@ def admin_portal_users():
         elif action == "delete":
             user_id = int(request.form.get("user_id", 0))
             delete_client_user(user_id)
-            return redirect(f"/admin/portal_users%stoken={token}&msg=deleted")
+            return redirect(f"/admin/portal_users?token={token}&msg=deleted")
     
     # Listar usuarios
     users = get_all_client_users()
@@ -7993,7 +7993,7 @@ def admin_verifications_delete_bulk():
     conn.commit()
     conn.close()
 
-    return redirect(f"/admin/panel%stenant={tenant}&token={token}&msg=verif_bulk_deleted&n={n}")
+    return redirect(f"/admin/panel?tenant={tenant}&token={token}&msg=verif_bulk_deleted&n={n}")
 
 
 
