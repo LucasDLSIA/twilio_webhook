@@ -4214,7 +4214,6 @@ def inbound_seen(message_sid: str) -> bool:
     cur.execute("INSERT INTO inbound_dedup(message_sid, created_at) VALUES (%s, %s) ON CONFLICT (message_sid) DO NOTHING", (message_sid, now))
     conn.commit()
     
-    
     inserted = (cur.rowcount == 1)
     conn.close()
     return (not inserted)  # True si ya existía
@@ -6126,11 +6125,13 @@ def generate_excel_report_v2(tenant: str, period_filter: str = "") -> BytesIO:
     """, (tenant,))
     msg_rows = cur.fetchall()
 
-    # pending_views (último period por (whatsapp,cuil))
+    # pending_views (último period por whatsapp)
     cur.execute("""
-        SELECT to_whatsapp, tenant, cuil, period, MAX(created_at) as last_ts
+        SELECT DISTINCT ON (to_whatsapp)
+            to_whatsapp, tenant, cuil, period, created_at AS last_ts
         FROM pending_views
         WHERE tenant = %s
+        ORDER BY to_whatsapp, created_at DESC
     """, (tenant,))
     pv_rows = cur.fetchall()
 
