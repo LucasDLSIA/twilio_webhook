@@ -538,8 +538,12 @@ def ensure_sqlite_columns(table: str, columns: dict[str, str]) -> None:
     conn = get_db_connection()
     cur = conn.cursor()
 
-    cur.execute(f"PRAGMA table_info({table});")
-    existing = {row[1] for row in cur.fetchall()}  # row[1] = name
+    cur.execute("""
+        SELECT column_name AS name
+        FROM information_schema.columns
+        WHERE table_name = %s
+    """, (table,))
+    existing = {row['name'] for row in cur.fetchall()}  # row['name'] = name
 
     for col, col_type in columns.items():
         if col not in existing:
@@ -804,12 +808,13 @@ def create_client_user(tenant: str, username: str, email: str, full_name: str, c
     # Crear usuario
     now = int(time.time())
     cur.execute("""
-        INSERT INTO client_users 
+        INSERT INTO client_users
         (tenant, username, password_hash, email, full_name, role, active, must_change_password, created_at, created_by)
-        VALUES (%s, %s, %s, %s, %s, 'admin', 1, 1, %s, %s)
+        VALUES (%s, %s, %s, %s, %s, 'admin', TRUE, TRUE, %s, %s)
+        RETURNING id
     """, (tenant, username, password_hash, email, full_name, now, created_by))
-    
-    user_id = cur.lastrowid
+
+    user_id = cur.fetchone()['id']
     conn.commit()
     conn.close()
     
@@ -856,7 +861,7 @@ def toggle_client_user_active(user_id: int):
     """
     conn = get_db_connection()
     cur = conn.cursor()
-    cur.execute("UPDATE client_users SET active = 1 - active WHERE id = %s", (user_id,))
+    cur.execute("UPDATE client_users SET active = NOT active WHERE id = %s", (user_id,))
     conn.commit()
     conn.close()
 
@@ -948,7 +953,7 @@ def change_portal_password(user_id: int, new_password: str):
     cur = conn.cursor()
     cur.execute("""
         UPDATE client_users 
-        SET password_hash = %s, must_change_password = 0
+        SET password_hash = %s, must_change_password = FALSE
         WHERE id = %s
     """, (password_hash, user_id))
     conn.commit()
@@ -1148,38 +1153,38 @@ def portal_dashboard():
         
         # KPIs actuales
         cur.execute("""
-            SELECT COUNT(DISTINCT cuil) 
-            FROM message_status 
+            SELECT COUNT(DISTINCT cuil) AS total
+            FROM message_status
             WHERE tenant = %s AND period = %s AND kind = 'template'
         """, (tenant, selected_period))
-        enviados = cur.fetchone()[0] or 0
-        
+        enviados = cur.fetchone()['total'] or 0
+
         cur.execute("""
-            SELECT COUNT(DISTINCT cuil)
+            SELECT COUNT(DISTINCT cuil) AS total
             FROM sent_pdfs
             WHERE tenant = %s AND period = %s
         """, (tenant, selected_period))
-        vistos = cur.fetchone()[0] or 0
-        
+        vistos = cur.fetchone()['total'] or 0
+
         cur.execute("""
-            SELECT COUNT(DISTINCT cuil)
+            SELECT COUNT(DISTINCT cuil) AS total
             FROM recibo_estado
             WHERE tenant = %s AND period = %s AND estado IN ('FIRMADO', 'OBSERVADO')
         """, (tenant, selected_period))
-        firmados = cur.fetchone()[0] or 0
-        
+        firmados = cur.fetchone()['total'] or 0
+
         # Tiempo promedio de firma
         cur.execute("""
-            SELECT AVG(re.updated_at - ms.created_at) / 86400.0
+            SELECT AVG(re.updated_at - ms.created_at) / 86400.0 AS avg_days
             FROM recibo_estado re
-            JOIN message_status ms ON ms.tenant = re.tenant 
-                AND ms.cuil = re.cuil 
-                AND ms.period = re.period 
+            JOIN message_status ms ON ms.tenant = re.tenant
+                AND ms.cuil = re.cuil
+                AND ms.period = re.period
                 AND ms.kind = 'template'
-            WHERE re.tenant = %s AND re.period = %s 
+            WHERE re.tenant = %s AND re.period = %s
                 AND re.estado IN ('FIRMADO', 'OBSERVADO')
         """, (tenant, selected_period))
-        avg_days = cur.fetchone()[0]
+        avg_days = cur.fetchone()['avg_days']
         avg_days = round(avg_days, 1) if avg_days else 0
         
         pendientes = enviados - firmados
@@ -1202,25 +1207,25 @@ def portal_dashboard():
         periods_data = []
         for p in last_6_periods:
             cur.execute("""
-                SELECT COUNT(DISTINCT cuil) 
-                FROM message_status 
+                SELECT COUNT(DISTINCT cuil) AS total
+                FROM message_status
                 WHERE tenant = %s AND period = %s AND kind = 'template'
             """, (tenant, p))
-            env = cur.fetchone()[0] or 0
-            
+            env = cur.fetchone()['total'] or 0
+
             cur.execute("""
-                SELECT COUNT(DISTINCT cuil)
+                SELECT COUNT(DISTINCT cuil) AS total
                 FROM sent_pdfs
                 WHERE tenant = %s AND period = %s
             """, (tenant, p))
-            vis = cur.fetchone()[0] or 0
-            
+            vis = cur.fetchone()['total'] or 0
+
             cur.execute("""
-                SELECT COUNT(DISTINCT cuil)
+                SELECT COUNT(DISTINCT cuil) AS total
                 FROM recibo_estado
                 WHERE tenant = %s AND period = %s AND estado IN ('FIRMADO', 'OBSERVADO')
             """, (tenant, p))
-            fir = cur.fetchone()[0] or 0
+            fir = cur.fetchone()['total'] or 0
             
             periods_data.append({
                 'period': p,
@@ -1585,18 +1590,18 @@ def portal_calendario():
     periods_stats = []
     for period in period_labels:
         cur.execute("""
-            SELECT COUNT(DISTINCT cuil) 
-            FROM message_status 
+            SELECT COUNT(DISTINCT cuil) AS total
+            FROM message_status
             WHERE tenant = %s AND period = %s AND kind = 'template'
         """, (tenant, period))
-        enviados = cur.fetchone()[0] or 0
-        
+        enviados = cur.fetchone()['total'] or 0
+
         cur.execute("""
-            SELECT COUNT(DISTINCT cuil)
+            SELECT COUNT(DISTINCT cuil) AS total
             FROM recibo_estado
             WHERE tenant = %s AND period = %s AND estado IN ('FIRMADO', 'OBSERVADO')
         """, (tenant, period))
-        firmados = cur.fetchone()[0] or 0
+        firmados = cur.fetchone()['total'] or 0
         
         pct = int((firmados / enviados * 100)) if enviados > 0 else 0
         
@@ -1853,7 +1858,7 @@ def portal_search():
             SELECT DISTINCT cuil FROM message_status
             WHERE tenant = %s AND period = %s AND kind = 'template'
         """, (tenant, period))
-        cuils_enviados = [r[0] for r in cur.fetchall()]
+        cuils_enviados = [r['cuil'] for r in cur.fetchall()]
         
         # Cargar envíos
         envios = load_envios_rows(tenant)
@@ -1899,22 +1904,22 @@ def portal_search():
                 estado_row = cur.fetchone()
                 
                 # Determinar estado
-                if estado_row and estado_row[0] in ('FIRMADO', 'OBSERVADO'):
+                if estado_row and estado_row['estado'] in ('FIRMADO', 'OBSERVADO'):
                     status = 'firmado'
                     status_emoji = '✅'
-                    status_text = 'Firmado' if estado_row[0] == 'FIRMADO' else 'Observado'
+                    status_text = 'Firmado' if estado_row['estado'] == 'FIRMADO' else 'Observado'
                 elif pdf_row:
                     status = 'visto'
                     status_emoji = '👁️'
                     status_text = 'Visto, no firmado'
-                    days_ago = int((time.time() - pdf_row[0]) / 86400) if pdf_row[0] else 0
+                    days_ago = int((time.time() - pdf_row['created_at']) / 86400) if pdf_row['created_at'] else 0
                     if days_ago > 0:
                         status_text += f' (hace {days_ago}d)'
                 elif template_row:
                     status = 'enviado'
                     status_emoji = '⚠️'
                     status_text = 'No visto'
-                    days_ago = int((time.time() - template_row[0]) / 86400) if template_row[0] else 0
+                    days_ago = int((time.time() - template_row['created_at']) / 86400) if template_row['created_at'] else 0
                     if days_ago > 0:
                         status_text += f' (hace {days_ago}d)'
                 else:
@@ -2089,7 +2094,7 @@ def portal_historial(cuil):
         WHERE tenant = %s AND cuil = %s AND kind = 'template'
         ORDER BY period DESC
     """, (tenant, cuil))
-    periods = [r[0] for r in cur.fetchall()]
+    periods = [r['period'] for r in cur.fetchall()]
     
     historial = []
     for period in periods:
@@ -2118,26 +2123,26 @@ def portal_historial(cuil):
         estado_row = cur.fetchone()
         
         # Calcular tiempos
-        enviado_ts = template_row[0] if template_row else None
-        visto_ts = pdf_row[0] if pdf_row else None
-        firmado_ts = estado_row[1] if estado_row else None
-        
+        enviado_ts = template_row['created_at'] if template_row else None
+        visto_ts = pdf_row['created_at'] if pdf_row else None
+        firmado_ts = estado_row['updated_at'] if estado_row else None
+
         tiempo_ver = None
         tiempo_firmar = None
-        
+
         if enviado_ts and visto_ts:
             tiempo_ver = int((visto_ts - enviado_ts) / 3600)  # horas
-        
+
         if visto_ts and firmado_ts:
             tiempo_firmar = int((firmado_ts - visto_ts) / 3600)  # horas
         elif enviado_ts and firmado_ts:
             tiempo_firmar = int((firmado_ts - enviado_ts) / 3600)  # horas
-        
+
         # Determinar estado
-        if estado_row and estado_row[0] in ('FIRMADO', 'OBSERVADO'):
+        if estado_row and estado_row['estado'] in ('FIRMADO', 'OBSERVADO'):
             status = 'firmado'
             status_emoji = '✅'
-            status_text = 'Firmado' if estado_row[0] == 'FIRMADO' else 'Observado'
+            status_text = 'Firmado' if estado_row['estado'] == 'FIRMADO' else 'Observado'
             status_class = 'success'
         elif pdf_row:
             status = 'visto'
@@ -2436,7 +2441,7 @@ def portal_reports():
                 WHERE tenant = %s AND period = %s AND kind = 'template'
                 ORDER BY cuil
             """, (tenant, period))
-            cuils = [r[0] for r in cur.fetchall()]
+            cuils = [r['cuil'] for r in cur.fetchall()]
             
         elif action == "export_pending_views":
             ws.title = "No vieron"
@@ -2489,9 +2494,9 @@ def portal_reports():
                 """, (tenant, cuil, period))
                 estado_row = cur.fetchone()
                 
-                if estado_row and estado_row[0] in ('FIRMADO', 'OBSERVADO'):
-                    status = estado_row[0]
-                    firmado_fecha = ts_str(estado_row[1]) if estado_row[1] else ""
+                if estado_row and estado_row['estado'] in ('FIRMADO', 'OBSERVADO'):
+                    status = estado_row['estado']
+                    firmado_fecha = ts_str(estado_row['updated_at']) if estado_row['updated_at'] else ""
                 elif pdf_row:
                     status = "VISTO"
                     firmado_fecha = ""
@@ -2501,9 +2506,9 @@ def portal_reports():
                 else:
                     status = "NO_ENVIADO"
                     firmado_fecha = ""
-                
-                enviado_fecha = ts_str(template_row[0]) if template_row else ""
-                visto_fecha = ts_str(pdf_row[0]) if pdf_row else ""
+
+                enviado_fecha = ts_str(template_row['created_at']) if template_row else ""
+                visto_fecha = ts_str(pdf_row['created_at']) if pdf_row else ""
                 
                 ws.append([nombre, cuil, whatsapp, status, enviado_fecha, visto_fecha, firmado_fecha])
             
@@ -2516,11 +2521,11 @@ def portal_reports():
                 """, (tenant, cuil, period))
                 template_row = cur.fetchone()
                 
-                enviado_fecha = ts_str(template_row[0]) if template_row else ""
-                days_ago = int((time.time() - template_row[0]) / 86400) if template_row else 0
-                
+                enviado_fecha = ts_str(template_row['created_at']) if template_row else ""
+                days_ago = int((time.time() - template_row['created_at']) / 86400) if template_row else 0
+
                 ws.append([nombre, cuil, whatsapp, enviado_fecha, days_ago])
-            
+
             elif action == "export_pending_sigs":
                 # Solo los que no firmaron
                 cur.execute("""
@@ -2529,9 +2534,9 @@ def portal_reports():
                     LIMIT 1
                 """, (tenant, cuil, period))
                 pdf_row = cur.fetchone()
-                
-                pdf_fecha = ts_str(pdf_row[0]) if pdf_row else ""
-                days_ago = int((time.time() - pdf_row[0]) / 86400) if pdf_row else 0
+
+                pdf_fecha = ts_str(pdf_row['created_at']) if pdf_row else ""
+                days_ago = int((time.time() - pdf_row['created_at']) / 86400) if pdf_row else 0
                 
                 ws.append([nombre, cuil, whatsapp, pdf_fecha, days_ago])
         
@@ -2563,35 +2568,35 @@ def portal_reports():
         cur = conn.cursor()
         
         cur.execute("""
-            SELECT COUNT(DISTINCT cuil) FROM message_status 
+            SELECT COUNT(DISTINCT cuil) AS total FROM message_status
             WHERE tenant = %s AND period = %s AND kind = 'template'
         """, (tenant, period))
-        enviados = cur.fetchone()[0] or 0
-        
+        enviados = cur.fetchone()['total'] or 0
+
         cur.execute("""
-            SELECT COUNT(DISTINCT cuil) FROM sent_pdfs
+            SELECT COUNT(DISTINCT cuil) AS total FROM sent_pdfs
             WHERE tenant = %s AND period = %s
         """, (tenant, period))
-        vistos = cur.fetchone()[0] or 0
-        
+        vistos = cur.fetchone()['total'] or 0
+
         cur.execute("""
-            SELECT COUNT(DISTINCT cuil) FROM recibo_estado
+            SELECT COUNT(DISTINCT cuil) AS total FROM recibo_estado
             WHERE tenant = %s AND period = %s AND estado IN ('FIRMADO', 'OBSERVADO')
         """, (tenant, period))
-        firmados = cur.fetchone()[0] or 0
-        
+        firmados = cur.fetchone()['total'] or 0
+
         # Tiempo promedio de firma
         cur.execute("""
-            SELECT AVG(re.updated_at - ms.created_at) / 86400.0
+            SELECT AVG(re.updated_at - ms.created_at) / 86400.0 AS avg_days
             FROM recibo_estado re
-            JOIN message_status ms ON ms.tenant = re.tenant 
-                AND ms.cuil = re.cuil 
-                AND ms.period = re.period 
+            JOIN message_status ms ON ms.tenant = re.tenant
+                AND ms.cuil = re.cuil
+                AND ms.period = re.period
                 AND ms.kind = 'template'
-            WHERE re.tenant = %s AND re.period = %s 
+            WHERE re.tenant = %s AND re.period = %s
                 AND re.estado IN ('FIRMADO', 'OBSERVADO')
         """, (tenant, period))
-        avg_days = cur.fetchone()[0]
+        avg_days = cur.fetchone()['avg_days']
         avg_days = round(avg_days, 1) if avg_days else 0
         
         conn.close()
@@ -3099,7 +3104,7 @@ def mark_reset_token_used(token: str):
     """
     conn = get_db_connection()
     cur = conn.cursor()
-    cur.execute("UPDATE password_reset_tokens SET used = 1 WHERE token = %s", (token,))
+    cur.execute("UPDATE password_reset_tokens SET used = TRUE WHERE token = %s", (token,))
     conn.commit()
     conn.close()
 
@@ -3478,12 +3483,16 @@ def twilio_status():
         r = cur.fetchone()
 
         if r:
-            tenant, cuil, period, to_whatsapp = r
+            tenant = r['tenant']
+            cuil = r['cuil']
+            period = r['period']
+            to_whatsapp = r['to_whatsapp']
             # creamos fila mínima en message_status para que el callback pueda registrar delivered/read
             cur.execute("""
-                INSERT OR IGNORE INTO message_status
+                INSERT INTO message_status
                 (message_sid, to_whatsapp, tenant, cuil, period, nombre, kind, created_at, last_status, last_status_at)
                 VALUES (%s, %s, %s, %s, %s, '', 'media', %s, %s, %s)
+                ON CONFLICT (message_sid) DO NOTHING
             """, (sid, to_whatsapp, tenant, cuil, period, now, status, now))
 
             # volver a aplicar update (por si insertó recién)
@@ -3532,17 +3541,17 @@ def twilio_status():
         cur.execute("""
             UPDATE message_status
             SET failed_at = COALESCE(failed_at, %s),
-                error_code = COALESCE(NULLIF(?, ''), error_code),
-                error_message = COALESCE(NULLIF(?, ''), error_message)
+                error_code = COALESCE(NULLIF(%s, ''), error_code),
+                error_message = COALESCE(NULLIF(%s, ''), error_message)
             WHERE message_sid = %s
         """, (now, error_code, error_message, sid))
-        
+
         # ✅ TAMBIÉN actualizar sent_pdfs
         cur.execute("""
             UPDATE sent_pdfs
             SET failed_at = COALESCE(failed_at, %s),
-                error_code = COALESCE(NULLIF(?, ''), error_code),
-                error_message = COALESCE(NULLIF(?, ''), error_message),
+                error_code = COALESCE(NULLIF(%s, ''), error_code),
+                error_message = COALESCE(NULLIF(%s, ''), error_message),
                 status = 'failed'
             WHERE message_sid = %s
         """, (now, error_code, error_message, sid))
@@ -3551,7 +3560,7 @@ def twilio_status():
         # 4) SIGN después de delivered (solo INITIAL) + estado A_FINALIZAR
     if status == "delivered":
         cur.execute("""
-            SELECT tenant, cuil, period, to_whatsapp, sign_sent_at, COALESCE(origin, 'INITIAL')
+            SELECT tenant, cuil, period, to_whatsapp, sign_sent_at, COALESCE(origin, 'INITIAL') AS origin
             FROM sent_pdfs
             WHERE message_sid = %s
             LIMIT 1
@@ -3559,7 +3568,12 @@ def twilio_status():
         row = cur.fetchone()
 
         if row:
-            tenant, cuil, period, to_whatsapp, sign_sent_at, origin = row
+            tenant = row['tenant']
+            cuil = row['cuil']
+            period = row['period']
+            to_whatsapp = row['to_whatsapp']
+            sign_sent_at = row['sign_sent_at']
+            origin = row['origin']
             tenant = (tenant or "").strip().lower()
             cuil = norm_cuil(cuil)
             period = norm_period_label(period)
@@ -3581,7 +3595,8 @@ def twilio_status():
                 WHERE tenant=%s AND cuil=%s AND period=%s
                 LIMIT 1
             """, (tenant, cuil, period))
-            est = (cur.fetchone() or [None])[0]
+            _est_row = cur.fetchone()
+            est = _est_row['estado'] if _est_row else None
 
             # Si es reenvío, NO firmar nunca
             if origin != "INITIAL":
@@ -3600,9 +3615,10 @@ def twilio_status():
                         )
 
                         cur.execute("""
-                            INSERT OR IGNORE INTO message_status
+                            INSERT INTO message_status
                             (message_sid, to_whatsapp, tenant, cuil, period, kind, created_at, last_status, last_status_at)
                             VALUES (%s, %s, %s, %s, %s, 'sign', %s, 'sent', %s)
+                            ON CONFLICT (message_sid) DO NOTHING
                         """, (sid_sign, to_whatsapp, tenant, cuil, period, now, now))
 
                         cur.execute("UPDATE sent_pdfs SET sign_sent_at = %s WHERE message_sid = %s", (now, sid))
@@ -3726,7 +3742,7 @@ def get_receipt_request_count(tenant: str, cuil: str, period: str, to_whatsapp: 
     """, (tenant, cuil, period, to_whatsapp))
     row = cur.fetchone()
     conn.close()
-    return int(row[0]) if row and row[0] is not None else 0
+    return int(row['request_count']) if row and row['request_count'] is not None else 0
 
 
 def inc_receipt_request_count(tenant: str, cuil: str, period: str, to_whatsapp: str) -> int:
@@ -3744,7 +3760,9 @@ def inc_receipt_request_count(tenant: str, cuil: str, period: str, to_whatsapp: 
     row = cur.fetchone()
 
     if row:
-        rid, cnt, first_ts = row
+        rid = row['id']
+        cnt = row['request_count']
+        first_ts = row['first_requested_at']
         cnt = int(cnt or 0) + 1
         cur.execute("""
             UPDATE receipt_requests
@@ -3766,7 +3784,8 @@ def inc_receipt_request_count(tenant: str, cuil: str, period: str, to_whatsapp: 
 
 
 def get_origin_by_message_sid(message_sid: str) -> str | None:
-    with sqlite3.connect(DB_PATH) as conn:
+    conn = get_db_connection()
+    try:
         cur = conn.cursor()
         cur.execute("""
             SELECT origin FROM receipt_request_events
@@ -3774,7 +3793,9 @@ def get_origin_by_message_sid(message_sid: str) -> str | None:
             ORDER BY id DESC LIMIT 1
         """, (message_sid,))
         row = cur.fetchone()
-    return row[0] if row and row[0] else None
+    finally:
+        conn.close()
+    return row['origin'] if row and row['origin'] else None
 
 
 def _log_receipt_request_event(
@@ -3790,12 +3811,17 @@ def _log_receipt_request_event(
     ts = int(time.time())
     origin = origin or source
 
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_db_connection()
     try:
         cur = conn.cursor()
 
         # 2) Ver columnas actuales
-        cols = {r[1] for r in cur.execute("PRAGMA table_info(receipt_request_events)").fetchall()}
+        cur.execute("""
+            SELECT column_name AS name
+            FROM information_schema.columns
+            WHERE table_name = 'receipt_request_events'
+        """)
+        cols = {r['name'] for r in cur.fetchall()}
 
         def _add_col(colname: str, coltype: str):
             nonlocal cols
@@ -3861,7 +3887,7 @@ def _log_receipt_request_event(
 def get_receipt_event_origin_by_sid(message_sid: str) -> str | None:
     if not message_sid:
         return None
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_db_connection()
     try:
         cur = conn.cursor()
         # origin puede ser NULL en filas viejas
@@ -3875,7 +3901,7 @@ def get_receipt_event_origin_by_sid(message_sid: str) -> str | None:
         row = cur.fetchone()
         if not row:
             return None
-        return row[0] or row[1]  # origin si existe, si no source
+        return row['origin'] or row['source']  # origin si existe, si no source
     finally:
         conn.close()
 
@@ -4021,7 +4047,7 @@ def init_db():
         to_whatsapp TEXT NOT NULL,
         cuil TEXT NOT NULL,
         nombre TEXT,
-        require_pdf INTEGER DEFAULT 1,
+        require_pdf BOOLEAN DEFAULT TRUE,
         status TEXT DEFAULT 'PENDING',
         error TEXT,
         created_at INTEGER NOT NULL,
@@ -4136,8 +4162,8 @@ def init_db():
             full_name TEXT,
             email TEXT,
             role TEXT DEFAULT 'admin',
-            active INTEGER DEFAULT 1,
-            must_change_password INTEGER DEFAULT 1,
+            active BOOLEAN DEFAULT TRUE,
+            must_change_password BOOLEAN DEFAULT TRUE,
             created_at INTEGER NOT NULL,
             last_login INTEGER,
             created_by TEXT,
@@ -4151,7 +4177,7 @@ def init_db():
             user_id INTEGER NOT NULL,
             token TEXT NOT NULL,
             expires_at INTEGER NOT NULL,
-            used INTEGER DEFAULT 0,
+            used BOOLEAN DEFAULT FALSE,
             created_at INTEGER NOT NULL,
             UNIQUE(token),
             FOREIGN KEY(user_id) REFERENCES client_users(id)
@@ -4193,7 +4219,7 @@ def inbound_seen(message_sid: str) -> bool:
     now = int(time.time())
     conn = get_db_connection()
     cur = conn.cursor()
-    cur.execute("INSERT OR IGNORE INTO inbound_dedup(message_sid, created_at) VALUES (%s, %s)", (message_sid, now))
+    cur.execute("INSERT INTO inbound_dedup(message_sid, created_at) VALUES (%s, %s) ON CONFLICT (message_sid) DO NOTHING", (message_sid, now))
     conn.commit()
     inserted = (cur.rowcount == 1)
     conn.close()
@@ -4212,18 +4238,27 @@ def save_pdf_sid(tenant: str, cuil: str, period: str, to_whatsapp: str, message_
 
     # 1) histórico de PDFs
     cur.execute("""
-        INSERT OR REPLACE INTO sent_pdfs
+        INSERT INTO sent_pdfs
         (tenant, cuil, period, to_whatsapp, message_sid, created_at, sign_sent_at, origin)
         VALUES (%s, %s, %s, %s, %s, COALESCE((SELECT created_at FROM sent_pdfs WHERE message_sid = %s), %s),
                 COALESCE((SELECT sign_sent_at FROM sent_pdfs WHERE message_sid = %s), NULL),
-                ?)
+                %s)
+        ON CONFLICT (message_sid) DO UPDATE SET
+            tenant = EXCLUDED.tenant,
+            cuil = EXCLUDED.cuil,
+            period = EXCLUDED.period,
+            to_whatsapp = EXCLUDED.to_whatsapp,
+            created_at = EXCLUDED.created_at,
+            sign_sent_at = EXCLUDED.sign_sent_at,
+            origin = EXCLUDED.origin
     """, (tenant, cuil, period, to_whatsapp, message_sid, message_sid, now, message_sid, origin))
 
     # 2) ✅ tracking para reportes + callbacks
     cur.execute("""
-        INSERT OR IGNORE INTO message_status
+        INSERT INTO message_status
         (message_sid, to_whatsapp, tenant, cuil, period, nombre, kind, created_at, last_status, last_status_at)
         VALUES (%s, %s, %s, %s, %s, '', 'media', %s, 'sent', %s)
+        ON CONFLICT (message_sid) DO NOTHING
     """, (message_sid, to_whatsapp, tenant, cuil, period, now, now))
 
     conn.commit()
@@ -4276,7 +4311,7 @@ def upsert_verification(tenant: str, cuil: str, to_whatsapp: str, dni: str | Non
           UPDATE verifications
           SET dni_hash=%s, dni_last4=%s, updated_at=%s
           WHERE id=%s
-        """, (dni_hash or None, dni_last4 or None, now, row[0]))
+        """, (dni_hash or None, dni_last4 or None, now, row['id']))
     else:
         cur.execute("""
           INSERT INTO verifications (tenant, cuil, to_whatsapp, dni_hash, dni_last4, verified_at, updated_at)
@@ -4333,13 +4368,13 @@ def is_verified_contact(tenant: str, cuil: str, to_whatsapp: str) -> bool:
       WHERE tenant = %s
         AND (
           -- match por cuil normalizado (saca guiones, espacios, etc.)
-          replace(replace(cuil, '-', ''), ' ', '') = ?
+          replace(replace(cuil, '-', ''), ' ', '') = %s
         )
         AND (
           -- match por whatsapp normalizado
-          to_whatsapp = ?
+          to_whatsapp = %s
           OR replace(replace(replace(to_whatsapp,'whatsapp:',''),'+',''),' ','') =
-             replace(replace(replace(?,'whatsapp:',''),'+',''),' ','')
+             replace(replace(replace(%s,'whatsapp:',''),'+',''),' ','')
         )
       LIMIT 1
     """, (tenant, cuil_d, w, w))
@@ -4609,7 +4644,8 @@ def inc_pending_dni_attempts(pending_id: int) -> int:
     cur = conn.cursor()
     cur.execute("UPDATE pending_views SET dni_attempts = COALESCE(dni_attempts,0) + 1 WHERE id=%s", (pending_id,))
     cur.execute("SELECT dni_attempts FROM pending_views WHERE id=%s", (pending_id,))
-    n = (cur.fetchone() or [0])[0]
+    _row = cur.fetchone()
+    n = _row['dni_attempts'] if _row and _row['dni_attempts'] is not None else 0
     conn.commit()
     conn.close()
     return int(n)
@@ -5360,10 +5396,10 @@ def list_verifications(tenant: str, q: str = ""):
     if q:
         sql += """
           AND (
-            lower(cuil) LIKE ?
-            OR lower(to_whatsapp) LIKE ?
-            OR lower(ifnull(nombre,'')) LIKE ?
-            OR lower(ifnull(dni_last4,'')) LIKE ?
+            lower(cuil) LIKE %s
+            OR lower(to_whatsapp) LIKE %s
+            OR lower(COALESCE(nombre,'')) LIKE %s
+            OR lower(COALESCE(dni_last4,'')) LIKE %s
           )
         """
         like = f"%{q}%"
@@ -5372,7 +5408,7 @@ def list_verifications(tenant: str, q: str = ""):
     sql += " ORDER BY updated_at DESC, verified_at DESC LIMIT 200"
 
     cur.execute(sql, params)
-    rows = [dict(zip([c[0] for c in cur.description], r)) for r in cur.fetchall()]
+    rows = [dict(r) for r in cur.fetchall()]
     conn.close()
     return rows
 
@@ -5484,7 +5520,7 @@ def set_recibo_estado(tenant: str, cuil: str, period: str, estado: str):
         WHERE tenant=%s AND cuil=%s AND period=%s
     """, (tenant, cuil, period))
     row = cur.fetchone()
-    if row and (row[0] or "").strip().upper() == "FIRMADO":
+    if row and (row['estado'] or "").strip().upper() == "FIRMADO":
         conn.close()
         return
 
@@ -5547,15 +5583,16 @@ def save_template_sid(tenant: str, cuil: str, period: str, to_whatsapp: str, sid
     conn = get_db_connection()
     cur = conn.cursor()
     cur.execute("""
-        INSERT OR IGNORE INTO message_status
+        INSERT INTO message_status
         (message_sid, to_whatsapp, tenant, cuil, period, nombre, kind, created_at, last_status, last_status_at)
         VALUES (%s, %s, %s, %s, %s, %s, 'template', %s, 'sent', %s)
+        ON CONFLICT (message_sid) DO NOTHING
     """, (sid, to_whatsapp, tenant, cuil, period, nombre, now, now))
     conn.commit()
     conn.close()
 
 def already_sent_template(tenant: str, cuil: str, period: str, to_whatsapp: str) -> bool:
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_db_connection()
     try:
         cur = conn.cursor()
         cur.execute("""
@@ -7692,15 +7729,15 @@ def admin_reenviar_template():
                 conn = get_db_connection()
                 cur = conn.cursor()
                 cur.execute("""
-                    SELECT to_whatsapp FROM message_status 
-                    WHERE tenant = %s AND cuil = %s 
+                    SELECT to_whatsapp FROM message_status
+                    WHERE tenant = %s AND cuil = %s
                     ORDER BY created_at DESC LIMIT 1
                 """, (tenant, cuil))
                 row = cur.fetchone()
                 conn.close()
-                
-                if row and row[0]:
-                    whatsapp = row[0]
+
+                if row and row['to_whatsapp']:
+                    whatsapp = row['to_whatsapp']
                 else:
                     resultados.append(f"❌ {cuil} ({nombre}): Sin WhatsApp")
                     continue
@@ -8284,7 +8321,7 @@ def admin_reset_tenant():
                 FROM message_status 
                 WHERE tenant = %s AND period IN ({})
             )
-        """.format(','.join('?' * len(candidates))), (tenant, *candidates))
+        """.format(','.join(['%s'] * len(candidates))), (tenant, *candidates))
         print(f"RESET: DELETE FROM terms_accepted (tenant={tenant}, periods={candidates}); deleted= {cur.rowcount}")
         
     else:
@@ -8380,7 +8417,7 @@ def admin_reset():
             _del("DELETE FROM pending_terms WHERE tenant=%s AND period=%s;", (tenant, p))  # ✅ NUEVO
         
         # ✅ NUEVO: Borrar terms_accepted de usuarios de este tenant/período
-        placeholders = ','.join('?' for _ in periods)
+        placeholders = ','.join('%s' for _ in periods)
         cur.execute(f"""
             DELETE FROM terms_accepted 
             WHERE whatsapp IN (
@@ -8436,7 +8473,7 @@ def queue_template_send(tenant: str, period: str, to_whatsapp: str, cuil: str,
       INSERT INTO template_send_queue
         (tenant, period, to_whatsapp, cuil, nombre, require_pdf, status, created_at, updated_at, error)
       VALUES
-        (?, ?, ?, ?, ?, ?, 'PENDING', ?, ?, '')
+        (%s, %s, %s, %s, %s, %s, 'PENDING', %s, %s, '')
       ON CONFLICT(tenant, period, to_whatsapp, cuil) DO UPDATE SET
         nombre=excluded.nombre,
         require_pdf=excluded.require_pdf,
@@ -8449,7 +8486,7 @@ def queue_template_send(tenant: str, period: str, to_whatsapp: str, cuil: str,
           WHEN template_send_queue.status IN ('SKIPPED','FAILED') THEN ''
           ELSE template_send_queue.error
         END
-    """, (tenant, period, to_whatsapp, cuil, (nombre or ""), 1 if require_pdf else 0, now, now))
+    """, (tenant, period, to_whatsapp, cuil, (nombre or ""), bool(require_pdf), now, now))
 
     # Determinar resultado
     cur.execute("""
@@ -8457,7 +8494,8 @@ def queue_template_send(tenant: str, period: str, to_whatsapp: str, cuil: str,
       WHERE tenant=%s AND period=%s AND to_whatsapp=%s AND cuil=%s
       LIMIT 1
     """, (tenant, period, to_whatsapp, cuil))
-    status = (cur.fetchone() or [""])[0]
+    _row = cur.fetchone()
+    status = _row['status'] if _row else ""
 
     conn.commit()
     conn.close()
@@ -8587,8 +8625,7 @@ def _fetch_queue_batch(tenant: str, period: str, batch_size: int = 10) -> list[d
       ORDER BY id ASC
       LIMIT %s
     """, (tenant, period, batch_size))
-    cols = [c[0] for c in cur.description]
-    rows = [dict(zip(cols, r)) for r in cur.fetchall()]
+    rows = [dict(r) for r in cur.fetchall()]
     conn.close()
     return rows
 
@@ -8600,7 +8637,7 @@ def _mark_queue_row(row_id: int, status: str, error: str = "", sent_sid: str | N
     cur.execute("""
       UPDATE template_send_queue
       SET status=%s, error=%s, updated_at=%s, sent_sid=COALESCE(%s, sent_sid),
-          sent_at=CASE WHEN ? IS NOT NULL THEN ? ELSE sent_at END
+          sent_at=CASE WHEN %s IS NOT NULL THEN %s ELSE sent_at END
       WHERE id=%s
     """, (status, (error or ""), now, sent_sid, sent_sid, now, row_id))
     conn.commit()
@@ -8645,7 +8682,7 @@ def admin_send_template_queue_tick():
         to_whatsapp = (r["to_whatsapp"] or "").strip()
         cuil = (r["cuil"] or "").strip()
         nombre = (r.get("nombre") or "").strip()
-        require_pdf = bool(r.get("require_pdf", 1))
+        require_pdf = bool(r.get("require_pdf", True))
 
         try:
             # 1) Si require_pdf, validamos que exista PDF
@@ -9142,8 +9179,10 @@ def save_terms_acceptance(whatsapp: str):
     cur = conn.cursor()
     now = int(time.time())
     cur.execute("""
-        INSERT OR REPLACE INTO terms_accepted (whatsapp, accepted_at)
+        INSERT INTO terms_accepted (whatsapp, accepted_at)
         VALUES (%s, %s)
+        ON CONFLICT (whatsapp) DO UPDATE SET
+            accepted_at = EXCLUDED.accepted_at
     """, (whatsapp, now))
     conn.commit()
     conn.close()
@@ -9156,8 +9195,14 @@ def set_pending_terms_acceptance(whatsapp: str, tenant: str, cuil: str, period: 
     cur = conn.cursor()
     now = int(time.time())
     cur.execute("""
-        INSERT OR REPLACE INTO pending_terms (whatsapp, tenant, cuil, period, origin, created_at)
+        INSERT INTO pending_terms (whatsapp, tenant, cuil, period, origin, created_at)
         VALUES (%s, %s, %s, %s, %s, %s)
+        ON CONFLICT (whatsapp) DO UPDATE SET
+            tenant = EXCLUDED.tenant,
+            cuil = EXCLUDED.cuil,
+            period = EXCLUDED.period,
+            origin = EXCLUDED.origin,
+            created_at = EXCLUDED.created_at
     """, (whatsapp, tenant, cuil, period, origin, now))
     conn.commit()
     conn.close()
@@ -9175,7 +9220,7 @@ def get_pending_terms(whatsapp: str):
     conn.close()
     
     if row:
-        return {"tenant": row[0], "cuil": row[1], "period": row[2], "origin": row[3]}
+        return {"tenant": row['tenant'], "cuil": row['cuil'], "period": row['period'], "origin": row['origin']}
     return None
 
 
@@ -9455,21 +9500,21 @@ def get_multi_tenant_selection_state(whatsapp: str) -> Optional[dict]:
         return None
     
     try:
-        data = json.loads(row[0])
+        data = json.loads(row['tenants_json'])
         # Compatibilidad con formato antiguo
         if isinstance(data, list):
             return {
-                "tenants": data, 
-                "action": "RESEND", 
+                "tenants": data,
+                "action": "RESEND",
                 "period_offset": 0,
-                "created_at": row[1]
+                "created_at": row['created_at']
             }
         # Formato nuevo
         return {
             "tenants": data.get("tenants", []),
             "action": data.get("action", "RESEND"),
             "period_offset": data.get("period_offset", 0),
-            "created_at": row[1]
+            "created_at": row['created_at']
         }
     except Exception as e:
         print(f"Error parsing multi_tenant_selection: {e}")
@@ -10143,15 +10188,15 @@ def admin_reenviar_fallidos():
                 conn = get_db_connection()
                 cur = conn.cursor()
                 cur.execute("""
-                    SELECT to_whatsapp FROM message_status 
-                    WHERE tenant = %s AND cuil = %s 
+                    SELECT to_whatsapp FROM message_status
+                    WHERE tenant = %s AND cuil = %s
                     ORDER BY created_at DESC LIMIT 1
                 """, (tenant, cuil))
                 row = cur.fetchone()
                 conn.close()
-                
-                if row and row[0]:
-                    whatsapp = row[0]
+
+                if row and row['to_whatsapp']:
+                    whatsapp = row['to_whatsapp']
                 else:
                     resultados.append(f"❌ {cuil} ({nombre}): Sin WhatsApp en Excel ni BD")
                     continue
