@@ -841,7 +841,6 @@ def get_all_client_users():
     Obtiene todos los usuarios del portal.
     """
     conn = get_db_connection()
-    conn.row_factory = sqlite3.Row
     cur = conn.cursor()
     cur.execute("""
         SELECT id, tenant, username, email, full_name, role, active, 
@@ -889,7 +888,6 @@ def authenticate_portal_user(username: str, password: str) -> dict:
     username = username.strip().lower()
     
     conn = get_db_connection()
-    conn.row_factory = sqlite3.Row
     cur = conn.cursor()
     
     cur.execute("""
@@ -931,7 +929,6 @@ def get_portal_user_by_id(user_id: int):
     Obtiene un usuario del portal por ID.
     """
     conn = get_db_connection()
-    conn.row_factory = sqlite3.Row
     cur = conn.cursor()
     cur.execute("""
         SELECT id, tenant, username, password_hash, email, full_name, role, active, must_change_password
@@ -3074,7 +3071,6 @@ def get_password_reset_token(token: str):
     Returns: user_id si es válido, None si no.
     """
     conn = get_db_connection()
-    conn.row_factory = sqlite3.Row
     cur = conn.cursor()
     
     cur.execute("""
@@ -3114,7 +3110,6 @@ def get_client_user_by_email(email: str):
     Busca un usuario del portal por email.
     """
     conn = get_db_connection()
-    conn.row_factory = sqlite3.Row
     cur = conn.cursor()
     cur.execute("""
         SELECT id, tenant, username, email, full_name, active
@@ -3634,7 +3629,6 @@ def twilio_status():
 
 def is_template_sid(message_sid: str) -> bool:
     conn = get_db_connection()
-    conn.row_factory = sqlite3.Row
     cur = conn.cursor()
     cur.execute("SELECT 1 FROM sent_templates WHERE message_sid=%s LIMIT 1;", (message_sid,))
     row = cur.fetchone()
@@ -3643,7 +3637,6 @@ def is_template_sid(message_sid: str) -> bool:
 
 def get_sent_pdf_by_sid(message_sid: str) -> dict | None:
     conn = get_db_connection()
-    conn.row_factory = sqlite3.Row
     cur = conn.cursor()
     cur.execute("SELECT tenant,cuil,period,to_whatsapp,sign_sent_at FROM sent_pdfs WHERE message_sid=%s LIMIT 1;", (message_sid,))
     row = cur.fetchone()
@@ -3684,7 +3677,6 @@ def get_latest_context_for_whatsapp(to_whatsapp: str) -> dict | None:
     mirando message_status (template/pdf).
     """
     conn = get_db_connection()
-    conn.row_factory = sqlite3.Row
     cur = conn.cursor()
     cur.execute("""
         SELECT tenant, cuil, period
@@ -4695,7 +4687,6 @@ def get_nombre_for_cuil(tenant: str, cuil: str) -> str:
 
 def _db_fetchall_dict(sql, params=()):
     conn = get_db_connection()
-    conn.row_factory = sqlite3.Row
     cur = conn.cursor()
     cur.execute(sql, params)
     rows = [dict(r) for r in cur.fetchall()]
@@ -4875,7 +4866,6 @@ def generate_pdf_report_v2(tenant: str, period_filter: str = ""):
 
     # ========= DB =========
     conn = get_db_connection()
-    conn.row_factory = sqlite3.Row
     cur = conn.cursor()
 
     cur.execute("""
@@ -5417,7 +5407,6 @@ def list_verifications(tenant: str, q: str = ""):
 
 def get_pdf_by_sid(sid):
     conn = get_db_connection()
-    conn.row_factory = sqlite3.Row
     cur = conn.cursor()
     cur.execute("SELECT * FROM sent_pdfs WHERE message_sid = %s", (sid,))
     row = cur.fetchone()
@@ -5542,7 +5531,6 @@ def get_recibo_estado(tenant: str, cuil: str, period: str):
     period = norm_period_label(period)
 
     conn = get_db_connection()
-    conn.row_factory = sqlite3.Row
     cur = conn.cursor()
     cur.execute("""
       SELECT estado FROM recibo_estado
@@ -6125,7 +6113,6 @@ def generate_excel_report_v2(tenant: str, period_filter: str = "") -> BytesIO:
     period_filter = norm_period_label(period_filter)
 
     conn = get_db_connection()
-    conn.row_factory = sqlite3.Row
     cur = conn.cursor()
 
     # message_status
@@ -7384,7 +7371,6 @@ def get_pending_views_over_7days(tenant: str, period: str) -> list:
     Devuelve personas que recibieron el template hace +7 días pero nunca pidieron el PDF.
     """
     conn = get_db_connection()
-    conn.row_factory = sqlite3.Row
     cur = conn.cursor()
     
     seven_days_ago = int(time.time()) - (7 * 24 * 60 * 60)
@@ -7435,7 +7421,6 @@ def get_pending_signatures_over_7days(tenant: str, period: str) -> list:
     Devuelve personas que recibieron el PDF hace +7 días pero nunca firmaron ni observaron.
     """
     conn = get_db_connection()
-    conn.row_factory = sqlite3.Row
     cur = conn.cursor()
     
     seven_days_ago = int(time.time()) - (7 * 24 * 60 * 60)
@@ -7649,7 +7634,6 @@ def get_envios_df_for_tenant(tenant_slug: str, force: bool = False) -> pd.DataFr
 
 def get_estado_report(tenant: str, period: str | None = None):
     conn = get_db_connection()
-    conn.row_factory = sqlite3.Row
     cur = conn.cursor()
 
     if period:
@@ -8020,7 +8004,6 @@ def admin_report_estado():
 
 def get_sent_pdfs_report(tenant: str):
     conn = get_db_connection()
-    conn.row_factory = sqlite3.Row
     cur = conn.cursor()
     cur.execute("""
         SELECT cuil, period, to_whatsapp, message_sid, created_at, sign_sent_at
@@ -8870,7 +8853,6 @@ def _db_row_to_dict(r):
 
 def _get_last_msg_status(tenant: str, cuil: str, period: str, kind: str):
     conn = get_db_connection()
-    conn.row_factory = sqlite3.Row
     cur = conn.cursor()
     cur.execute("""
         SELECT *
