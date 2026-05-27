@@ -5567,6 +5567,23 @@ def root():
         return redirect(f"/admin?token={tok}")
     return redirect("/admin")
 
+
+# --- iconos pedidos por el browser en la raíz ---
+from flask import send_from_directory
+
+@app.get("/favicon.ico")
+def favicon_root():
+    return send_from_directory(
+        app.static_folder, "favicon.ico", mimetype="image/vnd.microsoft.icon"
+    )
+
+@app.get("/apple-touch-icon.png")
+@app.get("/apple-touch-icon-precomposed.png")
+def apple_touch_icon_root():
+    return send_from_directory(
+        app.static_folder, "apple-touch-icon.png", mimetype="image/png"
+    )
+
 def save_template_sid(tenant: str, cuil: str, period: str, to_whatsapp: str, sid: str, nombre: str = ""):
     now = int(time.time())
     conn = get_db_connection()
