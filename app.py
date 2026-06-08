@@ -9502,6 +9502,16 @@ def twilio_inbound():
     body = (request.form.get("Body") or "").strip()
     in_sid = (request.form.get("MessageSid") or "").strip()
 
+    # ✅ List Picker manda el Item ID en Body (no en ButtonPayload como el Quick Reply).
+    # Si el body es un ID de opción conocido y no vino button, lo tratamos como button.
+    _MENU_IDS = {
+        "RESEND_LAST", "SEE_PREVIOUS", "MORE_OPTIONS",
+        "VIEW_NOW", "NO_NEED", "SIGN_OK", "SIGN_OBS", "ACCEPT_TERMS",
+    }
+    if not button and body in _MENU_IDS:
+        button = body
+        body = ""
+
     print("INBOUND:", from_whatsapp, "MessageSid:", in_sid, "ButtonPayload:", button, "Body:", body)
 
     # ✅ DEDUP global: si Twilio reintenta el mismo inbound, no hacemos nada
