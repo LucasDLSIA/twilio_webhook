@@ -1973,11 +1973,11 @@ def portal_certificado():
  
     try:
         service = drive_service()
-        meta = service.files().get(fileId=file_id, fields='name,mimeType').execute()
+        meta = service.files().get(fileId=file_id, fields='name,mimeType', supportsAllDrives=True).execute()
         file_name = meta.get('name', cert.get('file_name', 'certificado'))
         mime = meta.get('mimeType', 'application/octet-stream')
  
-        req = service.files().get_media(fileId=file_id)
+        req = service.files().get_media(fileId=file_id, supportsAllDrives=True)
         fh = io.BytesIO()
         downloader = MediaIoBaseDownload(fh, req, chunksize=5*1024*1024)
         done = False
@@ -8257,58 +8257,60 @@ def _drive_find_child_folder_id(service, parent_id: str, folder_name: str) -> st
     return ""
 
 ##############################################################
-def _drive_ensure_child_folder(service, parent_id: str, folder_name: str) -> str:
+def _drive_ensure_child_folder_shared(service, parent_id: str, folder_name: str) -> str:
     """
-    Devuelve el id de la carpeta hija 'folder_name' dentro de parent_id.
-    Si no existe, la CREA. Requiere scope de escritura (drive, no readonly).
+    Igual que _drive_ensure_child_folder pero con soporte de Shared Drives.
+    Busca la carpeta hija por nombre; si no existe, la crea. Devuelve su id.
     """
-    # ¿ya existe?
-    existing = _drive_find_child_folder_id(service, parent_id, folder_name)
-    if existing:
-        return existing
+    # Buscar (con flags de shared drive)
+    safe_name = folder_name.replace("'", "\\'")
+    q = (
+        f"'{parent_id}' in parents "
+        f"and name = '{safe_name}' "
+        f"and mimeType = 'application/vnd.google-apps.folder' "
+        f"and trashed = false"
+    )
+    res = service.files().list(
+        q=q,
+        fields="files(id,name)",
+        pageSize=5,
+        supportsAllDrives=True,
+        includeItemsFromAllDrives=True,
+    ).execute()
+    files = res.get("files", [])
+    if files:
+        return (files[0].get("id") or "").strip()
  
-    # crearla
+    # Crear (con soporte shared drive)
     metadata = {
         "name": folder_name,
-        "mimeType": FOLDER_MIME,
+        "mimeType": "application/vnd.google-apps.folder",
         "parents": [parent_id],
     }
-    folder = service.files().create(body=metadata, fields="id").execute()
+    folder = service.files().create(
+        body=metadata,
+        fields="id",
+        supportsAllDrives=True,
+    ).execute()
     return (folder.get("id") or "").strip()
  
  
 def get_certificados_folder_id(tenant_slug: str) -> str:
     """
-    Devuelve (creando si hace falta) el id de /<tenant_root>/certificados/
+    Devuelve (creando si hace falta) el id de la carpeta del tenant
+    DENTRO del Shared Drive de certificados:  <SharedDrive>/<tenant>/
     """
-    t = get_tenant(tenant_slug)
-    if not t:
-        return ""
-    root_id = (t.get("drive_root_id") or t.get("recibos_root_id") or "").strip()
-    if not root_id:
-        return ""
+    if not CERTIFICADOS_DRIVE_ID:
+        raise RuntimeError("Falta CERTIFICADOS_SHARED_DRIVE_ID en ENV")
+ 
     service = drive_service()
-    return _drive_ensure_child_folder(service, root_id, "certificados")
- 
- 
-def download_twilio_media(media_url: str) -> tuple[bytes, str]:
-    """
-    Descarga un archivo de media de Twilio (requiere auth con las credenciales).
-    Devuelve (bytes, content_type).
-    """
-    r = requests.get(
-        media_url,
-        auth=(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN),
-        timeout=30,
-    )
-    r.raise_for_status()
-    content_type = r.headers.get("Content-Type", "application/octet-stream")
-    return r.content, content_type
+    # En un Shared Drive, el ID del drive funciona como id de la carpeta raíz.
+    return _drive_ensure_child_folder_shared(service, CERTIFICADOS_DRIVE_ID, tenant_slug)
  
  
 def upload_certificado_to_drive(tenant: str, cuil: str, data: bytes, content_type: str) -> tuple[str, str]:
     """
-    Sube el certificado a /<tenant>/certificados/<cuil>_<fecha>_<hora>.<ext>
+    Sube el certificado a <SharedDrive>/<tenant>/<cuil>_<fecha>_<hora>.<ext>
     Devuelve (file_id, file_name).
     """
     folder_id = get_certificados_folder_id(tenant)
@@ -8316,7 +8318,6 @@ def upload_certificado_to_drive(tenant: str, cuil: str, data: bytes, content_typ
         raise RuntimeError(f"No se pudo obtener/crear carpeta certificados para tenant={tenant}")
  
     # extensión según content_type
-    ext = "pdf"
     if "pdf" in content_type:
         ext = "pdf"
     elif "jpeg" in content_type or "jpg" in content_type:
@@ -8334,10 +8335,30 @@ def upload_certificado_to_drive(tenant: str, cuil: str, data: bytes, content_typ
     service = drive_service()
     media = MediaIoBaseUpload(io.BytesIO(data), mimetype=content_type, resumable=False)
     metadata = {"name": file_name, "parents": [folder_id]}
-    f = service.files().create(body=metadata, media_body=media, fields="id").execute()
+    f = service.files().create(
+        body=metadata,
+        media_body=media,
+        fields="id",
+        supportsAllDrives=True,   # 👈 clave para Shared Drive
+    ).execute()
     file_id = (f.get("id") or "").strip()
     return file_id, file_name
  
+ 
+ 
+def download_twilio_media(media_url: str) -> tuple[bytes, str]:
+    """
+    Descarga un archivo de media de Twilio (requiere auth con las credenciales).
+    Devuelve (bytes, content_type).
+    """
+    r = requests.get(
+        media_url,
+        auth=(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN),
+        timeout=30,
+    )
+    r.raise_for_status()
+    content_type = r.headers.get("Content-Type", "application/octet-stream")
+    return r.content, content_type
  
 def save_certificado(tenant: str, cuil: str, nombre: str, to_whatsapp: str,
                      file_id: str, file_name: str, mime_type: str):
