@@ -8294,6 +8294,8 @@ def _drive_ensure_child_folder_shared(service, parent_id: str, folder_name: str)
     ).execute()
     return (folder.get("id") or "").strip()
  
+CERTIFICADOS_DRIVE_ID = os.environ.get("CERTIFICADOS_SHARED_DRIVE_ID", "").strip()
+ 
  
 def get_certificados_folder_id(tenant_slug: str) -> str:
     """
