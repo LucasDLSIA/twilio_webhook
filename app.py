@@ -4375,6 +4375,23 @@ def init_db():
         ''')
         _try_alter(cur, "CREATE INDEX IF NOT EXISTS idx_cert_tenant ON certificados(tenant, created_at);")
     """
+    _try_alter(cur, "CREATE INDEX IF NOT EXISTS idx_ts_queue_pending ON template_send_queue(status, tenant, period, created_at);")
+
+    # ✅ NUEVO: certificados médicos recibidos
+    cur.execute('''
+        CREATE TABLE IF NOT EXISTS certificados (
+            id SERIAL PRIMARY KEY,
+            tenant TEXT NOT NULL,
+            cuil TEXT NOT NULL,
+            nombre TEXT,
+            to_whatsapp TEXT,
+            file_id TEXT NOT NULL,
+            file_name TEXT,
+            mime_type TEXT,
+            created_at INTEGER NOT NULL
+        )
+    ''')
+    _try_alter(cur, "CREATE INDEX IF NOT EXISTS idx_cert_tenant ON certificados(tenant, created_at);")
 
     _try_alter(cur, "CREATE INDEX IF NOT EXISTS idx_pending_to_created ON pending_views(to_whatsapp, created_at);")
     _try_alter(cur, "CREATE INDEX IF NOT EXISTS idx_estado_key ON recibo_estado(tenant, cuil, period);")
