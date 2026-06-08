@@ -7148,7 +7148,7 @@ def admin_panel():
     html.append("</div>")
     html.append("<div class='sep'></div>")
 
-    sample = envios_rows[:10]
+    sample = envios_rows
     if sample:
         cols = list(sample[0].keys())
         html.append("<div class='table-wrap'>")
