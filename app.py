@@ -4870,14 +4870,13 @@ def get_nombre_for_cuil(tenant: str, cuil: str) -> str:
         if not c_nombre or not c_arch:
             return ""
 
-        # normalizar cuil en df y comparar
         def norm(x):
             s = str(x or "").strip().replace(".pdf","")
             try:
                 s = strip_pdf(s)
             except Exception:
                 pass
-            return s
+            return _digits(s)   # 👈 deja SOLO números: "20-44143190-3" → "20441431903"
 
         target = norm(cuil)
         df["_cuil_norm"] = df[c_arch].apply(norm)
