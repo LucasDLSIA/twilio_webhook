@@ -1903,9 +1903,11 @@ def portal_certificados():
         html.append("<tbody>")
         for c in certificados:
             ver_url = f"/portal/certificado?id={c['id']}"
+            # Si el nombre quedó vacío al guardar, lo buscamos por CUIL
+            nombre_cert = c.get('nombre','') or get_nombre_for_cuil(tenant, c.get('cuil',''))
             html.append("<tr>")
             html.append(f"<td>{esc(ts_str(c.get('created_at')))}</td>")
-            html.append(f"<td>{esc(c.get('nombre','') or '')}</td>")
+            html.append(f"<td>{esc(nombre_cert)}</td>")
             html.append(f"<td>{esc(c.get('cuil',''))}</td>")
             html.append(f"<td>{esc(c.get('to_whatsapp','') or '')}</td>")
             html.append(f"<td><a class='btn primary btn-sm' href='{ver_url}' target='_blank'>Ver / Descargar</a></td>")
