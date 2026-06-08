@@ -3,7 +3,7 @@ import io
 from pydoc import html
 import re
 import time
-import sqlite3
+
 import json
 import threading
 from datetime import datetime
@@ -3662,14 +3662,12 @@ DB_PATH = os.environ.get("DB_PATH", "/data/app.db")
 
 def get_db_connection():
     DATABASE_URL = os.environ.get("DATABASE_URL")
-    if DATABASE_URL:
-        conn = psycopg2.connect(DATABASE_URL)
-        conn.cursor_factory = RealDictCursor
-        return conn
-    else:
-        conn = sqlite3.connect(DB_PATH)
-        conn.row_factory = sqlite3.Row
-        return conn
+    if not DATABASE_URL:
+        raise RuntimeError("Falta DATABASE_URL en ENV (la app requiere PostgreSQL)")
+    conn = psycopg2.connect(DATABASE_URL)
+    conn.cursor_factory = RealDictCursor
+    return conn
+
 
 def get_latest_context_for_whatsapp(to_whatsapp: str) -> dict | None:
     """
@@ -4801,7 +4799,7 @@ def norm_period_label(p: str) -> str:
     return f"{mm}/{yyyy}"
 
 from io import BytesIO
-import sqlite3
+
 import time
 import os
 from reportlab.platypus import Image
@@ -4843,7 +4841,7 @@ def generate_pdf_report_v2(tenant: str, period_filter: str = ""):
     """
     from io import BytesIO
     import time
-    import sqlite3
+    
 
     from reportlab.lib.pagesizes import A4, landscape
     from reportlab.lib.units import cm
@@ -5430,7 +5428,6 @@ def admin_required(fn):
     return wrapper
 
 
-import sqlite3, time
 
 def add_pending_view(to_whatsapp: str, tenant: str, cuil: str, period: str, origin: str = "INITIAL"):
     now = int(time.time())
@@ -6776,7 +6773,7 @@ def admin_panel():
     }
     .badge b{color:var(--text)}
     .badge.ok{border-color:rgba(52,211,153,.35)}
-    .badge.warn{border-color:rgba(251,191,36,.35)}
+    .badge.warn{border-color:rgba(251,191,36,.35)}ff
     .badge.bad{border-color:rgba(251,113,133,.35)}
     .sep{height:1px;background:var(--line);margin:12px 0}
     table{width:100%;border-collapse:separate;border-spacing:0}
@@ -6788,7 +6785,18 @@ def admin_panel():
     }
     th{font-size:12px;color:var(--muted);text-align:left}
     tr:hover td{background:rgba(255,255,255,.02)}
-    .table-wrap{overflow:auto;border:1px solid var(--line);border-radius:14px}
+    .table-wrap{
+    overflow:auto;
+    max-height:360px;
+    border:1px solid var(--line);
+    border-radius:14px;
+    }
+    .table-wrap thead th{
+    position:sticky;
+    top:0;
+    background:#0f1b33;
+    z-index:1;
+    }
     .right{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
     .hint{font-size:12px;color:var(--muted);margin-top:6px}
     .kpi{display:flex;gap:8px;flex-wrap:wrap;margin-top:8px}
@@ -8857,18 +8865,12 @@ def debug_list_root_pdfs(tenant: str, limit=20):
 
 from io import BytesIO
 from flask import send_file
-import sqlite3
+
 import pandas as pd
 import time
 
 def _db_row_to_dict(r):
-    # r puede ser sqlite3.Row o tupla
-    if r is None:
-        return None
-    if isinstance(r, sqlite3.Row):
-        return dict(r)
-    # fallback: si fuera tupla (no debería si usás row_factory)
-    return {str(i): v for i, v in enumerate(r)}
+    return dict(r) if r is not None else None
 
 def _get_last_msg_status(tenant: str, cuil: str, period: str, kind: str):
     conn = get_db_connection()
