@@ -18,6 +18,8 @@ from flask import Flask, request, redirect, Response, jsonify, session
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload
+from googleapiclient.http import MediaIoBaseUpload
+ 
 
 from twilio.rest import Client
 
@@ -150,7 +152,7 @@ def require_admin():
 # Google Drive
 # =========================
 def drive_service():
-    scopes = ["https://www.googleapis.com/auth/drive.readonly"]
+    scopes = ["https://www.googleapis.com/auth/drive"]
     if GOOGLE_SA_JSON:
         info = json.loads(GOOGLE_SA_JSON) if isinstance(GOOGLE_SA_JSON, str) else GOOGLE_SA_JSON
         creds = service_account.Credentials.from_service_account_info(info, scopes=scopes)
@@ -1434,6 +1436,11 @@ def portal_dashboard():
         html.append("<div class='action-title'>Calendario</div>")
         html.append("<div class='action-desc'>Ver todos los períodos</div>")
         html.append("</a>")
+        html.append("<a href='/portal/certificados' class='action-card'>")
+        html.append("<div class='action-icon'>🩺</div>")
+        html.append("<div class='action-title'>Certificados médicos</div>")
+        html.append("<div class='action-desc'>Ver los certificados recibidos</div>")
+        html.append("</a>")
         html.append("</div>")
         html.append("</div>")
     
@@ -1822,7 +1829,172 @@ def portal_calendario():
     
     return Response("".join(html), mimetype="text/html")
 
-
+@app.route("/portal/certificados")
+def portal_certificados():
+    """
+    Certificados médicos recibidos, para el portal de clientes.
+    Cada cliente ve SOLO los de su empresa (sale de la sesión).
+    """
+    # Verificar login
+    auth = require_portal_login()
+    if auth:
+        return auth
+ 
+    user_id = session.get('portal_user_id')
+    user = get_portal_user_by_id(user_id)
+    tenant = user['tenant']
+ 
+    t = get_tenant(tenant)
+    empresa_nombre = t.get('display_name', tenant) if t else tenant
+ 
+    certificados = get_certificados(tenant)
+ 
+    html = []
+    html.append("""<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Portal - Certificados</title>
+  <link rel="manifest" href="/static/manifest.json">
+  <meta name="theme-color" content="#2E3B8E">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta name="apple-mobile-web-app-title" content="Recibos">
+  <link rel="apple-touch-icon" href="/static/icon-192.png">
+  <link rel="stylesheet" href="/static/portal-theme.css">
+  <style>
+    .table-wrap { overflow:auto; max-height:520px; border:1px solid var(--line); border-radius:var(--radius); margin-top:16px; }
+    table { width:100%; border-collapse:separate; border-spacing:0; }
+    th, td { padding:12px 14px; border-bottom:1px solid var(--line); font-size:14px; text-align:left; }
+    thead th { position:sticky; top:0; background:var(--card); z-index:1; color:var(--text-muted); font-size:13px; }
+    tr:hover td { background:var(--card-hover); }
+    .btn-sm { padding:6px 12px; font-size:13px; border-radius:8px; }
+  </style>
+</head>
+<body>
+  <div class="top-logo">
+    <img src="/static/icon-192.png" alt="SIA Sueldos">
+    <span class="top-logo-text">SIA</span>
+  </div>
+ 
+  <div class="container">
+    <div class="header">
+      <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:16px">
+        <div>
+          <h1>🩺 Certificados médicos</h1>
+          <div class="subtitle">🏢 """ + esc(empresa_nombre) + """</div>
+        </div>
+        <div class="header-actions">
+          <a href="/portal" class="btn">← Volver al inicio</a>
+        </div>
+      </div>
+    </div>
+ 
+    <div class="card">
+""")
+ 
+    html.append(f"<h2>Recibidos: {len(certificados)}</h2>")
+ 
+    if certificados:
+        html.append("<div class='table-wrap'>")
+        html.append("<table>")
+        html.append("<thead><tr><th>Fecha</th><th>Nombre</th><th>CUIL</th><th>WhatsApp</th><th>Archivo</th></tr></thead>")
+        html.append("<tbody>")
+        for c in certificados:
+            ver_url = f"/portal/certificado?id={c['id']}"
+            html.append("<tr>")
+            html.append(f"<td>{esc(ts_str(c.get('created_at')))}</td>")
+            html.append(f"<td>{esc(c.get('nombre','') or '')}</td>")
+            html.append(f"<td>{esc(c.get('cuil',''))}</td>")
+            html.append(f"<td>{esc(c.get('to_whatsapp','') or '')}</td>")
+            html.append(f"<td><a class='btn primary btn-sm' href='{ver_url}' target='_blank'>Ver / Descargar</a></td>")
+            html.append("</tr>")
+        html.append("</tbody></table></div>")
+    else:
+        html.append("<p class='subtitle'>Todavía no se recibieron certificados.</p>")
+ 
+    html.append("""
+    </div>
+  </div>
+</body>
+</html>
+""")
+ 
+    return Response("".join(html), mimetype="text/html")
+ 
+ 
+# ╔══════════════════════════════════════════════════════════════════════╗
+# ║ PIEZA B — DESCARGA /portal/certificado                                 ║
+# ║ Sirve el archivo desde Drive. Protegido por login del portal.          ║
+# ║ SEGURIDAD: valida que el certificado sea del tenant del usuario.       ║
+# ╚══════════════════════════════════════════════════════════════════════╝
+ 
+@app.get("/portal/certificado")
+def portal_certificado():
+    """Sirve un certificado desde Drive (solo si pertenece al tenant del usuario)."""
+    auth = require_portal_login()
+    if auth:
+        return auth
+ 
+    user_id = session.get('portal_user_id')
+    user = get_portal_user_by_id(user_id)
+    tenant = user['tenant']
+ 
+    try:
+        cert_id = int(request.args.get("id") or "0")
+    except ValueError:
+        cert_id = 0
+    if not cert_id:
+        return Response("Falta id", status=400)
+ 
+    # Buscar el certificado y VALIDAR que sea del tenant del usuario
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT id, tenant, file_id, file_name
+        FROM certificados
+        WHERE id = %s
+    """, (cert_id,))
+    row = cur.fetchone()
+    conn.close()
+ 
+    if not row:
+        return Response("No encontrado", status=404)
+ 
+    cert = dict(row)
+    # 🔒 Seguridad: que el cliente no pueda ver certificados de otra empresa
+    if (cert.get("tenant") or "") != tenant:
+        return Response("Unauthorized", status=403)
+ 
+    file_id = (cert.get("file_id") or "").strip()
+    if not file_id:
+        return Response("Sin archivo", status=404)
+ 
+    try:
+        service = drive_service()
+        meta = service.files().get(fileId=file_id, fields='name,mimeType').execute()
+        file_name = meta.get('name', cert.get('file_name', 'certificado'))
+        mime = meta.get('mimeType', 'application/octet-stream')
+ 
+        req = service.files().get_media(fileId=file_id)
+        fh = io.BytesIO()
+        downloader = MediaIoBaseDownload(fh, req, chunksize=5*1024*1024)
+        done = False
+        while not done:
+            _, done = downloader.next_chunk()
+        fh.seek(0)
+        data = fh.read()
+ 
+        resp = Response(data, mimetype=mime)
+        resp.headers["Content-Disposition"] = f'inline; filename="{file_name}"'
+        resp.headers["Content-Length"] = str(len(data))
+        resp.headers["Cache-Control"] = "private, max-age=60"
+        return resp
+    except Exception as e:
+        print(f"❌ Error descargando certificado (portal): {e}")
+        return Response("Error descargando certificado", status=500)
+ 
 @app.route("/portal/search")
 def portal_search():
     """
@@ -4185,6 +4357,24 @@ def init_db():
             created_at INTEGER NOT NULL
         )
     """)
+
+    """
+        # ✅ NUEVO: certificados médicos recibidos
+        cur.execute('''
+            CREATE TABLE IF NOT EXISTS certificados (
+                id SERIAL PRIMARY KEY,
+                tenant TEXT NOT NULL,
+                cuil TEXT NOT NULL,
+                nombre TEXT,
+                to_whatsapp TEXT,
+                file_id TEXT NOT NULL,
+                file_name TEXT,
+                mime_type TEXT,
+                created_at INTEGER NOT NULL
+            )
+        ''')
+        _try_alter(cur, "CREATE INDEX IF NOT EXISTS idx_cert_tenant ON certificados(tenant, created_at);")
+    """
 
     _try_alter(cur, "CREATE INDEX IF NOT EXISTS idx_pending_to_created ON pending_views(to_whatsapp, created_at);")
     _try_alter(cur, "CREATE INDEX IF NOT EXISTS idx_estado_key ON recibo_estado(tenant, cuil, period);")
@@ -8050,7 +8240,127 @@ def _drive_find_child_folder_id(service, parent_id: str, folder_name: str) -> st
             return (c.get("id") or "").strip()
     return ""
 
-
+##############################################################
+def _drive_ensure_child_folder(service, parent_id: str, folder_name: str) -> str:
+    """
+    Devuelve el id de la carpeta hija 'folder_name' dentro de parent_id.
+    Si no existe, la CREA. Requiere scope de escritura (drive, no readonly).
+    """
+    # ¿ya existe?
+    existing = _drive_find_child_folder_id(service, parent_id, folder_name)
+    if existing:
+        return existing
+ 
+    # crearla
+    metadata = {
+        "name": folder_name,
+        "mimeType": FOLDER_MIME,
+        "parents": [parent_id],
+    }
+    folder = service.files().create(body=metadata, fields="id").execute()
+    return (folder.get("id") or "").strip()
+ 
+ 
+def get_certificados_folder_id(tenant_slug: str) -> str:
+    """
+    Devuelve (creando si hace falta) el id de /<tenant_root>/certificados/
+    """
+    t = get_tenant(tenant_slug)
+    if not t:
+        return ""
+    root_id = (t.get("drive_root_id") or t.get("recibos_root_id") or "").strip()
+    if not root_id:
+        return ""
+    service = drive_service()
+    return _drive_ensure_child_folder(service, root_id, "certificados")
+ 
+ 
+def download_twilio_media(media_url: str) -> tuple[bytes, str]:
+    """
+    Descarga un archivo de media de Twilio (requiere auth con las credenciales).
+    Devuelve (bytes, content_type).
+    """
+    r = requests.get(
+        media_url,
+        auth=(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN),
+        timeout=30,
+    )
+    r.raise_for_status()
+    content_type = r.headers.get("Content-Type", "application/octet-stream")
+    return r.content, content_type
+ 
+ 
+def upload_certificado_to_drive(tenant: str, cuil: str, data: bytes, content_type: str) -> tuple[str, str]:
+    """
+    Sube el certificado a /<tenant>/certificados/<cuil>_<fecha>_<hora>.<ext>
+    Devuelve (file_id, file_name).
+    """
+    folder_id = get_certificados_folder_id(tenant)
+    if not folder_id:
+        raise RuntimeError(f"No se pudo obtener/crear carpeta certificados para tenant={tenant}")
+ 
+    # extensión según content_type
+    ext = "pdf"
+    if "pdf" in content_type:
+        ext = "pdf"
+    elif "jpeg" in content_type or "jpg" in content_type:
+        ext = "jpg"
+    elif "png" in content_type:
+        ext = "png"
+    else:
+        ext = "bin"
+ 
+    now = time.localtime()
+    fecha = time.strftime("%Y-%m-%d", now)
+    hora = time.strftime("%H%M%S", now)
+    file_name = f"{cuil}_{fecha}_{hora}.{ext}"
+ 
+    service = drive_service()
+    media = MediaIoBaseUpload(io.BytesIO(data), mimetype=content_type, resumable=False)
+    metadata = {"name": file_name, "parents": [folder_id]}
+    f = service.files().create(body=metadata, media_body=media, fields="id").execute()
+    file_id = (f.get("id") or "").strip()
+    return file_id, file_name
+ 
+ 
+def save_certificado(tenant: str, cuil: str, nombre: str, to_whatsapp: str,
+                     file_id: str, file_name: str, mime_type: str):
+    """Registra el certificado en la BD."""
+    conn = get_db_connection()
+    cur = conn.cursor()
+    now = int(time.time())
+    cur.execute("""
+        INSERT INTO certificados (tenant, cuil, nombre, to_whatsapp, file_id, file_name, mime_type, created_at)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+    """, (tenant, cuil, nombre, to_whatsapp, file_id, file_name, mime_type, now))
+    conn.commit()
+    conn.close()
+    print(f"✅ Certificado guardado: {tenant}/{cuil} -> {file_name} (file_id={file_id})")
+ 
+ 
+def get_certificados(tenant: str, limit: int = 500) -> list[dict]:
+    """Lista los certificados de un tenant, más recientes primero."""
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT id, tenant, cuil, nombre, to_whatsapp, file_id, file_name, mime_type, created_at
+        FROM certificados
+        WHERE tenant = %s
+        ORDER BY created_at DESC
+        LIMIT %s
+    """, (tenant, limit))
+    rows = cur.fetchall()
+    conn.close()
+    result = []
+    for r in rows:
+        try:
+            result.append(dict(r))
+        except Exception:
+            keys = ["id","tenant","cuil","nombre","to_whatsapp","file_id","file_name","mime_type","created_at"]
+            result.append(dict(zip(keys, r)))
+    return result
+ 
+##############################################################
 def _drive_child_file_exists(service, parent_id: str, filename: str) -> bool:
     """
     True si existe un archivo con nombre exacto dentro de parent_id.
@@ -9507,6 +9817,7 @@ def twilio_inbound():
     _MENU_IDS = {
         "RESEND_LAST", "SEE_PREVIOUS", "MORE_OPTIONS",
         "VIEW_NOW", "NO_NEED", "SIGN_OK", "SIGN_OBS", "ACCEPT_TERMS",
+        "CERT_MEDICO",
     }
     if not button and body in _MENU_IDS:
         button = body
@@ -9592,6 +9903,38 @@ def twilio_inbound():
             )
         
         return twiml(msg)
+
+    # =========================================================================
+    # 🩺 CERT — botón "Certificado médico" (early, igual patrón que SEE_PREVIOUS)
+    # Funciona aunque no haya pending. Si está en varias empresas, pregunta a cuál.
+    # =========================================================================
+    if button == "CERT_MEDICO":
+        tenants_found = find_all_tenants_for_whatsapp(from_whatsapp)
+
+        if len(tenants_found) == 0:
+            return twiml("👋 Para enviar tu certificado, primero necesitás el mensaje inicial de RRHH. Si no lo tenés, avisá a RRHH.")
+
+        elif len(tenants_found) > 1:
+            # Multi-empresa: preguntar a cuál mandar el certificado
+            save_multi_tenant_selection_state(from_whatsapp, tenants_found, action="CERT")
+
+            msg = "Trabajás en varias empresas. ¿A cuál querés enviar el certificado?\n\n"
+            for i, t in enumerate(tenants_found, 1):
+                msg += f"{i}️⃣ {t['display_name']}\n"
+            msg += "\nRespondé con el número."
+
+            return twiml(msg)
+
+        # Un solo tenant: armar pending y pasar a AWAIT_CERT
+        tenant0 = tenants_found[0]["tenant"]
+        cuil0 = tenants_found[0]["cuil"]
+        add_pending_view(from_whatsapp, tenant0, cuil0, "", origin="CERT")
+        p = get_latest_pending_view(from_whatsapp)
+        set_pending_step(p["id"], "AWAIT_CERT")
+        return twiml(
+            "🩺 Mandame una *foto* o *PDF* de tu certificado médico.\n\n"
+            "Si querés salir, escribí *CANCELAR*."
+        )
 
     # ============================================================================
     # MANEJO DE SELECCIÓN MULTI-TENANT (1, 2, 3, 4)
@@ -9696,7 +10039,20 @@ def twilio_inbound():
                             clear_multi_tenant_selection_state(from_whatsapp)
                         
                         return twiml(msg)
-                    
+
+                    # ========================================================
+                    # 🩺 CERT — ACCIÓN: eligió empresa para mandar certificado
+                    # ========================================================
+                    if action == "CERT":
+                        clear_multi_tenant_selection_state(from_whatsapp)
+                        add_pending_view(from_whatsapp, tenant, cuil, "", origin="CERT")
+                        p = get_latest_pending_view(from_whatsapp)
+                        set_pending_step(p["id"], "AWAIT_CERT")
+                        return twiml(
+                            "🩺 Mandame una *foto* o *PDF* de tu certificado médico.\n\n"
+                            "Si querés salir, escribí *CANCELAR*."
+                        )
+
                     # ============================================================
                     # ACCIÓN: RESEND → Enviar último recibo
                     # ============================================================
@@ -9750,7 +10106,7 @@ def twilio_inbound():
                     print(f"Error en selección multi-tenant: {e}")
                     clear_multi_tenant_selection_state(from_whatsapp)
                     return twiml("❌ Hubo un error. Por favor, pedí tu recibo nuevamente.")
-
+            
     # =========================
     # REGLA: cualquier texto (sin botón) dispara menú,
     # EXCEPTO cuando estamos esperando DNI o selección de períodos
@@ -9761,6 +10117,11 @@ def twilio_inbound():
 
         # AWAIT_DNI: dejamos pasar para que lo procese el bloque AWAIT_DNI
         if step_now == "AWAIT_DNI":
+            pass
+
+        # 🩺 CERT — AWAIT_CERT: dejamos pasar para que lo procese el bloque AWAIT_CERT
+        # (importante: si no, la FOTO dispararía el menú)
+        elif step_now == "AWAIT_CERT":
             pass
 
         # CHOOSE_PREVIOUS: si no es 1/2/3/4, devolvemos ayuda (no menú)
@@ -9953,7 +10314,63 @@ def twilio_inbound():
         n = inc_receipt_request_count(tenant, cuil, chosen_period, from_whatsapp)
         _log_receipt_request_event(tenant, cuil, chosen_period, from_whatsapp, "CHOOSE_PREVIOUS", "SENT", message_sid=sid_pdf)
         return twiml(f"📄 Listo. Te reenvié el recibo {chosen_period}. (Pedido {n}/3)")
-    
+
+    # =========================================================================
+    # 🩺 CERT — AWAIT_CERT: esperando el archivo del certificado médico
+    # (va ANTES de AWAIT_DNI)
+    # =========================================================================
+    if step == "AWAIT_CERT":
+        # ¿quiere cancelar?
+        if body.strip().lower() in ("cancelar", "cancel", "salir"):
+            set_pending_step(pending["id"], "READY")
+            return twiml("✅ Cancelado. Cuando quieras, volvé a abrir el menú.")
+
+        # ¿mandó un archivo? Twilio lo indica con NumMedia > 0
+        try:
+            num_media = int(request.form.get("NumMedia") or "0")
+        except ValueError:
+            num_media = 0
+
+        if num_media < 1:
+            # mandó texto en vez de archivo
+            return twiml(
+                "📎 Necesito una *foto* o *PDF* del certificado.\n\n"
+                "Si querés salir, escribí *CANCELAR*."
+            )
+
+        media_url = (request.form.get("MediaUrl0") or "").strip()
+        media_ct = (request.form.get("MediaContentType0") or "").strip().lower()
+
+        # validar tipo: solo imagen o pdf
+        if not (media_ct.startswith("image/") or "pdf" in media_ct):
+            return twiml(
+                "⚠️ Solo acepto *imágenes* o *PDF*. Probá de nuevo.\n\n"
+                "Si querés salir, escribí *CANCELAR*."
+            )
+
+        try:
+            # 1) descargar de Twilio
+            data, content_type = download_twilio_media(media_url)
+            if content_type == "application/octet-stream" and media_ct:
+                content_type = media_ct
+
+            # 2) subir a Drive
+            file_id, file_name = upload_certificado_to_drive(tenant, cuil, data, content_type)
+
+            # 3) registrar en BD
+            nombre = pending.get("nombre", "") or get_nombre_for_cuil(tenant, cuil)
+            save_certificado(tenant, cuil, nombre, from_whatsapp, file_id, file_name, content_type)
+
+            # 4) volver a READY y confirmar
+            set_pending_step(pending["id"], "READY")
+            return twiml("✅ Recibí tu certificado. RRHH lo va a revisar. ¡Gracias!")
+
+        except Exception as e:
+            print(f"❌ Error guardando certificado: {type(e).__name__}: {e}")
+            return twiml(
+                "❌ Hubo un error guardando tu certificado. Probá de nuevo en un momento, o avisá a RRHH."
+            )
+
     # =========================
     # AWAIT_DNI
     # =========================
@@ -10302,6 +10719,41 @@ def admin_reenviar_fallidos():
 """
     
     return Response(html, mimetype="text/html")
+
+@app.get("/media/certificado")
+def media_certificado():
+    #"\"\"Sirve un certificado médico desde Drive (para el panel admin).\"\"\"
+    token = request.args.get("token", "").strip()
+    if ADMIN_TOKEN and token != ADMIN_TOKEN:
+        return Response("Unauthorized", status=401)
+ 
+    file_id = (request.args.get("file_id") or "").strip()
+    if not file_id:
+        return Response("Falta file_id", status=400)
+ 
+    try:
+        service = drive_service()
+        meta = service.files().get(fileId=file_id, fields='name,mimeType').execute()
+        file_name = meta.get('name', 'certificado')
+        mime = meta.get('mimeType', 'application/octet-stream')
+ 
+        req = service.files().get_media(fileId=file_id)
+        fh = io.BytesIO()
+        downloader = MediaIoBaseDownload(fh, req, chunksize=5*1024*1024)
+        done = False
+        while not done:
+            _, done = downloader.next_chunk()
+        fh.seek(0)
+        data = fh.read()
+ 
+        resp = Response(data, mimetype=mime)
+        resp.headers["Content-Disposition"] = f'inline; filename="{file_name}"'
+        resp.headers["Content-Length"] = str(len(data))
+        resp.headers["Cache-Control"] = "private, max-age=60"
+        return resp
+    except Exception as e:
+        print(f"❌ Error descargando certificado: {e}")
+        return Response("Error descargando certificado", status=500)
 
 
 def _send_pdf_flow(from_whatsapp: str, tenant: str, cuil: str, period: str, origin: str = "INITIAL") -> str | None:
