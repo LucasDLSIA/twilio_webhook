@@ -4125,6 +4125,23 @@ def init_db():
         _try_alter(cur, "ALTER TABLE verifications ADD COLUMN IF NOT EXISTS nombre TEXT;")
         _try_alter(cur, "ALTER TABLE verifications ADD COLUMN IF NOT EXISTS dni_hash TEXT;")
         _try_alter(cur, "ALTER TABLE verifications ADD COLUMN IF NOT EXISTS dni_last4 TEXT;")
+
+        # ✅ NUEVO: certificados médicos recibidos (PostgreSQL)
+        cur.execute('''
+            CREATE TABLE IF NOT EXISTS certificados (
+                id SERIAL PRIMARY KEY,
+                tenant TEXT NOT NULL,
+                cuil TEXT NOT NULL,
+                nombre TEXT,
+                to_whatsapp TEXT,
+                file_id TEXT NOT NULL,
+                file_name TEXT,
+                mime_type TEXT,
+                created_at BIGINT NOT NULL
+            )
+        ''')
+        _try_alter(cur, "CREATE INDEX IF NOT EXISTS idx_cert_tenant ON certificados(tenant, created_at);")
+
         conn.commit()
         conn.close()
         return
@@ -4358,25 +4375,22 @@ def init_db():
         )
     """)
 
-        _try_alter(cur, "ALTER TABLE verifications ADD COLUMN IF NOT EXISTS dni_hash TEXT;")
-        _try_alter(cur, "ALTER TABLE verifications ADD COLUMN IF NOT EXISTS dni_last4 TEXT;")
+    # ✅ NUEVO: certificados médicos recibidos (SQLite)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS certificados (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            tenant TEXT NOT NULL,
+            cuil TEXT NOT NULL,
+            nombre TEXT,
+            to_whatsapp TEXT,
+            file_id TEXT NOT NULL,
+            file_name TEXT,
+            mime_type TEXT,
+            created_at INTEGER NOT NULL
+        )
+    """)
 
-        # ✅ NUEVO: certificados médicos recibidos (PostgreSQL)
-        cur.execute('''
-            CREATE TABLE IF NOT EXISTS certificados (
-                id SERIAL PRIMARY KEY,
-                tenant TEXT NOT NULL,
-                cuil TEXT NOT NULL,
-                nombre TEXT,
-                to_whatsapp TEXT,
-                file_id TEXT NOT NULL,
-                file_name TEXT,
-                mime_type TEXT,
-                created_at BIGINT NOT NULL
-            )
-        ''')
-        _try_alter(cur, "CREATE INDEX IF NOT EXISTS idx_cert_tenant ON certificados(tenant, created_at);")
-
+    _try_alter(cur, "CREATE INDEX IF NOT EXISTS idx_cert_tenant ON certificados(tenant, created_at);")
     _try_alter(cur, "CREATE INDEX IF NOT EXISTS idx_pending_to_created ON pending_views(to_whatsapp, created_at);")
     _try_alter(cur, "CREATE INDEX IF NOT EXISTS idx_estado_key ON recibo_estado(tenant, cuil, period);")
     _try_alter(cur, "CREATE INDEX IF NOT EXISTS idx_msg_key ON message_status(tenant, cuil, period, kind);")
@@ -4392,6 +4406,7 @@ def init_db():
     conn.commit()
     conn.close()
 
+    
 init_db()
 
 def inbound_seen(message_sid: str) -> bool:
