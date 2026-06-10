@@ -2,6 +2,7 @@ import os
 import io
 import hmac
 import hashlib
+import logging
 import re
 import time
 
@@ -83,6 +84,16 @@ app.secret_key = SECRET_KEY
 # La app corre detrás de un proxy (Render/Heroku/etc.): respetar X-Forwarded-Proto/Host
 # para que request.url y request.host_url reflejen la URL pública real (https).
 app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1, x_port=1)
+
+# --- Logging ---
+# Nivel configurable con LOG_LEVEL (DEBUG/INFO/WARNING/ERROR). Default: INFO.
+# Los errores dentro de except ahora loguean el traceback completo (log.exception).
+_log_level = os.environ.get("LOG_LEVEL", "INFO").strip().upper()
+logging.basicConfig(
+    level=getattr(logging, _log_level, logging.INFO),
+    format="%(asctime)s %(levelname)s %(message)s",
+)
+log = logging.getLogger("app")
 
 
 
@@ -408,11 +419,11 @@ def debug_list_pdfs_in_folder(folder_id: str):
     ).execute()
 
     files = res.get("files", [])
-    print("📂 DEBUG PDFs en carpeta", folder_id)
+    log.info("%s %s", "📂 DEBUG PDFs en carpeta", folder_id)
     if not files:
-        print("   (no hay PDFs)")
+        log.info("   (no hay PDFs)")
     for f in files:
-        print("   -", f["name"], "| id:", f["id"])
+        log.info("%s %s %s %s", "   -", f["name"], "| id:", f["id"])
 
 
 # Drive: PDF
@@ -427,17 +438,17 @@ def format_cuil_with_dashes(cuil: str) -> str:
 def find_pdf_file_id_for_cuil_period(tenant: str, cuil: str, period: str, *, quiet: bool = False) -> str | None:
     t = get_tenant(tenant)
     if not t:
-        if not quiet: print("❌ tenant inválido:", tenant)
+        if not quiet: log.error("%s %s", "❌ tenant inválido:", tenant)
         return None
 
     root_id = (t.get("recibos_root_id") or t.get("drive_root_id") or "").strip()
     if not root_id:
-        if not quiet: print("❌ tenant sin recibos_root_id:", tenant)
+        if not quiet: log.error("%s %s", "❌ tenant sin recibos_root_id:", tenant)
         return None
 
     cuil_digits = norm_digits(strip_pdf(cuil).strip())
     if len(cuil_digits) != 11:
-        if not quiet: print("❌ CUIL inválido:", cuil)
+        if not quiet: log.error("%s %s", "❌ CUIL inválido:", cuil)
         return None
 
     cuil_dash = format_cuil_with_dashes(cuil_digits)
@@ -455,7 +466,7 @@ def find_pdf_file_id_for_cuil_period(tenant: str, cuil: str, period: str, *, qui
     folders = res.get("files", [])
     if not folders:
         if not quiet:
-            print(f"❌ No encontré carpeta período '{period_folder_name}' en root {root_id}")
+            log.error(f"❌ No encontré carpeta período '{period_folder_name}' en root {root_id}")
         return None
 
     period_id = folders[0]["id"]
@@ -477,7 +488,7 @@ def find_pdf_file_id_for_cuil_period(tenant: str, cuil: str, period: str, *, qui
         return files2[0]["id"]
 
     if not quiet:
-        print(f"❌ No encontré {filename_exact} dentro de carpeta período {period_folder_name} ({period_id})")
+        log.error(f"❌ No encontré {filename_exact} dentro de carpeta período {period_folder_name} ({period_id})")
     return None
 
 from typing import List, Optional
@@ -652,7 +663,7 @@ def media_pdf():
         return resp
         
     except Exception as e:
-        print(f"❌ Error descargando PDF: {e}")
+        log.exception(f"❌ Error descargando PDF: {e}")
         return Response("Error descargando PDF de Drive", status=500)
     
 
@@ -664,7 +675,7 @@ def _twilio_signature_ok() -> bool:
     if not TWILIO_VALIDATE_WEBHOOKS:
         return True
     if not TWILIO_AUTH_TOKEN:
-        print("⚠️ TWILIO_AUTH_TOKEN no configurado: webhook rechazado (TWILIO_VALIDATE_WEBHOOKS=0 lo desactiva).")
+        log.warning("⚠️ TWILIO_AUTH_TOKEN no configurado: webhook rechazado (TWILIO_VALIDATE_WEBHOOKS=0 lo desactiva).")
         return False
     sig = request.headers.get("X-Twilio-Signature", "")
     if not sig:
@@ -730,7 +741,7 @@ def send_email(to_email: str, subject: str, html_body: str) -> bool:
     Returns True si se envió correctamente, False si hubo error.
     """
     if not SMTP_USER or not SMTP_PASSWORD:
-        print("ERROR: SMTP credentials not configured")
+        log.error("ERROR: SMTP credentials not configured")
         return False
     
     try:
@@ -748,11 +759,11 @@ def send_email(to_email: str, subject: str, html_body: str) -> bool:
         server.sendmail(SMTP_FROM, to_email, msg.as_string())
         server.quit()
         
-        print(f"Email sent to {to_email}")
+        log.info(f"Email sent to {to_email}")
         return True
         
     except Exception as e:
-        print(f"Error sending email to {to_email}: {e}")
+        log.exception(f"Error sending email to {to_email}: {e}")
         return False
 
 
@@ -2059,7 +2070,7 @@ def portal_certificado():
         resp.headers["Cache-Control"] = "private, max-age=60"
         return resp
     except Exception as e:
-        print(f"❌ Error descargando certificado (portal): {e}")
+        log.exception(f"❌ Error descargando certificado (portal): {e}")
         return Response("Error descargando certificado", status=500)
  
 @app.route("/portal/search")
@@ -3686,7 +3697,7 @@ def is_pdf_sid(message_sid: str) -> bool:
 @app.post("/twilio/status")
 def twilio_status():
     if not _twilio_signature_ok():
-        print("⚠️ /twilio/status: firma Twilio inválida, request rechazado")
+        log.warning("⚠️ /twilio/status: firma Twilio inválida, request rechazado")
         return Response("Forbidden", status=403)
 
     sid = (request.form.get("MessageSid") or "").strip()
@@ -3838,10 +3849,10 @@ def twilio_status():
 
             # Si es reenvío, NO firmar nunca
             if origin != "INITIAL":
-                print("SKIP SIGN AFTER PDF (origin=", origin, "):", sid)
+                log.info("%s %s %s %s", "SKIP SIGN AFTER PDF (origin=", origin, "):", sid)
 
             elif est in ("FIRMADO", "OBSERVADO"):
-                print("SKIP SIGN (already closed):", tenant, cuil, period, est)
+                log.info("%s %s %s %s %s", "SKIP SIGN (already closed):", tenant, cuil, period, est)
 
             else:
                 if not sign_sent_at and TWILIO_SIGN_TEMPLATE_SID:
@@ -3860,9 +3871,9 @@ def twilio_status():
                         """, (sid_sign, to_whatsapp, tenant, cuil, period, now, now))
 
                         cur.execute("UPDATE sent_pdfs SET sign_sent_at = %s WHERE message_sid = %s", (now, sid))
-                        print("SENT SIGN AFTER PDF DELIVERED:", sid_sign)
+                        log.info("%s %s", "SENT SIGN AFTER PDF DELIVERED:", sid_sign)
                     except Exception as e:
-                        print("WARN: could not send SIGN:", e)
+                        log.warning("%s %s", "WARN: could not send SIGN:", e)
 
 
     conn.commit()
@@ -4129,7 +4140,7 @@ def _log_receipt_request_event(
         conn.commit()
 
     except Exception as e:
-        print("WARN: _log_receipt_request_event failed:", e)
+        log.warning("%s %s", "WARN: _log_receipt_request_event failed:", e)
         try:
             conn.rollback()
         except Exception:
@@ -4731,7 +4742,7 @@ def admin_reset_reenvios():
             cur.execute(sql, params)
             return cur.rowcount
         except Exception as e:
-            print("WARN reset_reenvios:", e)
+            log.warning("%s %s", "WARN reset_reenvios:", e)
             return 0
 
     deleted = {}
@@ -4898,7 +4909,7 @@ def precache_pdfs_for_period(tenant, period):
         # ✅ USAR LA FUNCIÓN CORRECTA
         folder_id = get_tenant_period_folder_id(tenant, period)
         if not folder_id:
-            print(f"⚠️ No se encontró carpeta para {tenant}/{period}")
+            log.warning(f"⚠️ No se encontró carpeta para {tenant}/{period}")
             return {}
         
         service = drive_service()
@@ -4918,11 +4929,11 @@ def precache_pdfs_for_period(tenant, period):
             if cuil:
                 cache[cuil] = f['id']
         
-        print(f"✅ Pre-cached {len(cache)} PDFs for {tenant}/{period}")
+        log.info(f"✅ Pre-cached {len(cache)} PDFs for {tenant}/{period}")
         return cache
         
     except Exception as e:
-        print(f"❌ Error pre-caching PDFs: {e}")
+        log.exception(f"❌ Error pre-caching PDFs: {e}")
         return {}
 
 def set_pending_step(pending_id: int, step: str):
@@ -6418,7 +6429,7 @@ def ts_to_str(ts) -> str:
 
         return dt.datetime.fromtimestamp(int(ts_f)).strftime("%d/%m/%Y %H:%M:%S")
     except Exception as e:
-        print("ts_to_str ERROR:", ts, repr(e))
+        log.exception("%s %s %s", "ts_to_str ERROR:", ts, repr(e))
         return ""
 
 
@@ -6658,7 +6669,7 @@ def find_pdf_with_retry(tenant, cuil, period, tries=4):
                 continue
             raise
     # si agotó reintentos, devolvemos None (no tumbamos la cola)
-    print("DRIVE RETRY EXHAUSTED:", tenant, cuil, period, last)
+    log.info("%s %s %s %s %s", "DRIVE RETRY EXHAUSTED:", tenant, cuil, period, last)
     return None
 
 def get_queue_stats(tenant: str, period: str) -> dict:
@@ -7778,16 +7789,16 @@ def admin_resend_all_pending_views():
                 conn.close()
                 
                 sent += 1
-                print(f"[RESEND_MASS] Enviado a {p['cuil']}: {sid}")
+                log.info(f"[RESEND_MASS] Enviado a {p['cuil']}: {sid}")
                 
                 # Pausa entre envíos
                 time.sleep(1)
                 
             except Exception as e:
                 failed += 1
-                print(f"[RESEND_MASS] Error enviando a {p['cuil']}: {e}")
+                log.exception(f"[RESEND_MASS] Error enviando a {p['cuil']}: {e}")
         
-        print(f"[RESEND_MASS] Completado. Enviados: {sent}, Fallidos: {failed}")
+        log.info(f"[RESEND_MASS] Completado. Enviados: {sent}, Fallidos: {failed}")
     
     # Disparar en background
     thread = threading.Thread(target=process_in_background, daemon=True)
@@ -7850,16 +7861,16 @@ def admin_remind_all_pending_signatures():
                 conn.close()
                 
                 sent += 1
-                print(f"[REMIND_MASS] Enviado a {p['cuil']}: {sid}")
+                log.info(f"[REMIND_MASS] Enviado a {p['cuil']}: {sid}")
                 
                 # Pausa entre envíos
                 time.sleep(1)
                 
             except Exception as e:
                 failed += 1
-                print(f"[REMIND_MASS] Error enviando a {p['cuil']}: {e}")
+                log.exception(f"[REMIND_MASS] Error enviando a {p['cuil']}: {e}")
         
-        print(f"[REMIND_MASS] Completado. Enviados: {sent}, Fallidos: {failed}")
+        log.info(f"[REMIND_MASS] Completado. Enviados: {sent}, Fallidos: {failed}")
     
     # Disparar en background
     thread = threading.Thread(target=process_in_background, daemon=True)
@@ -8472,7 +8483,7 @@ def save_certificado(tenant: str, cuil: str, nombre: str, to_whatsapp: str,
     """, (tenant, cuil, nombre, to_whatsapp, file_id, file_name, mime_type, now))
     conn.commit()
     conn.close()
-    print(f"✅ Certificado guardado: {tenant}/{cuil} -> {file_name} (file_id={file_id})")
+    log.info(f"✅ Certificado guardado: {tenant}/{cuil} -> {file_name} (file_id={file_id})")
  
  
 def get_certificados(tenant: str, limit: int = 500) -> list[dict]:
@@ -8597,14 +8608,14 @@ def find_pdf_file_id(tenant: str, cuil: str, period: str) -> str | None:
     """
     t = get_tenant(tenant)
     if not t:
-        print("❌ tenant inválido:", tenant)
+        log.error("%s %s", "❌ tenant inválido:", tenant)
         return None
 
     root_id = (t.get("drive_root_id") or t.get("recibos_root_id") or "").strip()
-    print("ROOT_ID:", root_id)
+    log.info("%s %s", "ROOT_ID:", root_id)
 
     if not root_id:
-        print("❌ tenant sin drive_root_id/recibos_root_id:", tenant, t)
+        log.error("%s %s %s", "❌ tenant sin drive_root_id/recibos_root_id:", tenant, t)
         return None
 
     cuil = strip_pdf(cuil).strip()
@@ -8618,7 +8629,7 @@ def find_pdf_file_id(tenant: str, cuil: str, period: str) -> str | None:
 
     # debug útil
     if not files:
-        print("🔎 NO ENCONTRÉ:", filename, "en root:", root_id)
+        log.info("%s %s %s %s", "🔎 NO ENCONTRÉ:", filename, "en root:", root_id)
 
     return files[0]["id"] if files else None
 
@@ -8643,7 +8654,7 @@ def admin_reset_tenant():
     cur = conn.cursor()
     cur.execute("DELETE FROM pending_views WHERE tenant=%s;", (tenant,))
     deleted_pending = cur.rowcount
-    print(f"RESET: DELETE FROM pending_views WHERE tenant=%s; args= ({tenant},) deleted= {deleted_pending}")
+    log.info(f"RESET: DELETE FROM pending_views WHERE tenant=%s; args= ({tenant},) deleted= {deleted_pending}")
 
     if period_raw:
         p_norm = norm_period_label(period_raw)  # MM/AAAA
@@ -8662,26 +8673,26 @@ def admin_reset_tenant():
         # borramos en todas las tablas por cada candidato
         for p in candidates:
             cur.execute("DELETE FROM recibo_estado WHERE tenant=%s AND period=%s;", (tenant, p))
-            print(f"RESET: DELETE FROM recibo_estado WHERE tenant=%s AND period=%s; args= {(tenant, p)} deleted= {cur.rowcount}")
+            log.info(f"RESET: DELETE FROM recibo_estado WHERE tenant=%s AND period=%s; args= {(tenant, p)} deleted= {cur.rowcount}")
             
             cur.execute("DELETE FROM message_status WHERE tenant=%s AND period=%s;", (tenant, p))
-            print(f"RESET: DELETE FROM message_status WHERE tenant=%s AND period=%s; args= {(tenant, p)} deleted= {cur.rowcount}")
+            log.info(f"RESET: DELETE FROM message_status WHERE tenant=%s AND period=%s; args= {(tenant, p)} deleted= {cur.rowcount}")
             
             cur.execute("DELETE FROM sent_pdfs WHERE tenant=%s AND period=%s;", (tenant, p))
-            print(f"RESET: DELETE FROM sent_pdfs WHERE tenant=%s AND period=%s; args= {(tenant, p)} deleted= {cur.rowcount}")
+            log.info(f"RESET: DELETE FROM sent_pdfs WHERE tenant=%s AND period=%s; args= {(tenant, p)} deleted= {cur.rowcount}")
             
             cur.execute("DELETE FROM receipt_request_events WHERE tenant=%s AND period=%s;", (tenant, p))
-            print(f"RESET: DELETE FROM receipt_request_events WHERE tenant=%s AND period=%s; args= {(tenant, p)} deleted= {cur.rowcount}")
+            log.info(f"RESET: DELETE FROM receipt_request_events WHERE tenant=%s AND period=%s; args= {(tenant, p)} deleted= {cur.rowcount}")
             
             cur.execute("DELETE FROM receipt_requests WHERE tenant=%s AND period=%s;", (tenant, p))
-            print(f"RESET: DELETE FROM receipt_requests WHERE tenant=%s AND period=%s; args= {(tenant, p)} deleted= {cur.rowcount}")
+            log.info(f"RESET: DELETE FROM receipt_requests WHERE tenant=%s AND period=%s; args= {(tenant, p)} deleted= {cur.rowcount}")
             
             cur.execute("DELETE FROM template_send_queue WHERE tenant=%s AND period=%s;", (tenant, p))
-            print(f"RESET: DELETE FROM template_send_queue WHERE tenant=%s AND period=%s; args= {(tenant, p)} deleted= {cur.rowcount}")
+            log.info(f"RESET: DELETE FROM template_send_queue WHERE tenant=%s AND period=%s; args= {(tenant, p)} deleted= {cur.rowcount}")
             
             # ✅ NUEVO: Borrar pending_terms de este tenant/período
             cur.execute("DELETE FROM pending_terms WHERE tenant=%s AND period=%s;", (tenant, p))
-            print(f"RESET: DELETE FROM pending_terms WHERE tenant=%s AND period=%s; args= {(tenant, p)} deleted= {cur.rowcount}")
+            log.info(f"RESET: DELETE FROM pending_terms WHERE tenant=%s AND period=%s; args= {(tenant, p)} deleted= {cur.rowcount}")
         
         # ✅ NUEVO: Borrar terms_accepted de usuarios de este tenant/período
         cur.execute("""
@@ -8692,31 +8703,31 @@ def admin_reset_tenant():
                 WHERE tenant = %s AND period IN ({})
             )
         """.format(','.join(['%s'] * len(candidates))), (tenant, *candidates))
-        print(f"RESET: DELETE FROM terms_accepted (tenant={tenant}, periods={candidates}); deleted= {cur.rowcount}")
+        log.info(f"RESET: DELETE FROM terms_accepted (tenant={tenant}, periods={candidates}); deleted= {cur.rowcount}")
         
     else:
         # Sin período: borrar todo del tenant
         cur.execute("DELETE FROM recibo_estado WHERE tenant=%s;", (tenant,))
-        print(f"RESET: DELETE FROM recibo_estado WHERE tenant=%s; args= ({tenant},) deleted= {cur.rowcount}")
+        log.info(f"RESET: DELETE FROM recibo_estado WHERE tenant=%s; args= ({tenant},) deleted= {cur.rowcount}")
         
         cur.execute("DELETE FROM message_status WHERE tenant=%s;", (tenant,))
-        print(f"RESET: DELETE FROM message_status WHERE tenant=%s; args= ({tenant},) deleted= {cur.rowcount}")
+        log.info(f"RESET: DELETE FROM message_status WHERE tenant=%s; args= ({tenant},) deleted= {cur.rowcount}")
         
         cur.execute("DELETE FROM sent_pdfs WHERE tenant=%s;", (tenant,))
-        print(f"RESET: DELETE FROM sent_pdfs WHERE tenant=%s; args= ({tenant},) deleted= {cur.rowcount}")
+        log.info(f"RESET: DELETE FROM sent_pdfs WHERE tenant=%s; args= ({tenant},) deleted= {cur.rowcount}")
         
         cur.execute("DELETE FROM receipt_request_events WHERE tenant=%s;", (tenant,))
-        print(f"RESET: DELETE FROM receipt_request_events WHERE tenant=%s; args= ({tenant},) deleted= {cur.rowcount}")
+        log.info(f"RESET: DELETE FROM receipt_request_events WHERE tenant=%s; args= ({tenant},) deleted= {cur.rowcount}")
         
         cur.execute("DELETE FROM receipt_requests WHERE tenant=%s;", (tenant,))
-        print(f"RESET: DELETE FROM receipt_requests WHERE tenant=%s; args= ({tenant},) deleted= {cur.rowcount}")
+        log.info(f"RESET: DELETE FROM receipt_requests WHERE tenant=%s; args= ({tenant},) deleted= {cur.rowcount}")
         
         cur.execute("DELETE FROM template_send_queue WHERE tenant=%s;", (tenant,))
-        print(f"RESET: DELETE FROM template_send_queue WHERE tenant=%s; args= ({tenant},) deleted= {cur.rowcount}")
+        log.info(f"RESET: DELETE FROM template_send_queue WHERE tenant=%s; args= ({tenant},) deleted= {cur.rowcount}")
         
         # ✅ NUEVO: Borrar pending_terms de este tenant (sin período)
         cur.execute("DELETE FROM pending_terms WHERE tenant=%s;", (tenant,))
-        print(f"RESET: DELETE FROM pending_terms WHERE tenant=%s; args= ({tenant},) deleted= {cur.rowcount}")
+        log.info(f"RESET: DELETE FROM pending_terms WHERE tenant=%s; args= ({tenant},) deleted= {cur.rowcount}")
         
         # ✅ NUEVO: Borrar terms_accepted de usuarios de este tenant (sin período)
         cur.execute("""
@@ -8727,7 +8738,7 @@ def admin_reset_tenant():
                 WHERE tenant = %s
             )
         """, (tenant,))
-        print(f"RESET: DELETE FROM terms_accepted (tenant={tenant}, all periods); deleted= {cur.rowcount}")
+        log.info(f"RESET: DELETE FROM terms_accepted (tenant={tenant}, all periods); deleted= {cur.rowcount}")
 
     conn.commit()
     conn.close()
@@ -8772,7 +8783,7 @@ def admin_reset():
 
     def _del(sql, args):
         cur.execute(sql, args)
-        print("RESET:", sql.split("\n")[0][:80], "args=", args, "deleted=", cur.rowcount)
+        log.info("%s %s %s %s %s %s", "RESET:", sql.split("\n")[0][:80], "args=", args, "deleted=", cur.rowcount)
 
     _del("DELETE FROM pending_views WHERE tenant=%s;", (tenant,))
 
@@ -8796,7 +8807,7 @@ def admin_reset():
                 WHERE tenant = %s AND period IN ({placeholders})
             )
         """, (tenant, *periods))
-        print(f"RESET: DELETE FROM terms_accepted (tenant={tenant}, periods={periods}); deleted= {cur.rowcount}")
+        log.info(f"RESET: DELETE FROM terms_accepted (tenant={tenant}, periods={periods}); deleted= {cur.rowcount}")
         
     else:
         _del("DELETE FROM recibo_estado WHERE tenant=%s;", (tenant,))
@@ -8816,7 +8827,7 @@ def admin_reset():
                 WHERE tenant = %s
             )
         """, (tenant,))
-        print(f"RESET: DELETE FROM terms_accepted (tenant={tenant}, all periods); deleted= {cur.rowcount}")
+        log.info(f"RESET: DELETE FROM terms_accepted (tenant={tenant}, all periods); deleted= {cur.rowcount}")
 
     conn.commit()
     conn.close()
@@ -9168,7 +9179,7 @@ def admin_send_auto():
                 )
                 
                 if response.status_code != 200:
-                    print(f"[AUTO] Error HTTP {response.status_code}")
+                    log.error(f"[AUTO] Error HTTP {response.status_code}")
                     break
                 
                 data = response.json()
@@ -9178,21 +9189,21 @@ def admin_send_auto():
                 processed_total += processed
                 sent_total += sent
                 
-                print(f"[AUTO] Iteración {iterations}: procesados={processed}, enviados={sent}, total={sent_total}")
+                log.info(f"[AUTO] Iteración {iterations}: procesados={processed}, enviados={sent}, total={sent_total}")
                 
                 # Si no procesó nada, terminamos
                 if processed == 0:
-                    print(f"[AUTO] Completado. Total enviados: {sent_total}")
+                    log.info(f"[AUTO] Completado. Total enviados: {sent_total}")
                     break
                 
                 # Pausa de 2 segundos entre lotes
                 time.sleep(5)
                 
             except Exception as e:
-                print(f"[AUTO] Error: {e}")
+                log.exception(f"[AUTO] Error: {e}")
                 break
         
-        print(f"[AUTO] Finalizó. Iteraciones: {iterations}, Total enviado: {sent_total}")
+        log.info(f"[AUTO] Finalizó. Iteraciones: {iterations}, Total enviado: {sent_total}")
     
     # Disparar el thread en background
     thread = threading.Thread(target=process_in_background, daemon=True)
@@ -9218,9 +9229,9 @@ def debug_list_root_pdfs(tenant: str, limit=20):
         pageSize=limit
     ).execute()
 
-    print("\n=== ROOT FILES ===")
+    log.info("\n=== ROOT FILES ===")
     for f in res.get("files", []):
-        print(f["name"], f["mimeType"])
+        log.info("%s %s", f["name"], f["mimeType"])
 
 from io import BytesIO
 from flask import send_file
@@ -9549,7 +9560,7 @@ def save_terms_acceptance(whatsapp: str):
     """, (whatsapp, now))
     conn.commit()
     conn.close()
-    print(f"✅ T&C aceptados: {whatsapp}")
+    log.info(f"✅ T&C aceptados: {whatsapp}")
 
 
 def set_pending_terms_acceptance(whatsapp: str, tenant: str, cuil: str, period: str, origin: str = "INITIAL"):
@@ -9569,7 +9580,7 @@ def set_pending_terms_acceptance(whatsapp: str, tenant: str, cuil: str, period: 
     """, (whatsapp, tenant, cuil, period, origin, now))
     conn.commit()
     conn.close()
-    print(f"✅ Pending T&C: {whatsapp} -> {tenant}/{cuil}/{period}")
+    log.info(f"✅ Pending T&C: {whatsapp} -> {tenant}/{cuil}/{period}")
 
 
 def get_pending_terms(whatsapp: str):
@@ -9594,7 +9605,7 @@ def clear_pending_terms(whatsapp: str):
     cur.execute("DELETE FROM pending_terms WHERE whatsapp = %s", (whatsapp,))
     conn.commit()
     conn.close()
-    print(f"✅ Cleared pending T&C: {whatsapp}")
+    log.info(f"✅ Cleared pending T&C: {whatsapp}")
 
 @app.get("/media/terms")
 def media_terms():
@@ -9633,7 +9644,7 @@ def media_terms():
         return resp
         
     except Exception as e:
-        print(f"❌ Error descargando T&C: {e}")
+        log.exception(f"❌ Error descargando T&C: {e}")
         return Response("Error descargando PDF de T&C", status=500)
 
 
@@ -9642,11 +9653,11 @@ def send_terms_and_conditions(to_whatsapp: str, tenant: str, cuil: str, period: 
     try:
         # Validar que estén configuradas las variables
         if not TERMS_TEMPLATE_SID:
-            print(f"❌ ERROR: TERMS_TEMPLATE_SID no está configurado")
+            log.error(f"❌ ERROR: TERMS_TEMPLATE_SID no está configurado")
             return None
         
         if not TERMS_PDF_FILE_ID:
-            print(f"❌ ERROR: TERMS_PDF_FILE_ID no está configurado")
+            log.error(f"❌ ERROR: TERMS_PDF_FILE_ID no está configurado")
             return None
         
         client = _twilio_client()  # ✅ Usar la función correcta
@@ -9672,7 +9683,7 @@ def send_terms_and_conditions(to_whatsapp: str, tenant: str, cuil: str, period: 
             payload_pdf["from_"] = TWILIO_WHATSAPP_FROM
             payload_button["from_"] = TWILIO_WHATSAPP_FROM
         else:
-            print(f"❌ ERROR: No hay TWILIO_WHATSAPP_FROM ni TWILIO_MESSAGING_SERVICE_SID configurado")
+            log.error(f"❌ ERROR: No hay TWILIO_WHATSAPP_FROM ni TWILIO_MESSAGING_SERVICE_SID configurado")
             return None
         
         # Agregar status callback si existe
@@ -9686,11 +9697,11 @@ def send_terms_and_conditions(to_whatsapp: str, tenant: str, cuil: str, period: 
         # 2. Enviar template con botón "Acepto"
         msg_button = client.messages.create(**payload_button)
         
-        print(f"✅ T&C enviados a {to_whatsapp}: PDF={msg_pdf.sid}, Button={msg_button.sid}")
+        log.info(f"✅ T&C enviados a {to_whatsapp}: PDF={msg_pdf.sid}, Button={msg_button.sid}")
         return msg_button.sid
         
     except Exception as e:
-        print(f"❌ Error enviando T&C: {type(e).__name__}: {e}")
+        log.exception(f"❌ Error enviando T&C: {type(e).__name__}: {e}")
         return None
 # ============================================================================
 
@@ -9700,7 +9711,7 @@ def send_whatsapp_menu_template(to_whatsapp: str, nombre: str = "") -> str | Non
     Devuelve Message SID o None.
     """
     if not WHATSAPP_MENU_CONTENT_SID:
-        print("ERROR: falta WHATSAPP_MENU_CONTENT_SID")
+        log.error("ERROR: falta WHATSAPP_MENU_CONTENT_SID")
         return None
 
     client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
@@ -9719,7 +9730,7 @@ def send_whatsapp_menu_template(to_whatsapp: str, nombre: str = "") -> str | Non
         )
         return msg.sid
     except Exception as e:
-        print("ERROR send_whatsapp_menu_template:", e, "vars_=", vars_)
+        log.exception("%s %s %s %s", "ERROR send_whatsapp_menu_template:", e, "vars_=", vars_)
         return None
 
 def list_previous_periods_excluding_current(tenant: str, cuil: str, limit: int = 3) -> list[str]:
@@ -9763,7 +9774,7 @@ def find_all_tenants_for_whatsapp(whatsapp: str) -> List[dict]:
         try:
             envios = load_envios_rows(tenant_slug)
         except Exception as e:
-            print(f"Error loading envios for {tenant_slug}: {e}")
+            log.exception(f"Error loading envios for {tenant_slug}: {e}")
             continue
         
         for row in envios:
@@ -9880,7 +9891,7 @@ def get_multi_tenant_selection_state(whatsapp: str) -> Optional[dict]:
             "created_at": row['created_at']
         }
     except Exception as e:
-        print(f"Error parsing multi_tenant_selection: {e}")
+        log.exception(f"Error parsing multi_tenant_selection: {e}")
         return None
     
 def show_previous_periods_paginated(from_whatsapp: str, tenant: str, cuil: str, offset: int = 0):
@@ -9916,7 +9927,7 @@ def show_previous_periods_paginated(from_whatsapp: str, tenant: str, cuil: str, 
     conn.commit()
     conn.close()
     
-    print(f"✅ SAVED OFFSET IN PENDING: {offset}")  # Debug
+    log.info(f"✅ SAVED OFFSET IN PENDING: {offset}")  # Debug
     
     # Construir mensaje
     msg = "🗂️ Períodos anteriores:\n\n"
@@ -9945,7 +9956,7 @@ TWILIO_SIGN_TEMPLATE_SID = os.environ.get("TWILIO_SIGN_TEMPLATE_SID", "").strip(
 @app.post("/twilio/inbound")
 def twilio_inbound():
     if not _twilio_signature_ok():
-        print("⚠️ /twilio/inbound: firma Twilio inválida, request rechazado")
+        log.warning("⚠️ /twilio/inbound: firma Twilio inválida, request rechazado")
         return Response("Forbidden", status=403)
 
     from_whatsapp = (request.form.get("From") or "").strip()
@@ -9964,12 +9975,12 @@ def twilio_inbound():
         button = body
         body = ""
 
-    print("INBOUND:", from_whatsapp, "MessageSid:", in_sid, "ButtonPayload:", button, "Body:", body)
+    log.info("%s %s %s %s %s %s %s %s", "INBOUND:", from_whatsapp, "MessageSid:", in_sid, "ButtonPayload:", button, "Body:", body)
 
     # ✅ DEDUP global: si Twilio reintenta el mismo inbound, no hacemos nada
     # ✅ DEDUP global
     if inbound_seen(in_sid):
-        print("DEDUP inbound:", in_sid)
+        log.info("%s %s", "DEDUP inbound:", in_sid)
         return Response("OK", status=200)
 
     # ============================================================================
@@ -10004,7 +10015,7 @@ def twilio_inbound():
         return t in ("pdf", "reenviar", "reenviar recibo", "reenvio", "reenvío", "pedir recibo", "quiero mi recibo")
 
     pending = get_latest_pending_view(from_whatsapp)
-    print("PENDING:", pending)
+    log.info("%s %s", "PENDING:", pending)
     
     # =========================
     # SEE_PREVIOUS debe funcionar incluso sin pending
@@ -10096,14 +10107,14 @@ def twilio_inbound():
                 cuil = tenant_info.get("cuil")
                 current_offset = multi_state.get("period_offset", 0)
                 
-                print(f"🔍 PAGING FORWARD: current_offset={current_offset}")
+                log.info(f"🔍 PAGING FORWARD: current_offset={current_offset}")
                 
                 msg, has_more = show_previous_periods_paginated(from_whatsapp, tenant, cuil, offset=current_offset)
                 
                 # Actualizar offset para próxima paginación
                 if has_more:
                     new_offset = current_offset + 3
-                    print(f"✅ SAVING NEXT OFFSET: {new_offset}")
+                    log.info(f"✅ SAVING NEXT OFFSET: {new_offset}")
                     save_multi_tenant_selection_state(
                         from_whatsapp,
                         tenants=[{"tenant": tenant, "cuil": cuil}],
@@ -10117,7 +10128,7 @@ def twilio_inbound():
                 return twiml(msg)
             else:
                 # Si no hay estado de paginación, buscar tenant del pending
-                print(f"⚠️ NO PAGINATION STATE FOUND, using pending tenant/cuil")
+                log.warning(f"⚠️ NO PAGINATION STATE FOUND, using pending tenant/cuil")
                 
                 if not pending:
                     return twiml("❌ Hubo un error. Por favor, pedí tus períodos anteriores nuevamente.")
@@ -10155,7 +10166,7 @@ def twilio_inbound():
                     tenant = selected["tenant"]
                     cuil = selected["cuil"]
                     
-                    print(f"🔍 MULTI-TENANT SELECT: tenant={tenant}, action={action}")
+                    log.info(f"🔍 MULTI-TENANT SELECT: tenant={tenant}, action={action}")
                     
                     # ============================================================
                     # ACCIÓN: SEE_PREVIOUS → Mostrar períodos anteriores
@@ -10164,11 +10175,11 @@ def twilio_inbound():
                         # ⚠️ NO limpiar aquí para SEE_PREVIOUS
                         msg, has_more = show_previous_periods_paginated(from_whatsapp, tenant, cuil, offset=0)
                         
-                        print(f"🔍 AFTER SELECT COMPANY: has_more={has_more}")
+                        log.info(f"🔍 AFTER SELECT COMPANY: has_more={has_more}")
                         
                         # Guardar estado para manejar "4" (ver más)
                         if has_more:
-                            print(f"✅ SAVING PAGINATION STATE: offset=3")
+                            log.info(f"✅ SAVING PAGINATION STATE: offset=3")
                             save_multi_tenant_selection_state(
                                 from_whatsapp,
                                 tenants=[{"tenant": tenant, "cuil": cuil}],
@@ -10200,10 +10211,10 @@ def twilio_inbound():
                     # Para RESEND sí limpiamos porque ya no necesitamos el estado
                     clear_multi_tenant_selection_state(from_whatsapp)
                     
-                    print(f"🔍 RESEND: tenant={tenant}, cuil={cuil}")
+                    log.info(f"🔍 RESEND: tenant={tenant}, cuil={cuil}")
                     
                     period = resolve_best_period_with_pdf(tenant, cuil)
-                    print(f"🔍 RESEND: period={period}")
+                    log.info(f"🔍 RESEND: period={period}")
                     
                     if not period:
                         _log_receipt_request_event(tenant, cuil, "", from_whatsapp, "MULTI_SELECT", "NO_PDF")
@@ -10213,24 +10224,24 @@ def twilio_inbound():
                     pending = get_latest_pending_view(from_whatsapp)
                     
                     cnt = get_receipt_request_count(tenant, cuil, period, from_whatsapp)
-                    print(f"🔍 RESEND: cnt={cnt}")
+                    log.info(f"🔍 RESEND: cnt={cnt}")
                     
                     if cnt >= 3:
                         _log_receipt_request_event(tenant, cuil, period, from_whatsapp, "MULTI_SELECT", "BLOCKED_LIMIT")
                         return twiml(f"⚠️ Ya pediste este recibo {cnt}/3 veces para {period}. Si necesitás más, avisá a RRHH.")
                     
                     is_verified = is_verified_contact(tenant, cuil, from_whatsapp)
-                    print(f"🔍 RESEND: is_verified={is_verified}")
+                    log.info(f"🔍 RESEND: is_verified={is_verified}")
                     
                     if not is_verified:
                         set_pending_step(pending["id"], "AWAIT_DNI")
                         _log_receipt_request_event(tenant, cuil, period, from_whatsapp, "MULTI_SELECT", "ASK_DNI")
                         return twiml("🔐 Para reenviar tu recibo, enviá tu DNI (solo números, sin puntos).")
                     
-                    print(f"🔍 RESEND: Calling _send_pdf_flow...")
+                    log.info(f"🔍 RESEND: Calling _send_pdf_flow...")
                     
                     sid_pdf = _send_pdf_flow(from_whatsapp, tenant, cuil, period, origin="RESEND_LAST")
-                    print(f"🔍 RESEND: sid_pdf={sid_pdf}")
+                    log.info(f"🔍 RESEND: sid_pdf={sid_pdf}")
                     
                     if not sid_pdf:
                         _log_receipt_request_event(tenant, cuil, period, from_whatsapp, "MULTI_SELECT", "ERROR")
@@ -10239,12 +10250,12 @@ def twilio_inbound():
                     n = inc_receipt_request_count(tenant, cuil, period, from_whatsapp)
                     _log_receipt_request_event(tenant, cuil, period, from_whatsapp, "MULTI_SELECT", "SENT", message_sid=sid_pdf)
                     
-                    print(f"✅ RESEND: PDF sent successfully, sid={sid_pdf}")
+                    log.info(f"✅ RESEND: PDF sent successfully, sid={sid_pdf}")
                     
                     return Response("OK", status=200)
                     
                 except Exception as e:
-                    print(f"Error en selección multi-tenant: {e}")
+                    log.exception(f"Error en selección multi-tenant: {e}")
                     clear_multi_tenant_selection_state(from_whatsapp)
                     return twiml("❌ Hubo un error. Por favor, pedí tu recibo nuevamente.")
             
@@ -10415,19 +10426,19 @@ def twilio_inbound():
         # ✅ Leer offset directamente del pending
         current_offset = pending.get("period_offset", 0)
         
-        print(f"🔍 PAGINATION DEBUG: current_offset={current_offset} (from pending)")
+        log.info(f"🔍 PAGINATION DEBUG: current_offset={current_offset} (from pending)")
         
         # Obtener períodos desde el offset correcto
         all_prev = list_previous_periods_excluding_current(tenant, cuil, limit=20)
         prev = all_prev[current_offset:current_offset + 3]
         
-        print(f"🔍 PERIODS: all={all_prev[:10]}, showing={prev}")
+        log.info(f"🔍 PERIODS: all={all_prev[:10]}, showing={prev}")
         
         if idx >= len(prev):
             return twiml("❌ Opción inválida. Respondé con 1, 2 o 3.")
 
         chosen_period = prev[idx]
-        print(f"✅ SELECTED: idx={idx}, period={chosen_period}")
+        log.info(f"✅ SELECTED: idx={idx}, period={chosen_period}")
 
         # Limpiar estado de paginación
         clear_multi_tenant_selection_state(from_whatsapp)
@@ -10507,7 +10518,7 @@ def twilio_inbound():
             return twiml("✅ Recibí tu certificado. RRHH lo va a revisar. ¡Gracias!")
 
         except Exception as e:
-            print(f"❌ Error guardando certificado: {type(e).__name__}: {e}")
+            log.exception(f"❌ Error guardando certificado: {type(e).__name__}: {e}")
             return twiml(
                 "❌ Hubo un error guardando tu certificado. Probá de nuevo en un momento, o avisá a RRHH."
             )
@@ -10545,18 +10556,18 @@ def twilio_inbound():
 
         # ✅ VERIFICAR T&C antes de enviar PDF
         already_accepted = has_accepted_terms(from_whatsapp)
-        print(f"🔍 T&C CHECK (AWAIT_DNI): whatsapp={from_whatsapp}, already_accepted={already_accepted}")
-        print(f"🔍 T&C CONFIG: TERMS_TEMPLATE_SID={TERMS_TEMPLATE_SID[:10] if TERMS_TEMPLATE_SID else 'EMPTY'}, TERMS_PDF_FILE_ID={TERMS_PDF_FILE_ID[:10] if TERMS_PDF_FILE_ID else 'EMPTY'}")
+        log.info(f"🔍 T&C CHECK (AWAIT_DNI): whatsapp={from_whatsapp}, already_accepted={already_accepted}")
+        log.info(f"🔍 T&C CONFIG: TERMS_TEMPLATE_SID={TERMS_TEMPLATE_SID[:10] if TERMS_TEMPLATE_SID else 'EMPTY'}, TERMS_PDF_FILE_ID={TERMS_PDF_FILE_ID[:10] if TERMS_PDF_FILE_ID else 'EMPTY'}")
         
         if not already_accepted:
             origin = (pending.get("origin") or "INITIAL")
-            print(f"🔍 T&C: Enviando T&C a {from_whatsapp}")
+            log.info(f"🔍 T&C: Enviando T&C a {from_whatsapp}")
             send_terms_and_conditions(from_whatsapp, tenant, cuil, period)
             set_pending_terms_acceptance(from_whatsapp, tenant, cuil, period, origin)
             _log_receipt_request_event(tenant, cuil, period, from_whatsapp, "DNI_OK", "SENT_TERMS")
             return twiml("✅ DNI verificado.")
         else:
-            print(f"🔍 T&C: Ya aceptó, enviando PDF directo")
+            log.info(f"🔍 T&C: Ya aceptó, enviando PDF directo")
 
         # ✅ usar origin del pending (INITIAL si vino del admin)
         origin = (pending.get("origin") or "INITIAL")
@@ -10894,7 +10905,7 @@ def media_certificado():
         resp.headers["Cache-Control"] = "private, max-age=60"
         return resp
     except Exception as e:
-        print(f"❌ Error descargando certificado: {e}")
+        log.exception(f"❌ Error descargando certificado: {e}")
         return Response("Error descargando certificado", status=500)
 
 
@@ -10940,7 +10951,7 @@ def _send_pdf_flow(from_whatsapp: str, tenant: str, cuil: str, period: str, orig
         return sid_pdf
 
     except Exception as e:
-        print("ERROR sending PDF:", e)
+        log.exception("%s %s", "ERROR sending PDF:", e)
         return None
 
 
