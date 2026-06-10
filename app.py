@@ -1,6 +1,7 @@
 import os
 import io
-from pydoc import html
+import hmac
+import hashlib
 import re
 import time
 
@@ -9,11 +10,12 @@ import threading
 from datetime import datetime
 import datetime as _dt
 
-import token
 from typing import Optional, Dict, List
+from urllib.parse import urlencode
 
 import pandas as pd
-from flask import Flask, request, redirect, Response, jsonify, session
+from flask import Flask, request, redirect, Response, jsonify, session, g, has_app_context
+from werkzeug.middleware.proxy_fix import ProxyFix
 
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
@@ -22,6 +24,7 @@ from googleapiclient.http import MediaIoBaseUpload
  
 
 from twilio.rest import Client
+from twilio.request_validator import RequestValidator
 
 
 # =========================
@@ -29,6 +32,15 @@ from twilio.rest import Client
 # =========================
 ADMIN_TOKEN = os.environ.get("ADMIN_TOKEN", "").strip()
 EMPRESAS_FILE_ID = os.environ.get("EMPRESAS_FILE_ID", "").strip()
+
+# --- Seguridad (ver CAMBIOS.md) ---
+SECRET_KEY = os.environ.get("SECRET_KEY", "").strip()
+# Secreto para firmar las URLs de /media/pdf y /media/terms. Si no se define, usa SECRET_KEY.
+MEDIA_SECRET = os.environ.get("MEDIA_SECRET", "").strip() or SECRET_KEY
+# Vigencia (segundos) de los links de media firmados. Default: 24 hs.
+MEDIA_TOKEN_TTL = int(os.environ.get("MEDIA_TOKEN_TTL", "86400"))
+# Validación de firma de webhooks de Twilio (X-Twilio-Signature). Poner "0" solo para debug local.
+TWILIO_VALIDATE_WEBHOOKS = os.environ.get("TWILIO_VALIDATE_WEBHOOKS", "1").strip() != "0"
 
 # Google Service Account
 GOOGLE_SA_JSON = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON", "").strip()
@@ -62,7 +74,15 @@ CACHE_TTL = int(os.environ.get("CACHE_TTL", "120"))
 # Flask
 # =========================
 app = Flask(__name__)
-app.secret_key = os.environ.get("SECRET_KEY")
+
+if not SECRET_KEY:
+    # Fail-fast: sin SECRET_KEY las sesiones del portal quedan rotas/inseguras en silencio.
+    raise RuntimeError("Falta SECRET_KEY en ENV: configurala antes de iniciar la app.")
+app.secret_key = SECRET_KEY
+
+# La app corre detrás de un proxy (Render/Heroku/etc.): respetar X-Forwarded-Proto/Host
+# para que request.url y request.host_url reflejen la URL pública real (https).
+app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1, x_port=1)
 
 
 
@@ -138,9 +158,32 @@ def period_to_folder_name(period: str) -> str:
 # =========================
 # Auth admin (token por query/header)
 # =========================
+def make_media_token(kind: str, tenant: str = "", cuil: str = "", period: str = "", ttl: int | None = None) -> str:
+    """Token firmado (HMAC) con vencimiento para los endpoints /media/*.
+    Reemplaza el uso de ADMIN_TOKEN en URLs que viajan a Twilio."""
+    exp = int(time.time()) + int(ttl if ttl is not None else MEDIA_TOKEN_TTL)
+    msg = f"{kind}|{tenant}|{cuil}|{period}|{exp}".encode("utf-8")
+    sig = hmac.new(MEDIA_SECRET.encode("utf-8"), msg, hashlib.sha256).hexdigest()
+    return f"{exp}.{sig}"
+
+def check_media_token(token: str, kind: str, tenant: str = "", cuil: str = "", period: str = "") -> bool:
+    """Valida un token generado por make_media_token (firma + vencimiento + alcance)."""
+    try:
+        exp_s, sig = (token or "").split(".", 1)
+        exp = int(exp_s)
+    except (ValueError, AttributeError):
+        return False
+    if exp < int(time.time()):
+        return False
+    msg = f"{kind}|{tenant}|{cuil}|{period}|{exp}".encode("utf-8")
+    expected = hmac.new(MEDIA_SECRET.encode("utf-8"), msg, hashlib.sha256).hexdigest()
+    return hmac.compare_digest(sig, expected)
+
 def admin_ok() -> bool:
     if not ADMIN_TOKEN:
-        return True
+        # Fail-closed: si no hay ADMIN_TOKEN configurado, el admin queda bloqueado
+        # (antes quedaba abierto a internet).
+        return False
     tok = request.args.get("token", "") or request.headers.get("X-Admin-Token", "")
     return tok.strip() == ADMIN_TOKEN
 
@@ -564,15 +607,16 @@ def ensure_sqlite_columns(table: str, columns: dict[str, str]) -> None:
 @app.get("/media/pdf")
 def media_pdf():
     token = request.args.get("token", "").strip()
-    if ADMIN_TOKEN and token != ADMIN_TOKEN:
-        return Response("Unauthorized", status=401)
-
     tenant = (request.args.get("tenant") or "").strip().lower()
     cuil = (request.args.get("cuil") or "").strip()
     period = (request.args.get("period") or "").strip()
 
     if not (tenant and cuil and period):
         return Response("Faltan parámetros tenant/cuil/period", status=400)
+
+    # Token firmado y acotado a este tenant/cuil/period (ya no se usa ADMIN_TOKEN acá).
+    if not check_media_token(token, "pdf", tenant=tenant, cuil=cuil, period=period):
+        return Response("Unauthorized", status=401)
 
     file_id = find_pdf_file_id_for_cuil_period(tenant, cuil, period, quiet=True)
     if not file_id:
@@ -614,6 +658,27 @@ def media_pdf():
 
 # Twilio senders
 # =========================
+def _twilio_signature_ok() -> bool:
+    """Valida la firma X-Twilio-Signature de los webhooks entrantes.
+    Evita que terceros simulen mensajes/estados. Desactivable con TWILIO_VALIDATE_WEBHOOKS=0."""
+    if not TWILIO_VALIDATE_WEBHOOKS:
+        return True
+    if not TWILIO_AUTH_TOKEN:
+        print("⚠️ TWILIO_AUTH_TOKEN no configurado: webhook rechazado (TWILIO_VALIDATE_WEBHOOKS=0 lo desactiva).")
+        return False
+    sig = request.headers.get("X-Twilio-Signature", "")
+    if not sig:
+        return False
+    validator = RequestValidator(TWILIO_AUTH_TOKEN)
+    params = request.form.to_dict()
+    if validator.validate(request.url, params, sig):
+        return True
+    # Fallback por si el proxy no reporta bien el esquema (http vs https).
+    if request.url.startswith("http://"):
+        return validator.validate("https://" + request.url[len("http://"):], params, sig)
+    return False
+
+
 def _twilio_client() -> Client:
     if not (TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN):
         raise RuntimeError("Faltan TWILIO_ACCOUNT_SID / TWILIO_AUTH_TOKEN en ENV")
@@ -3620,6 +3685,10 @@ def is_pdf_sid(message_sid: str) -> bool:
 
 @app.post("/twilio/status")
 def twilio_status():
+    if not _twilio_signature_ok():
+        print("⚠️ /twilio/status: firma Twilio inválida, request rechazado")
+        return Response("Forbidden", status=403)
+
     sid = (request.form.get("MessageSid") or "").strip()
     status = (request.form.get("MessageStatus") or "").strip().lower()
     error_code = (request.form.get("ErrorCode") or "").strip()
@@ -3840,7 +3909,29 @@ def get_db_connection():
         raise RuntimeError("Falta DATABASE_URL en ENV (la app requiere PostgreSQL)")
     conn = psycopg2.connect(DATABASE_URL)
     conn.cursor_factory = RealDictCursor
+    # Red de seguridad contra fugas: registramos la conexión para cerrarla al final
+    # del request si algún handler la dejó abierta (p. ej. por una excepción).
+    if has_app_context():
+        if not hasattr(g, "_db_conns"):
+            g._db_conns = []
+        g._db_conns.append(conn)
     return conn
+
+
+@app.teardown_appcontext
+def _close_leaked_db_connections(exc):
+    conns = getattr(g, "_db_conns", None) or []
+    for conn in conns:
+        try:
+            if getattr(conn, "closed", 1) == 0:
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
+                conn.close()
+        except Exception:
+            pass
+    g._db_conns = []
 
 
 def get_latest_context_for_whatsapp(to_whatsapp: str) -> dict | None:
@@ -4478,10 +4569,12 @@ def cuil_to_dni(cuil: str) -> str | None:
 
 import hashlib
 
-def _hash_dni(dni: str) -> tuple[str, str]:
+def _hash_dni(dni: str, tenant: str = "") -> tuple[str, str]:
+    """Hash de DNI + últimos 4 dígitos. Delega en _dni_hash() (salt por tenant)
+    para que toda la tabla verifications use un único esquema de hash."""
     dni_digits = "".join(ch for ch in (dni or "") if ch.isdigit())
     last4 = dni_digits[-4:] if len(dni_digits) >= 4 else dni_digits
-    h = hashlib.sha256(dni_digits.encode("utf-8")).hexdigest() if dni_digits else ""
+    h = _dni_hash(dni_digits, tenant) if dni_digits else ""
     return h, last4
 
 def is_verified(tenant: str, cuil: str, to_whatsapp: str) -> bool:
@@ -4493,7 +4586,7 @@ def is_verified(tenant: str, cuil: str, to_whatsapp: str) -> bool:
 
 def upsert_verification(tenant: str, cuil: str, to_whatsapp: str, dni: str | None = None):
     now = int(time.time())
-    dni_hash, dni_last4 = _hash_dni(dni or "")
+    dni_hash, dni_last4 = _hash_dni(dni or "", tenant)
     conn = get_db_connection()
     cur = conn.cursor()
 
@@ -4585,7 +4678,8 @@ def is_verified_contact(tenant: str, cuil: str, to_whatsapp: str) -> bool:
 import hashlib
 
 def _dni_hash(dni: str, tenant: str) -> str:
-    # Salt simple por tenant (podés cambiar por SECRET_KEY si tenés)
+    # Hash canónico de DNI (salt por tenant). _hash_dni() delega acá:
+    # antes había dos esquemas distintos escribiendo en verifications.dni_hash.
     raw = f"{tenant}|{dni}".encode("utf-8")
     return hashlib.sha256(raw).hexdigest()
 
@@ -5752,11 +5846,14 @@ def pdf_exists_for_tenant_period_cuil(tenant, cuil, period):
     if not url.startswith("http"):
         # fallback: no podemos verificar
         return True
+    t_q = str(tenant or "").strip().lower()
+    c_q = str(cuil or "").strip()
+    p_q = str(period or "").strip()
     r = requests.get(url, params={
-        "tenant": tenant,
-        "cuil": cuil,
-        "period": period,
-        "token": ADMIN_TOKEN
+        "tenant": t_q,
+        "cuil": c_q,
+        "period": p_q,
+        "token": make_media_token("pdf", tenant=t_q, cuil=c_q, period=p_q)
     }, timeout=12)
     return r.status_code == 200
 
@@ -9503,7 +9600,7 @@ def clear_pending_terms(whatsapp: str):
 def media_terms():
     """Sirve el PDF de Términos y Condiciones."""
     token = request.args.get("token", "").strip()
-    if ADMIN_TOKEN and token != ADMIN_TOKEN:
+    if not check_media_token(token, "terms"):
         return Response("Unauthorized", status=401)
     
     if not TERMS_PDF_FILE_ID:
@@ -9558,7 +9655,7 @@ def send_terms_and_conditions(to_whatsapp: str, tenant: str, cuil: str, period: 
         payload_pdf = {
             "to": to_whatsapp,
             "body": "📄 Antes de continuar, por favor leé nuestros Términos y Condiciones adjuntos.",
-            "media_url": [f"{request.host_url.rstrip('/')}/media/terms?token={ADMIN_TOKEN}"],
+            "media_url": [f"{request.host_url.rstrip('/')}/media/terms?token={make_media_token('terms')}"],
         }
         
         # Preparar payload del botón
@@ -9847,6 +9944,10 @@ TWILIO_SIGN_TEMPLATE_SID = os.environ.get("TWILIO_SIGN_TEMPLATE_SID", "").strip(
 
 @app.post("/twilio/inbound")
 def twilio_inbound():
+    if not _twilio_signature_ok():
+        print("⚠️ /twilio/inbound: firma Twilio inválida, request rechazado")
+        return Response("Forbidden", status=403)
+
     from_whatsapp = (request.form.get("From") or "").strip()
     button = (request.form.get("ButtonPayload") or "").strip()
     body = (request.form.get("Body") or "").strip()
@@ -10764,7 +10865,8 @@ def admin_reenviar_fallidos():
 def media_certificado():
     #"\"\"Sirve un certificado médico desde Drive (para el panel admin).\"\"\"
     token = request.args.get("token", "").strip()
-    if ADMIN_TOKEN and token != ADMIN_TOKEN:
+    if not ADMIN_TOKEN or token != ADMIN_TOKEN:
+        # Fail-closed: sin ADMIN_TOKEN configurado este endpoint queda bloqueado.
         return Response("Unauthorized", status=401)
  
     file_id = (request.args.get("file_id") or "").strip()
@@ -10807,11 +10909,17 @@ def _send_pdf_flow(from_whatsapp: str, tenant: str, cuil: str, period: str, orig
         return None
 
 
-    # ✅ URL optimizada de nuestro servidor (más rápido con chunks 5MB)
-    pdf_url = (
-        f"{request.host_url.rstrip('/')}/media/pdf"
-        f"?tenant={tenant}&cuil={cuil}&period={period}&token={ADMIN_TOKEN}"
-    )
+    # ✅ URL firmada y con vencimiento (ya no viaja ADMIN_TOKEN a Twilio)
+    t_q = (tenant or "").strip().lower()
+    c_q = (cuil or "").strip()
+    p_q = (period or "").strip()
+    qs = urlencode({
+        "tenant": t_q,
+        "cuil": c_q,
+        "period": p_q,
+        "token": make_media_token("pdf", tenant=t_q, cuil=c_q, period=p_q),
+    })
+    pdf_url = f"{request.host_url.rstrip('/')}/media/pdf?{qs}"
     try:
         # ✅ Para controlar el orden:
         # - En INITIAL podemos incluir body (si querés).
