@@ -12,7 +12,8 @@ from datetime import datetime
 import datetime as _dt
 
 from typing import Optional, Dict, List
-from urllib.parse import urlencode
+from urllib.parse import urlencode, quote
+from functools import wraps
 
 import pandas as pd
 from flask import Flask, request, redirect, Response, jsonify, session, g, has_app_context
@@ -94,6 +95,19 @@ logging.basicConfig(
     format="%(asctime)s %(levelname)s %(message)s",
 )
 log = logging.getLogger("app")
+# La librería de Twilio loguea cada request/response a su API a nivel INFO
+# (bloques "-- BEGIN Twilio API Request --"): puro ruido, lo subimos a WARNING.
+logging.getLogger("twilio").setLevel(logging.WARNING)
+
+# --- Cookies de sesión (admin y portal) ---
+# SameSite=Lax bloquea CSRF en los POST autenticados por sesión: el navegador
+# no manda la cookie en POSTs originados en otros sitios.
+# COOKIE_SECURE=0 solo para desarrollo local sin HTTPS.
+app.config.update(
+    SESSION_COOKIE_HTTPONLY=True,
+    SESSION_COOKIE_SAMESITE="Lax",
+    SESSION_COOKIE_SECURE=os.environ.get("COOKIE_SECURE", "1").strip() != "0",
+)
 
 
 
@@ -190,17 +204,64 @@ def check_media_token(token: str, kind: str, tenant: str = "", cuil: str = "", p
     expected = hmac.new(MEDIA_SECRET.encode("utf-8"), msg, hashlib.sha256).hexdigest()
     return hmac.compare_digest(sig, expected)
 
-def admin_ok() -> bool:
-    if not ADMIN_TOKEN:
-        # Fail-closed: si no hay ADMIN_TOKEN configurado, el admin queda bloqueado
-        # (antes quedaba abierto a internet).
+# =========================
+# Autenticación del admin (sesión + token para automatizaciones)
+# =========================
+# Vigencia de la sesión del admin (segundos). Default: 8 horas.
+ADMIN_SESSION_TTL = int(os.environ.get("ADMIN_SESSION_TTL", str(8 * 3600)))
+
+def admin_session_active() -> bool:
+    """True si hay una sesión de admin válida y no vencida."""
+    if not session.get("admin_authed"):
         return False
-    tok = request.args.get("token", "") or request.headers.get("X-Admin-Token", "")
-    return tok.strip() == ADMIN_TOKEN
+    since = session.get("admin_authed_at", 0)
+    try:
+        since = int(since)
+    except (TypeError, ValueError):
+        return False
+    return (int(time.time()) - since) < ADMIN_SESSION_TTL
+
+def admin_token_valid() -> bool:
+    """True si el request trae el ADMIN_TOKEN correcto (para cron / background / self-calls)."""
+    if not ADMIN_TOKEN:
+        return False
+    tok = (request.args.get("token") or request.form.get("token")
+           or request.headers.get("X-Admin-Token", "")).strip()
+    return bool(tok) and hmac.compare_digest(tok, ADMIN_TOKEN)
+
+def admin_authenticated() -> bool:
+    """El admin está autenticado por sesión (humano) o por token (máquina)."""
+    return admin_session_active() or admin_token_valid()
+
+def admin_ok() -> bool:
+    # Mantengo el nombre por compatibilidad: ahora acepta sesión o token.
+    # (Antes devolvía True si ADMIN_TOKEN estaba vacío, dejando el admin abierto.)
+    return admin_authenticated()
 
 def require_admin():
-    if not admin_ok():
-        return Response("Unauthorized (admin token requerido)", status=401)
+    if admin_authenticated():
+        return None
+    # Si parece un navegador (acepta HTML) y no es POST, lo mandamos al login
+    # preservando el destino. Para clientes no-navegador / POST, 401 directo.
+    accepts_html = "text/html" in (request.headers.get("Accept") or "")
+    if request.method == "GET" and accepts_html:
+        return redirect("/admin/login?next=" + quote(request.full_path or "/admin", safe=""))
+    return Response("Unauthorized (admin login requerido)", status=401)
+
+def _get_admin_token_from_request() -> str:
+    return (request.args.get("token") or request.form.get("token") or "").strip()
+
+def admin_required(fn):
+    @wraps(fn)
+    def wrapper(*args, **kwargs):
+        # Acepta sesión de admin (humano logueado) o ADMIN_TOKEN (cron/background/self-call).
+        if admin_authenticated():
+            return fn(*args, **kwargs)
+        accepts_html = "text/html" in (request.headers.get("Accept") or "")
+        if request.method == "GET" and accepts_html:
+            return redirect("/admin/login?next=" + quote(request.full_path or "/admin", safe=""))
+        return Response("Unauthorized", status=401)
+    return wrapper
 
 # =========================
 # Google Drive
@@ -4780,9 +4841,10 @@ def admin_reset_reenvios():
 
 @app.get("/admin/send_template_preview")
 def admin_send_template_preview():
-    auth = require_admin()
-    if auth:
-        return auth
+    # Endpoint de acción por URL (dispara envíos): solo ADMIN_TOKEN, sin sesión.
+    # Mismo criterio que /admin/reset_reenvios — inmune a CSRF por link.
+    if not admin_token_valid():
+        return Response("Unauthorized (requiere token=ADMIN_TOKEN)", status=401)
 
     tenant = (request.args.get("tenant") or "").strip().lower()
     period_label = (request.args.get("period") or "").strip()  # "01/2026"
@@ -5642,6 +5704,7 @@ def generate_pdf_report_v2(tenant: str, period_filter: str = ""):
 
 
 @app.get("/admin/report_recibos.pdf")
+@admin_required
 def admin_report_recibos_pdf():
     token = _get_admin_token_from_request()
     tenant = (request.args.get("tenant") or "").strip().lower()
@@ -5662,6 +5725,7 @@ def admin_report_recibos_pdf():
 
 
 @app.get("/admin/report_recibos.xlsx")
+@admin_required
 def admin_report_recibos_xlsx():
     token = _get_admin_token_from_request()
     tenant = (request.args.get("tenant") or "").strip().lower()
@@ -5727,17 +5791,9 @@ def get_pdf_by_sid(sid):
 from functools import wraps
 from flask import request, Response
 
-def _get_admin_token_from_request() -> str:
-    return (request.args.get("token") or request.form.get("token") or "").strip()
-
-def admin_required(fn):
-    @wraps(fn)
-    def wrapper(*args, **kwargs):
-        tok = _get_admin_token_from_request()
-        if not ADMIN_TOKEN or tok != ADMIN_TOKEN:
-            return Response("Unauthorized", status=401)
-        return fn(*args, **kwargs)
-    return wrapper
+# (_get_admin_token_from_request y admin_required están definidos arriba,
+#  junto a los demás helpers de auth: los decoradores se evalúan al importar
+#  y acá quedaban DESPUÉS de su primer uso.)
 
 
 
@@ -5876,7 +5932,7 @@ def pdf_exists_for_tenant_period_cuil(tenant, cuil, period):
 def root():
     tok = request.args.get("token", "")
     if tok:
-        return redirect(f"/admin?token={tok}")
+        return redirect(f"/admin")
     return redirect("/admin")
 
 
@@ -5924,6 +5980,78 @@ def already_sent_template(tenant: str, cuil: str, period: str, to_whatsapp: str)
     finally:
         conn.close()
 
+
+
+@app.route("/admin/login", methods=["GET", "POST"])
+def admin_login():
+    # Si ya hay sesión activa, vamos directo al destino.
+    nxt = request.args.get("next") or request.form.get("next") or "/admin"
+    # Anti open-redirect: solo permitimos rutas internas.
+    if not nxt.startswith("/") or nxt.startswith("//"):
+        nxt = "/admin"
+
+    if admin_session_active():
+        return redirect(nxt)
+
+    error = ""
+    if request.method == "POST":
+        pwd = (request.form.get("password") or "").strip()
+        if not ADMIN_TOKEN:
+            error = "El admin no está configurado (falta ADMIN_TOKEN en el servidor)."
+        elif pwd and hmac.compare_digest(pwd, ADMIN_TOKEN):
+            session["admin_authed"] = True
+            session["admin_authed_at"] = int(time.time())
+            session.permanent = False
+            log.info("ADMIN LOGIN OK desde %s", request.remote_addr)
+            return redirect(nxt)
+        else:
+            time.sleep(0.8)  # frena fuerza bruta contra el formulario
+            error = "Clave incorrecta."
+            log.warning("ADMIN LOGIN fallido desde %s", request.remote_addr)
+
+    error_html = f"<div class='err'>{esc(error)}</div>" if error else ""
+    page = f"""<!doctype html>
+<html lang="es"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Admin · Ingresar</title>
+<style>
+  :root {{ --bg:#0b1220; --text:#e8eefc; --line:rgba(255,255,255,.12); --accent:#5aa7ff; }}
+  *{{box-sizing:border-box}}
+  body{{margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;
+    font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;
+    background:radial-gradient(1000px 600px at 30% -10%, rgba(90,167,255,.20), transparent 60%), var(--bg);
+    color:var(--text);padding:20px;}}
+  .card{{width:100%;max-width:380px;border:1px solid var(--line);border-radius:16px;
+    background:rgba(255,255,255,.04);padding:28px;box-shadow:0 20px 60px rgba(0,0,0,.4);}}
+  h1{{font-size:20px;margin:0 0 6px}}
+  p.sub{{margin:0 0 20px;color:#9fb2d6;font-size:14px}}
+  label{{display:block;font-size:13px;margin-bottom:6px;color:#cdd9f0}}
+  input[type=password]{{width:100%;padding:12px 14px;border-radius:10px;border:1px solid var(--line);
+    background:rgba(0,0,0,.25);color:var(--text);font-size:15px;}}
+  button{{margin-top:16px;width:100%;padding:12px;border:0;border-radius:10px;cursor:pointer;
+    background:var(--accent);color:#04122b;font-weight:600;font-size:15px;}}
+  .err{{margin-bottom:14px;padding:10px 12px;border-radius:10px;background:rgba(248,113,113,.15);
+    border:1px solid rgba(248,113,113,.4);color:#fecaca;font-size:14px;}}
+</style></head>
+<body>
+  <form class="card" method="post" action="/admin/login">
+    <h1>🔐 Panel de administración</h1>
+    <p class="sub">Ingresá la clave de acceso para continuar.</p>
+    {error_html}
+    <input type="hidden" name="next" value="{esc(nxt)}">
+    <label for="password">Clave</label>
+    <input id="password" name="password" type="password" autofocus autocomplete="current-password">
+    <button type="submit">Ingresar</button>
+  </form>
+</body></html>"""
+    return Response(page, mimetype="text/html")
+
+
+@app.get("/admin/logout")
+def admin_logout():
+    session.pop("admin_authed", None)
+    session.pop("admin_authed_at", None)
+    return redirect("/admin/login")
 
 
 @app.get("/admin")
@@ -6075,7 +6203,8 @@ def admin_home():
     html.append("<div class='row' style='gap:10px;justify-content:flex-end'>")
     html.append("<button class='eye-btn' type='button' id='eyeAll' title='Mostrar/ocultar todas'>👁️</button>")
     html.append(f"<div class='muted'>Token: <code>{esc(token)}</code></div>")
-    html.append("<a href='/admin/portal_users?token=" + esc(token) + "' class='btn'>👥 Usuarios del Portal</a>")
+    html.append("<a href='/admin/portal_users' class='btn'>👥 Usuarios del Portal</a>")
+    html.append("<a href='/admin/logout' class='btn secondary' style='float:right'>Salir</a>")
     html.append("</div>")
 
     html.append("</div>")  # topbar
@@ -6106,8 +6235,8 @@ def admin_home():
         for t in tenants:
             slug = t["slug"]
             name = t.get("display_name") or slug
-            panel_url = f"/admin/panel?tenant={esc(slug)}&token={esc(token)}"
-            test_url = f"/admin/send_test?tenant={esc(slug)}&token={esc(token)}"
+            panel_url = f"/admin/panel?tenant={esc(slug)}"
+            test_url = f"/admin/send_test?tenant={esc(slug)}"
 
             html.append(f"""
               <div class="tile" data-name="{esc(name).lower()} {esc(slug).lower()}" data-tenant="{esc(slug)}">
@@ -6313,7 +6442,7 @@ def admin_verifications_import():
     import pandas as pd
     df = pd.read_excel(f)
     if df is None or df.empty:
-        return redirect(f"/admin/panel?tenant={tenant}&token={token}&msg=verif_import_empty")
+        return redirect(f"/admin/panel?tenant={tenant}&msg=verif_import_empty")
 
     df.columns = [str(c).strip().lower() for c in df.columns]
 
@@ -6372,7 +6501,7 @@ def admin_verifications_import():
     conn.commit()
     conn.close()
 
-    return redirect(f"/admin/panel?tenant={tenant}&token={token}&msg=verif_import_ok&n={ok}&skipped={skipped}")
+    return redirect(f"/admin/panel?tenant={tenant}&msg=verif_import_ok&n={ok}&skipped={skipped}")
 
 
 @app.post("/admin/verifications_update")
@@ -6380,7 +6509,7 @@ def admin_verifications_import():
 def admin_verifications_update():
     token = _get_admin_token_from_request()
     tenant = (request.form.get("tenant") or "").strip().lower()
-    return redirect(f"/admin/panel?tenant={tenant}&token={token}&msg=verif_update_disabled")
+    return redirect(f"/admin/panel?tenant={tenant}&msg=verif_update_disabled")
 
 
 @app.post("/admin/verifications_delete")
@@ -6404,7 +6533,7 @@ def admin_verifications_delete():
     conn.commit()
     conn.close()
 
-    return redirect(f"/admin/panel?tenant={tenant}&token={token}&msg=verif_deleted")
+    return redirect(f"/admin/panel?tenant={tenant}&msg=verif_deleted")
 
 from io import BytesIO
 from openpyxl import Workbook
@@ -6809,14 +6938,13 @@ def admin_seguimiento():
     html.append(f"<div class='subtitle'><b>Empresa:</b> {esc(t.get('display_name',''))}</div>")
     html.append("</div>")
     html.append("<div class='row'>")
-    html.append(f"<a class='btn secondary' href='/admin/panel?tenant={esc(tenant)}&token={esc(token)}'>← Volver al panel</a>")
+    html.append(f"<a class='btn secondary' href='/admin/panel?tenant={esc(tenant)}'>← Volver al panel</a>")
     html.append("</div>")
     html.append("</div>")
 
     # Selector de período
     html.append("<div class='card'>")
     html.append("<form method='get'>")
-    html.append(f"<input type='hidden' name='token' value='{esc(token)}'>")
     html.append(f"<input type='hidden' name='tenant' value='{esc(tenant)}'>")
     html.append("<div class='row'>")
     html.append("<div>")
@@ -7129,11 +7257,11 @@ def admin_panel():
     html.append(f"<div class='subtitle'><b>Empresa:</b> {esc(t.get('display_name',''))} · <span class='pill'>slug <code>{esc(t.get('slug',''))}</code></span></div>")
     html.append("</div>")
     html.append("<div class='right'>")
-    html.append(f"<a class='btn secondary' href='/admin?token={esc(token)}'>← Volver</a>")
-    html.append(f"<a class='btn' href='/admin/reenviar_template?token={esc(token)}'>📤 Reenviar template</a>")
-    html.append(f"<a class='btn' href='/admin/send_test?tenant={esc(tenant)}&token={esc(token)}'>📤 Envío individual</a>")
-    html.append(f"<a class='btn' href='/admin/reenviar_fallidos?token={esc(token)}'>🔄 Reenviar fallidos</a>")
-    html.append(f"<a class='btn' href='/admin/seguimiento?tenant={esc(tenant)}&token={esc(token)}'>⚠️ Seguimiento</a>")
+    html.append(f"<a class='btn secondary' href='/admin'>← Volver</a>")
+    html.append(f"<a class='btn' href='/admin/reenviar_template'>📤 Reenviar template</a>")
+    html.append(f"<a class='btn' href='/admin/send_test?tenant={esc(tenant)}'>📤 Envío individual</a>")
+    html.append(f"<a class='btn' href='/admin/reenviar_fallidos'>🔄 Reenviar fallidos</a>")
+    html.append(f"<a class='btn' href='/admin/seguimiento?tenant={esc(tenant)}'>⚠️ Seguimiento</a>")
     html.append("</div>")
     html.append("</div>")
 
@@ -7147,7 +7275,6 @@ def admin_panel():
 
     # Start queue
     html.append("<form method='post' action='/admin/send_template_queue_start'>")
-    html.append(f"<input type='hidden' name='token' value='{esc(token)}'>")
     html.append(f"<input type='hidden' name='tenant' value='{esc(tenant)}'>")
     html.append("<div class='row'>")
     html.append("<div>")
@@ -7182,7 +7309,6 @@ def admin_panel():
         html.append("</div>")
 
         html.append("<form method='post' action='/admin/send_template_queue_tick' style='margin-top:10px;'>")
-        html.append(f"<input type='hidden' name='token' value='{esc(token)}'>")
         html.append(f"<input type='hidden' name='tenant' value='{esc(tenant)}'>")
         html.append(f"<input type='hidden' name='period' value='{esc(panel_period)}'>")
         html.append("<div class='row'>")
@@ -7198,7 +7324,6 @@ def admin_panel():
 
         # NUEVO: Botón de envío automático
         html.append("<form method='post' action='/admin/send_auto' style='margin-top:10px;'>")
-        html.append(f"<input type='hidden' name='token' value='{esc(token)}'>")
         html.append(f"<input type='hidden' name='tenant' value='{esc(tenant)}'>")
         html.append(f"<input type='hidden' name='period' value='{esc(panel_period)}'>")
         html.append("<input type='hidden' name='batch_size' value='10'>")
@@ -7206,7 +7331,7 @@ def admin_panel():
         html.append("</form>")
 
         html.append("<div class='hint'>Cron URL (POST) sugerida:</div>")
-        html.append(f"<div class='hint mono'><code>/admin/send_template_queue_tick?tenant={esc(tenant)}&period={esc(panel_period)}&batch_size=10&token={esc(token)}&mode=json</code></div>")
+        html.append(f"<div class='hint mono'><code>/admin/send_template_queue_tick?tenant={esc(tenant)}&period={esc(panel_period)}&batch_size=10&mode=json&token=TU_ADMIN_TOKEN</code> · para el cron: reemplazá TU_ADMIN_TOKEN por el valor real</div>")
     else:
         html.append("<div class='muted'>Elegí un período en Reportes para ver la cola y poder procesarla.</div>")
 
@@ -7219,7 +7344,6 @@ def admin_panel():
     html.append("<div class='sep'></div>")
 
     html.append("<form method='get' action='/admin/panel'>")
-    html.append(f"<input type='hidden' name='token' value='{esc(token)}'>")
     html.append(f"<input type='hidden' name='tenant' value='{esc(tenant)}'>")
     html.append("<label>Período</label><br>")
     html.append("<div class='row' style='margin-top:6px'>")
@@ -7236,13 +7360,13 @@ def admin_panel():
     html.append("<div class='sep'></div>")
     html.append("<div class='row'>")
     html.append(
-        f"<a class='btn' href='/admin/report_recibos.xlsx?tenant={esc(tenant)}&period={period_q}&token={esc(token)}'>📄 Reporte recibos (XLSX)</a>"
+        f"<a class='btn' href='/admin/report_recibos.xlsx?tenant={esc(tenant)}&period={period_q}'>📄 Reporte recibos (XLSX)</a>"
     )
     html.append(
-        f"<a class='btn' href='/admin/report_recibos.pdf?tenant={esc(tenant)}&period={period_q}&token={esc(token)}'>🧾 Informe (PDF)</a>"
+        f"<a class='btn' href='/admin/report_recibos.pdf?tenant={esc(tenant)}&period={period_q}'>🧾 Informe (PDF)</a>"
     )
     html.append(
-        f"<a class='btn secondary' href='/admin/report_envios.csv?tenant={esc(tenant)}&token={esc(token)}'>📤 Envíos (CSV)</a>"
+        f"<a class='btn secondary' href='/admin/report_envios.csv?tenant={esc(tenant)}'>📤 Envíos (CSV)</a>"
     )
     html.append("</div>")
 
@@ -7250,7 +7374,6 @@ def admin_panel():
     html.append("<h3>🔎 Buscar períodos por CUIL</h3>")
     html.append(f"""
       <form method="get" action="/admin/periodos">
-        <input type="hidden" name="token" value="{esc(token)}">
         <input type="hidden" name="tenant" value="{esc(tenant)}">
         <label>CUIL</label><br>
         <div class="row" style="margin-top:6px">
@@ -7265,7 +7388,6 @@ def admin_panel():
     html.append("<div class='muted'>Borra <code>pending_views</code> y <code>recibo_estado</code> para esta empresa (y período si lo completás).</div>")
     html.append(f"""
       <form method="post" action="/admin/reset" onsubmit="return confirm('¿Seguro? Esto borra pending y estados.');" style="margin-top:10px">
-        <input type="hidden" name="token" value="{esc(token)}">
         <input type="hidden" name="tenant" value="{esc(tenant)}">
         <label>Período (opcional, mm/aaaa)</label><br>
         <div class="row" style="margin-top:6px">
@@ -7293,8 +7415,7 @@ def admin_panel():
         html.append(f"""
           <form id="bulkForm" method="post" action="/admin/verifications_delete_bulk"
                 onsubmit="return confirm('¿Borrar verificaciones seleccionadas?');">
-            <input type="hidden" name="token" value="{esc(token)}">
-            <input type="hidden" name="tenant" value="{esc(tenant)}">
+                <input type="hidden" name="tenant" value="{esc(tenant)}">
           </form>
         """)
 
@@ -7329,8 +7450,7 @@ def admin_panel():
             html.append(f"""
               <form method="post" action="/admin/verifications_delete"
                     onsubmit="return confirm('¿Borrar verificación?');" style="margin:0">
-                <input type="hidden" name="token" value="{esc(token)}">
-                <input type="hidden" name="tenant" value="{esc(tenant)}">
+                        <input type="hidden" name="tenant" value="{esc(tenant)}">
                 <input type="hidden" name="cuil" value="{esc(r['cuil'])}">
                 <input type="hidden" name="to_whatsapp" value="{esc(r['to_whatsapp'])}">
                 <button class="btn small danger" type="submit">Borrar</button>
@@ -7353,7 +7473,6 @@ def admin_panel():
       <h3>📥 Importar verificaciones</h3>
       <div class="muted">Subí un Excel con columnas: <code>cuil</code>, <code>whatsapp</code> (o teléfono). Opcional: <code>dni</code>.</div>
       <form method="post" action="/admin/verifications_import" enctype="multipart/form-data" style="margin-top:10px">
-        <input type="hidden" name="token" value="{esc(token)}">
         <input type="hidden" name="tenant" value="{esc(tenant)}">
         <div class="row">
           <input type="file" name="file" accept=".xlsx" required>
@@ -7371,7 +7490,7 @@ def admin_panel():
     html.append("<h3>👀 Preview Excel de envíos</h3>")
     html.append(f"<div class='muted'>Filas: <b>{len(envios_rows)}</b></div>")
     html.append("</div>")
-    html.append(f"<a class='btn secondary' href='/admin/panel?tenant={esc(tenant)}&token={esc(token)}&refresh=1&period={esc(selected_period or '')}'>🔄 Refrescar</a>")
+    html.append(f"<a class='btn secondary' href='/admin/panel?tenant={esc(tenant)}&refresh=1&period={esc(selected_period or '')}'>🔄 Refrescar</a>")
     html.append("</div>")
     html.append("<div class='sep'></div>")
 
@@ -7428,17 +7547,17 @@ def admin_portal_users():
             else:
                 msg = f"error&details={result['message']}"
             
-            return redirect(f"/admin/portal_users?token={token}&msg={msg}")
+            return redirect(f"/admin/portal_users?msg={msg}")
         
         elif action == "toggle":
             user_id = int(request.form.get("user_id", 0))
             toggle_client_user_active(user_id)
-            return redirect(f"/admin/portal_users?token={token}&msg=toggled")
+            return redirect(f"/admin/portal_users?msg=toggled")
         
         elif action == "delete":
             user_id = int(request.form.get("user_id", 0))
             delete_client_user(user_id)
-            return redirect(f"/admin/portal_users?token={token}&msg=deleted")
+            return redirect(f"/admin/portal_users?msg=deleted")
     
     # Listar usuarios
     users = get_all_client_users()
@@ -7498,7 +7617,7 @@ def admin_portal_users():
 <div class="wrap">
 """)
     
-    html.append(f"<a href='/admin?token={esc(token)}' class='btn'>← Volver al admin</a>")
+    html.append(f"<a href='/admin' class='btn'>← Volver al admin</a>")
     
     html.append("<div class='card'>")
     html.append("<h2>👥 Usuarios del Portal</h2>")
@@ -7525,7 +7644,6 @@ def admin_portal_users():
     html.append("<div class='card'>")
     html.append("<h3>➕ Crear nuevo usuario</h3>")
     html.append(f"<form method='post'>")
-    html.append(f"<input type='hidden' name='token' value='{esc(token)}'>")
     html.append(f"<input type='hidden' name='action' value='create'>")
     
     html.append("<label>Empresa:</label><br>")
@@ -7574,7 +7692,6 @@ def admin_portal_users():
             
             # Toggle activo/inactivo
             html.append(f"<form method='post' style='display:inline'>")
-            html.append(f"<input type='hidden' name='token' value='{esc(token)}'>")
             html.append(f"<input type='hidden' name='action' value='toggle'>")
             html.append(f"<input type='hidden' name='user_id' value='{u['id']}'>")
             toggle_text = "Desactivar" if u['active'] else "Activar"
@@ -7583,7 +7700,6 @@ def admin_portal_users():
             
             # Eliminar
             html.append(f"<form method='post' style='display:inline' onsubmit='return confirm(\"¿Eliminar usuario?\")'>")
-            html.append(f"<input type='hidden' name='token' value='{esc(token)}'>")
             html.append(f"<input type='hidden' name='action' value='delete'>")
             html.append(f"<input type='hidden' name='user_id' value='{u['id']}'>")
             html.append(f"<button type='submit' class='btn danger'>Eliminar</button>")
@@ -7743,7 +7859,7 @@ def admin_resend_all_pending_views():
     pending = get_pending_views_over_7days(tenant, period)
     
     if not pending:
-        return redirect(f"/admin/seguimiento?tenant={tenant}&token={token}&period={period}&msg=no_pending")
+        return redirect(f"/admin/seguimiento?tenant={tenant}&period={period}&msg=no_pending")
     
     # Encolar todos para envío automático
     base_url = request.host_url.rstrip('/')
@@ -7804,7 +7920,7 @@ def admin_resend_all_pending_views():
     thread = threading.Thread(target=process_in_background, daemon=True)
     thread.start()
     
-    return redirect(f"/admin/seguimiento?tenant={tenant}&token={token}&period={period}&msg=resend_started&total={len(pending)}")
+    return redirect(f"/admin/seguimiento?tenant={tenant}&period={period}&msg=resend_started&total={len(pending)}")
 
 
 @app.post("/admin/remind_all_pending_signatures")
@@ -7827,7 +7943,7 @@ def admin_remind_all_pending_signatures():
     pending = get_pending_signatures_over_7days(tenant, period)
     
     if not pending:
-        return redirect(f"/admin/seguimiento?tenant={tenant}&token={token}&period={period}&msg=no_pending")
+        return redirect(f"/admin/seguimiento?tenant={tenant}&period={period}&msg=no_pending")
     
     # Verificar que exista el template de firma
     if not TWILIO_SIGN_TEMPLATE_SID:
@@ -7876,7 +7992,7 @@ def admin_remind_all_pending_signatures():
     thread = threading.Thread(target=process_in_background, daemon=True)
     thread.start()
     
-    return redirect(f"/admin/seguimiento?tenant={tenant}&token={token}&period={period}&msg=remind_started&total={len(pending)}")
+    return redirect(f"/admin/seguimiento?tenant={tenant}&period={period}&msg=remind_started&total={len(pending)}")
 
 def get_envios_df_for_tenant(tenant_slug: str, force: bool = False) -> pd.DataFrame:
     """
@@ -8032,7 +8148,7 @@ def admin_reenviar_template():
         
         html += f"""
   <hr>
-  <p><a href="/admin/reenviar_template?token={ADMIN_TOKEN}">← Volver</a></p>
+  <p><a href="/admin/reenviar_template">← Volver</a></p>
 </body>
 </html>
 """
@@ -8138,7 +8254,6 @@ def admin_reenviar_template():
   </div>
   
   <form method="post">
-    <input type="hidden" name="token" value="{ADMIN_TOKEN}">
     
     <div class="card">
       <label>Tenant</label>
@@ -8165,7 +8280,7 @@ def admin_reenviar_template():
     </div>
   </form>
   
-  <p><a href="/admin?token={ADMIN_TOKEN}">← Volver al admin</a></p>
+  <p><a href="/admin">← Volver al admin</a></p>
 </body>
 </html>
 """
@@ -8208,7 +8323,7 @@ def admin_verifications_delete_bulk():
     keys = request.form.getlist("keys")
 
     if not tenant or not keys:
-        return redirect(f"/admin/panel?tenant={tenant}&token={token}&msg=verif_bulk_empty")
+        return redirect(f"/admin/panel?tenant={tenant}&msg=verif_bulk_empty")
 
     conn = get_db_connection()
     cur = conn.cursor()
@@ -8228,7 +8343,7 @@ def admin_verifications_delete_bulk():
     conn.commit()
     conn.close()
 
-    return redirect(f"/admin/panel?tenant={tenant}&token={token}&msg=verif_bulk_deleted&n={n}")
+    return redirect(f"/admin/panel?tenant={tenant}&msg=verif_bulk_deleted&n={n}")
 
 
 
@@ -8745,7 +8860,7 @@ def admin_reset_tenant():
 
     # devolvemos SIEMPRE el normalizado para que el panel quede prolijo
     p_show = norm_period_label(period_raw) if period_raw else ""
-    return redirect(f"/admin/panel?tenant={tenant}&token={token}&msg=reset_ok&period={p_show or period_raw}")
+    return redirect(f"/admin/panel?tenant={tenant}&msg=reset_ok&period={p_show or period_raw}")
 
 from flask import redirect
 
@@ -8833,7 +8948,7 @@ def admin_reset():
     conn.close()
 
     p_show = norm_period_label(period_raw) if period_raw else ""
-    url = f"/admin/panel?tenant={tenant}&token={token}&msg=reset_ok"
+    url = f"/admin/panel?tenant={tenant}&msg=reset_ok"
     if p_show:
         url += f"&period={p_show}"
     return redirect(url)
@@ -8990,7 +9105,7 @@ def admin_send_template_queue_start():
 
     stats = count_queue_status(tenant, period)
     return redirect(
-        f"/admin/panel?tenant={tenant}&token={token}&msg=queue_enqueued"
+        f"/admin/panel?tenant={tenant}&msg=queue_enqueued"
         f"&period={period}&enqueued={enqueued}&dup={skipped_dup}&bad={skipped_bad}"
         f"&pending={stats.get('PENDING',0)}&sent={stats.get('SENT',0)}"
         f"&failed={stats.get('FAILED',0)}&skipped={stats.get('SKIPPED',0)}"
@@ -9118,18 +9233,22 @@ def admin_send_template_queue_tick():
         }
 
     return redirect(
-        f"/admin/panel?tenant={tenant}&token={token}&msg=queue_tick"
+        f"/admin/panel?tenant={tenant}&msg=queue_tick"
         f"&period={period}&processed={processed}&sent={sent}&skipped={skipped}&failed={failed}"
         f"&pending={stats.get('PENDING',0)}"
     )
 
 @app.post("/admin/send_auto")
+@admin_required
 def admin_send_auto():
     """
     Procesa la cola automáticamente en background usando threading.
     Versión simple sin Celery - gratis pero con límite de ~30 minutos.
     """
-    token = _get_admin_token_from_request()
+    # Token para el self-call de background a /send_template_queue_tick.
+    # Si el admin disparó esto por sesión (sin token en el form), usamos el ADMIN_TOKEN real:
+    # el thread no tiene sesión, así que necesita autenticarse por token.
+    token = _get_admin_token_from_request() or ADMIN_TOKEN
     
     tenant = (request.form.get("tenant") or "").strip().lower()
     period = (request.form.get("period") or "").strip()
@@ -9211,7 +9330,7 @@ def admin_send_auto():
     
     # Respuesta inmediata al usuario
     return redirect(
-        f"/admin/panel?tenant={tenant}&token={token}&msg=auto_started"
+        f"/admin/panel?tenant={tenant}&msg=auto_started"
         f"&period={period}"
     )
 
@@ -9258,16 +9377,17 @@ def _get_last_msg_status(tenant: str, cuil: str, period: str, kind: str):
 
 
 
-@app.get("/admin/send_test")
+@app.route("/admin/send_test", methods=["GET", "POST"])
 def admin_send_test():
     auth = require_admin()
     if auth:
         return auth
 
-    token = request.args.get("token", "")
-    tenant = (request.args.get("tenant") or "").strip().lower()
-    cuil = (request.args.get("cuil") or "").strip()
-    period = (request.args.get("period") or "").strip()
+    # request.values lee de la query (GET) y del form (POST) por igual.
+    token = request.values.get("token", "")
+    tenant = (request.values.get("tenant") or "").strip().lower()
+    cuil = (request.values.get("cuil") or "").strip()
+    period = (request.values.get("period") or "").strip()
 
     t = get_tenant(tenant)
     if not t:
@@ -9276,7 +9396,7 @@ def admin_send_test():
     html = []
     html.append("<h2>Envío individual a persona específica</h2>")
     html.append(f"<p><b>Empresa:</b> {esc(t['display_name'])}</p>")
-    html.append(f"<p><a href='/admin/panel?tenant={esc(tenant)}&token={esc(token)}'>← volver al panel</a></p>")
+    html.append(f"<p><a href='/admin/panel?tenant={esc(tenant)}'>← volver al panel</a></p>")
 
     html.append(f"""
     <style>
@@ -9295,7 +9415,7 @@ def admin_send_test():
 
     html.append("<div class='card'>")
     html.append(f"""
-    <form method="get">
+    <form method="post">
       <input type="hidden" name="tenant" value="{esc(tenant)}">
       <input type="hidden" name="token" value="{esc(token)}">
 
@@ -9310,7 +9430,14 @@ def admin_send_test():
     """)
     html.append("</div>")
 
-    if cuil and period:
+    # El envío solo se dispara por POST (botón del form) o por GET con ADMIN_TOKEN
+    # (uso manual/automatización). Un GET con la sesión activa NO envía: evita que
+    # un link malicioso dispare mensajes usando la cookie del admin (CSRF).
+    _envio_ok = (request.method == "POST") or admin_token_valid()
+    if cuil and period and not _envio_ok:
+        html.append("<div class='card'><div class='info'>ℹ️ Por seguridad, el envío se confirma desde el botón del formulario.</div></div>")
+
+    if cuil and period and _envio_ok:
         html.append("<div class='card'>")
         html.append("<h3>Resultado del envío</h3>")
 
@@ -9452,7 +9579,7 @@ def admin_resend_template():
     except Exception as e:
         msg = f"resend_error&error={str(e)[:100]}"
     
-    return redirect(f"/admin/panel?tenant={tenant}&token={token}&period={period}&msg={msg}")
+    return redirect(f"/admin/panel?tenant={tenant}&period={period}&msg={msg}")
 
 
 @app.post("/admin/remind_signature")
@@ -9508,7 +9635,7 @@ def admin_remind_signature():
     except Exception as e:
         msg = f"remind_error&error={str(e)[:100]}"
     
-    return redirect(f"/admin/panel?tenant={tenant}&token={token}&period={period}&msg={msg}")
+    return redirect(f"/admin/panel?tenant={tenant}&period={period}&msg={msg}")
 
 # =========================
 # Twilio inbound: VIEW_NOW + firma/observa
@@ -10739,7 +10866,7 @@ def admin_reenviar_fallidos():
         
         html += f"""
   <hr>
-  <p><a href="/admin/reenviar_fallidos?token={ADMIN_TOKEN}">← Volver</a></p>
+  <p><a href="/admin/reenviar_fallidos">← Volver</a></p>
 </body>
 </html>
 """
@@ -10838,7 +10965,6 @@ def admin_reenviar_fallidos():
   </div>
   
   <form method="post">
-    <input type="hidden" name="token" value="{ADMIN_TOKEN}">
     
     <div class="card">
       <label>Tenant</label>
@@ -10865,7 +10991,7 @@ def admin_reenviar_fallidos():
     </div>
   </form>
   
-  <p><a href="/admin?token={ADMIN_TOKEN}">← Volver al admin</a></p>
+  <p><a href="/admin">← Volver al admin</a></p>
 </body>
 </html>
 """
