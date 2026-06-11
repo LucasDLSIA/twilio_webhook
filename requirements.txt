@@ -3,6 +3,7 @@
 # cycler, fonttools, kiwisolver, pillow) y se quitaron paquetes que el código no
 # importa: Flask-Mail, python-dotenv, google-auth-oauthlib, oauthlib,
 # requests-oauthlib, colorama.
+# Sentry: opcional, se activa con la variable de entorno SENTRY_DSN.
 # Nota: si algún día subís Python a 3.13+, subí psycopg2-binary a >=2.9.10.
 
 aiohappyeyeballs==2.6.1
@@ -53,6 +54,7 @@ pytz==2025.2
 reportlab==4.4.4
 requests==2.32.5
 rsa==4.9.1
+sentry-sdk[flask]==2.62.0
 six==1.17.0
 twilio==9.8.5
 typing_extensions==4.15.0

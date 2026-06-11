@@ -109,6 +109,24 @@ app.config.update(
     SESSION_COOKIE_SECURE=os.environ.get("COOKIE_SECURE", "1").strip() != "0",
 )
 
+# --- Sentry: alertas de errores por mail (opcional) ---
+# Se activa solo si SENTRY_DSN está definida en el entorno. Sin la variable,
+# este bloque no hace nada y la app funciona exactamente igual que siempre.
+# Solo errores (sin tracing de performance: cuida la cuota gratis) y sin PII
+# por defecto; Sentry además enmascara campos tipo token/password al recibir.
+# Los log.error / log.exception del código llegan como eventos con traceback;
+# los log.info quedan como "migas" de contexto del evento.
+SENTRY_DSN = (os.environ.get("SENTRY_DSN") or "").strip()
+if SENTRY_DSN:
+    import sentry_sdk
+    sentry_sdk.init(
+        dsn=SENTRY_DSN,
+        send_default_pii=False,
+        traces_sample_rate=0.0,
+        environment=os.environ.get("SENTRY_ENVIRONMENT", "production"),
+    )
+    log.info("Sentry activo (alertas de errores encendidas)")
+
 
 
 # =========================
@@ -6070,6 +6088,16 @@ def admin_logout():
     session.pop("admin_authed", None)
     session.pop("admin_authed_at", None)
     return redirect("/admin/login")
+
+
+@app.get("/admin/sentry_test")
+def admin_sentry_test():
+    # Dispara un error a propósito para verificar el circuito de alertas.
+    # Solo accesible con sesión de admin (o header X-Admin-Token).
+    auth = require_admin()
+    if auth:
+        return auth
+    raise RuntimeError("Prueba de Sentry: si ves este error en sentry.io, las alertas funcionan")
 
 
 @app.get("/admin")
