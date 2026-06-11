@@ -221,22 +221,40 @@ def admin_session_active() -> bool:
         return False
     return (int(time.time()) - since) < ADMIN_SESSION_TTL
 
-def admin_token_valid() -> bool:
-    """True si el request trae el ADMIN_TOKEN correcto (para cron / background / self-calls)."""
+def _admin_token_match(tok: str) -> bool:
     if not ADMIN_TOKEN:
         return False
-    tok = (request.args.get("token") or request.form.get("token")
-           or request.headers.get("X-Admin-Token", "")).strip()
+    tok = (tok or "").strip()
     return bool(tok) and hmac.compare_digest(tok, ADMIN_TOKEN)
 
+def admin_token_valid() -> bool:
+    """Token por CUALQUIER vía (query, form o header).
+    Reservado a los endpoints de automatización que lo necesitan por URL:
+    queue_tick (cron y self-call de fondo), reset_reenvios,
+    send_template_preview y media_certificado. El resto del panel NO
+    acepta token por URL: humanos por login, máquinas por header."""
+    return _admin_token_match(request.args.get("token") or request.form.get("token")
+                              or request.headers.get("X-Admin-Token", ""))
+
+def admin_token_valid_header() -> bool:
+    """Token solo por header X-Admin-Token (no queda en access logs ni historial)."""
+    return _admin_token_match(request.headers.get("X-Admin-Token", ""))
+
 def admin_authenticated() -> bool:
-    """El admin está autenticado por sesión (humano) o por token (máquina)."""
-    return admin_session_active() or admin_token_valid()
+    """Humanos: sesión (login). Máquinas: header X-Admin-Token.
+    El token por URL ya NO abre el panel (ver allowlist en admin_token_valid)."""
+    return admin_session_active() or admin_token_valid_header()
 
 def admin_ok() -> bool:
     # Mantengo el nombre por compatibilidad: ahora acepta sesión o token.
     # (Antes devolvía True si ADMIN_TOKEN estaba vacío, dejando el admin abierto.)
     return admin_authenticated()
+
+def _admin_next_path() -> str:
+    """Destino post-login: path actual con su query pero SIN el token,
+    para que un ?token= viejo no siga paseando por la URL del login."""
+    qs = [(k, v) for k, v in request.args.items(multi=True) if k != "token"]
+    return request.path + ("?" + urlencode(qs) if qs else "")
 
 def require_admin():
     if admin_authenticated():
@@ -245,7 +263,7 @@ def require_admin():
     # preservando el destino. Para clientes no-navegador / POST, 401 directo.
     accepts_html = "text/html" in (request.headers.get("Accept") or "")
     if request.method == "GET" and accepts_html:
-        return redirect("/admin/login?next=" + quote(request.full_path or "/admin", safe=""))
+        return redirect("/admin/login?next=" + quote(_admin_next_path(), safe=""))
     return Response("Unauthorized (admin login requerido)", status=401)
 
 def _get_admin_token_from_request() -> str:
@@ -259,7 +277,7 @@ def admin_required(fn):
             return fn(*args, **kwargs)
         accepts_html = "text/html" in (request.headers.get("Accept") or "")
         if request.method == "GET" and accepts_html:
-            return redirect("/admin/login?next=" + quote(request.full_path or "/admin", safe=""))
+            return redirect("/admin/login?next=" + quote(_admin_next_path(), safe=""))
         return Response("Unauthorized", status=401)
     return wrapper
 
@@ -7331,7 +7349,7 @@ def admin_panel():
         html.append("</form>")
 
         html.append("<div class='hint'>Cron URL (POST) sugerida:</div>")
-        html.append(f"<div class='hint mono'><code>/admin/send_template_queue_tick?tenant={esc(tenant)}&period={esc(panel_period)}&batch_size=10&mode=json&token=TU_ADMIN_TOKEN</code> · para el cron: reemplazá TU_ADMIN_TOKEN por el valor real</div>")
+        html.append(f"<div class='hint mono'><code>/admin/send_template_queue_tick?tenant={esc(tenant)}&period={esc(panel_period)}&batch_size=10&mode=json&token=TU_ADMIN_TOKEN</code> · para el cron: reemplazá TU_ADMIN_TOKEN por el valor real (o mandalo por header X-Admin-Token y ni siquiera queda en los access logs)</div>")
     else:
         html.append("<div class='muted'>Elegí un período en Reportes para ver la cola y poder procesarla.</div>")
 
@@ -9141,8 +9159,13 @@ def _mark_queue_row(row_id: int, status: str, error: str = "", sent_sid: str | N
 
 
 @app.post("/admin/send_template_queue_tick")
-@admin_required
 def admin_send_template_queue_tick():
+    # Único endpoint del panel que acepta token por URL/form: lo usan el cron
+    # (query string) y el self-call del envío automático (form). También valen
+    # la sesión (humano) y el header X-Admin-Token (otras automatizaciones).
+    if not (admin_authenticated() or admin_token_valid()):
+        return Response("Unauthorized", status=401)
+
     token = _get_admin_token_from_request()
 
     tenant = (request.form.get("tenant") or request.args.get("tenant") or "").strip().lower()
@@ -9430,10 +9453,10 @@ def admin_send_test():
     """)
     html.append("</div>")
 
-    # El envío solo se dispara por POST (botón del form) o por GET con ADMIN_TOKEN
-    # (uso manual/automatización). Un GET con la sesión activa NO envía: evita que
-    # un link malicioso dispare mensajes usando la cookie del admin (CSRF).
-    _envio_ok = (request.method == "POST") or admin_token_valid()
+    # El envío solo se dispara por POST (botón del form) o con ADMIN_TOKEN por
+    # header X-Admin-Token (automatización). Un GET con la sesión activa NO envía:
+    # evita que un link malicioso dispare mensajes usando la cookie del admin (CSRF).
+    _envio_ok = (request.method == "POST") or admin_token_valid_header()
     if cuil and period and not _envio_ok:
         html.append("<div class='card'><div class='info'>ℹ️ Por seguridad, el envío se confirma desde el botón del formulario.</div></div>")
 
