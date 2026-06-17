@@ -1614,6 +1614,11 @@ def portal_dashboard():
         html.append("<div class='action-title'>Certificados médicos</div>")
         html.append("<div class='action-desc'>Ver los certificados recibidos</div>")
         html.append("</a>")
+        html.append("<a href='/portal/certificados-familia' class='action-card'>")
+        html.append("<div class='action-icon'>🧑\u200d🧑\u200d🧒</div>")
+        html.append("<div class='action-title'>Certificados de familia</div>")
+        html.append("<div class='action-desc'>Asignaciones familiares recibidas</div>")
+        html.append("</a>")
         html.append("</div>")
         html.append("</div>")
     
@@ -2004,23 +2009,42 @@ def portal_calendario():
 
 @app.route("/portal/certificados")
 def portal_certificados():
+    """Certificados médicos recibidos (portal)."""
+    return _portal_certificados_render("medico")
+
+
+@app.route("/portal/certificados-familia")
+def portal_certificados_familia():
+    """Certificados de asignaciones familiares recibidos (portal)."""
+    return _portal_certificados_render("familia")
+
+
+def _portal_certificados_render(tipo: str = "medico"):
     """
-    Certificados médicos recibidos, para el portal de clientes.
+    Render de la grilla de certificados de un tipo, para el portal de clientes.
     Cada cliente ve SOLO los de su empresa (sale de la sesión).
     """
+    # Textos según el tipo
+    if tipo == "familia":
+        titulo = "🧑\u200d🧑\u200d🧒 Certificados de familia"
+        titulo_tab = "Certificados de familia"
+    else:
+        titulo = "🩺 Certificados médicos"
+        titulo_tab = "Certificados"
+
     # Verificar login
     auth = require_portal_login()
     if auth:
         return auth
- 
+
     user_id = session.get('portal_user_id')
     user = get_portal_user_by_id(user_id)
     tenant = user['tenant']
- 
+
     t = get_tenant(tenant)
     empresa_nombre = t.get('display_name', tenant) if t else tenant
- 
-    certificados = get_certificados(tenant)
+
+    certificados = get_certificados(tenant, tipo=tipo)
  
     html = []
     html.append("""<!doctype html>
@@ -2028,7 +2052,7 @@ def portal_certificados():
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Portal - Certificados</title>
+  <title>Portal - """ + titulo_tab + """</title>
   <link rel="manifest" href="/static/manifest.json">
   <meta name="theme-color" content="#2E3B8E">
   <meta name="apple-mobile-web-app-capable" content="yes">
@@ -2055,7 +2079,7 @@ def portal_certificados():
     <div class="header">
       <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:16px">
         <div>
-          <h1>🩺 Certificados médicos</h1>
+          <h1>""" + titulo + """</h1>
           <div class="subtitle">🏢 """ + esc(empresa_nombre) + """</div>
         </div>
         <div class="header-actions">
@@ -4341,7 +4365,9 @@ def init_db():
                 created_at BIGINT NOT NULL
             )
         ''')
+        _try_alter(cur, "ALTER TABLE certificados ADD COLUMN tipo TEXT DEFAULT 'medico';")
         _try_alter(cur, "CREATE INDEX IF NOT EXISTS idx_cert_tenant ON certificados(tenant, created_at);")
+        _try_alter(cur, "CREATE INDEX IF NOT EXISTS idx_cert_tenant_tipo ON certificados(tenant, tipo, created_at);")
 
         conn.commit()
         conn.close()
@@ -4591,7 +4617,9 @@ def init_db():
         )
     """)
 
+    _try_alter(cur, "ALTER TABLE certificados ADD COLUMN tipo TEXT DEFAULT 'medico';")
     _try_alter(cur, "CREATE INDEX IF NOT EXISTS idx_cert_tenant ON certificados(tenant, created_at);")
+    _try_alter(cur, "CREATE INDEX IF NOT EXISTS idx_cert_tenant_tipo ON certificados(tenant, tipo, created_at);")
     _try_alter(cur, "CREATE INDEX IF NOT EXISTS idx_pending_to_created ON pending_views(to_whatsapp, created_at);")
     _try_alter(cur, "CREATE INDEX IF NOT EXISTS idx_estado_key ON recibo_estado(tenant, cuil, period);")
     _try_alter(cur, "CREATE INDEX IF NOT EXISTS idx_msg_key ON message_status(tenant, cuil, period, kind);")
@@ -8567,27 +8595,33 @@ def _drive_ensure_child_folder_shared(service, parent_id: str, folder_name: str)
 CERTIFICADOS_DRIVE_ID = os.environ.get("CERTIFICADOS_SHARED_DRIVE_ID", "").strip()
  
  
-def get_certificados_folder_id(tenant_slug: str) -> str:
+# Nombre de la subcarpeta de Drive según el tipo de certificado.
+CERT_SUBCARPETA = {"medico": "Medicos", "familia": "Familia"}
+
+def get_certificados_folder_id(tenant_slug: str, tipo: str = "medico") -> str:
     """
-    Devuelve (creando si hace falta) el id de la carpeta del tenant
-    DENTRO del Shared Drive de certificados:  <SharedDrive>/<tenant>/
+    Devuelve (creando si hace falta) el id de la subcarpeta del tipo de
+    certificado, DENTRO de la carpeta del tenant, DENTRO del Shared Drive:
+        <SharedDrive>/<tenant>/<Medicos|Familia>/
     """
     if not CERTIFICADOS_DRIVE_ID:
         raise RuntimeError("Falta CERTIFICADOS_SHARED_DRIVE_ID en ENV")
- 
+
+    sub = CERT_SUBCARPETA.get(tipo, "Medicos")
     service = drive_service()
     # En un Shared Drive, el ID del drive funciona como id de la carpeta raíz.
-    return _drive_ensure_child_folder_shared(service, CERTIFICADOS_DRIVE_ID, tenant_slug)
+    tenant_folder = _drive_ensure_child_folder_shared(service, CERTIFICADOS_DRIVE_ID, tenant_slug)
+    return _drive_ensure_child_folder_shared(service, tenant_folder, sub)
  
  
-def upload_certificado_to_drive(tenant: str, cuil: str, data: bytes, content_type: str) -> tuple[str, str]:
+def upload_certificado_to_drive(tenant: str, cuil: str, data: bytes, content_type: str, tipo: str = "medico") -> tuple[str, str]:
     """
-    Sube el certificado a <SharedDrive>/<tenant>/<cuil>_<fecha>_<hora>.<ext>
+    Sube el certificado a <SharedDrive>/<tenant>/<Medicos|Familia>/<cuil>_<fecha>_<hora>.<ext>
     Devuelve (file_id, file_name).
     """
-    folder_id = get_certificados_folder_id(tenant)
+    folder_id = get_certificados_folder_id(tenant, tipo)
     if not folder_id:
-        raise RuntimeError(f"No se pudo obtener/crear carpeta certificados para tenant={tenant}")
+        raise RuntimeError(f"No se pudo obtener/crear carpeta certificados para tenant={tenant} tipo={tipo}")
  
     # extensión según content_type
     if "pdf" in content_type:
@@ -8633,31 +8667,31 @@ def download_twilio_media(media_url: str) -> tuple[bytes, str]:
     return r.content, content_type
  
 def save_certificado(tenant: str, cuil: str, nombre: str, to_whatsapp: str,
-                     file_id: str, file_name: str, mime_type: str):
+                     file_id: str, file_name: str, mime_type: str, tipo: str = "medico"):
     """Registra el certificado en la BD."""
     conn = get_db_connection()
     cur = conn.cursor()
     now = int(time.time())
     cur.execute("""
-        INSERT INTO certificados (tenant, cuil, nombre, to_whatsapp, file_id, file_name, mime_type, created_at)
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
-    """, (tenant, cuil, nombre, to_whatsapp, file_id, file_name, mime_type, now))
+        INSERT INTO certificados (tenant, cuil, nombre, to_whatsapp, file_id, file_name, mime_type, created_at, tipo)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+    """, (tenant, cuil, nombre, to_whatsapp, file_id, file_name, mime_type, now, tipo))
     conn.commit()
     conn.close()
-    log.info(f"✅ Certificado guardado: {tenant}/{cuil} -> {file_name} (file_id={file_id})")
+    log.info(f"✅ Certificado guardado: {tenant}/{cuil} tipo={tipo} -> {file_name} (file_id={file_id})")
  
  
-def get_certificados(tenant: str, limit: int = 500) -> list[dict]:
-    """Lista los certificados de un tenant, más recientes primero."""
+def get_certificados(tenant: str, limit: int = 500, tipo: str = "medico") -> list[dict]:
+    """Lista los certificados de un tenant y tipo, más recientes primero."""
     conn = get_db_connection()
     cur = conn.cursor()
     cur.execute("""
-        SELECT id, tenant, cuil, nombre, to_whatsapp, file_id, file_name, mime_type, created_at
+        SELECT id, tenant, cuil, nombre, to_whatsapp, file_id, file_name, mime_type, created_at, tipo
         FROM certificados
-        WHERE tenant = %s
+        WHERE tenant = %s AND COALESCE(tipo, 'medico') = %s
         ORDER BY created_at DESC
         LIMIT %s
-    """, (tenant, limit))
+    """, (tenant, tipo, limit))
     rows = cur.fetchall()
     conn.close()
     result = []
@@ -10147,7 +10181,7 @@ def twilio_inbound():
     _MENU_IDS = {
         "RESEND_LAST", "SEE_PREVIOUS", "MORE_OPTIONS",
         "VIEW_NOW", "NO_NEED", "SIGN_OK", "SIGN_OBS", "ACCEPT_TERMS",
-        "CERT_MEDICO",
+        "CERT_MEDICO", "CERT_FAMILIA",
     }
     if not button and body in _MENU_IDS:
         button = body
@@ -10238,15 +10272,21 @@ def twilio_inbound():
     # 🩺 CERT — botón "Certificado médico" (early, igual patrón que SEE_PREVIOUS)
     # Funciona aunque no haya pending. Si está en varias empresas, pregunta a cuál.
     # =========================================================================
-    if button == "CERT_MEDICO":
+    if button in ("CERT_MEDICO", "CERT_FAMILIA"):
+        # El tipo viaja en origin para recordarlo hasta que llegue el archivo.
+        cert_tipo = "familia" if button == "CERT_FAMILIA" else "medico"
+        cert_origin = "CERT_FAMILIA" if cert_tipo == "familia" else "CERT"
+        cert_label = "certificado de asignaciones familiares" if cert_tipo == "familia" else "certificado médico"
+        cert_emoji = "🧑\u200d🧑\u200d🧒" if cert_tipo == "familia" else "🩺"
+
         tenants_found = find_all_tenants_for_whatsapp(from_whatsapp)
 
         if len(tenants_found) == 0:
             return twiml("👋 Para enviar tu certificado, primero necesitás el mensaje inicial de RRHH. Si no lo tenés, avisá a RRHH.")
 
         elif len(tenants_found) > 1:
-            # Multi-empresa: preguntar a cuál mandar el certificado
-            save_multi_tenant_selection_state(from_whatsapp, tenants_found, action="CERT")
+            # Multi-empresa: preguntar a cuál mandar el certificado (recordando el tipo)
+            save_multi_tenant_selection_state(from_whatsapp, tenants_found, action=cert_origin)
 
             msg = "Trabajás en varias empresas. ¿A cuál querés enviar el certificado?\n\n"
             for i, t in enumerate(tenants_found, 1):
@@ -10258,11 +10298,11 @@ def twilio_inbound():
         # Un solo tenant: armar pending y pasar a AWAIT_CERT
         tenant0 = tenants_found[0]["tenant"]
         cuil0 = tenants_found[0]["cuil"]
-        add_pending_view(from_whatsapp, tenant0, cuil0, "", origin="CERT")
+        add_pending_view(from_whatsapp, tenant0, cuil0, "", origin=cert_origin)
         p = get_latest_pending_view(from_whatsapp)
         set_pending_step(p["id"], "AWAIT_CERT")
         return twiml(
-            "🩺 Mandame una *foto* o *PDF* de tu certificado médico.\n\n"
+            f"{cert_emoji} Mandame una *foto* o *PDF* de tu {cert_label}.\n\n"
             "Si querés salir, escribí *CANCELAR*."
         )
 
@@ -10373,13 +10413,16 @@ def twilio_inbound():
                     # ========================================================
                     # 🩺 CERT — ACCIÓN: eligió empresa para mandar certificado
                     # ========================================================
-                    if action == "CERT":
+                    if action in ("CERT", "CERT_FAMILIA"):
+                        _tipo = "familia" if action == "CERT_FAMILIA" else "medico"
+                        _label = "certificado de asignaciones familiares" if _tipo == "familia" else "certificado médico"
+                        _emoji = "🧑\u200d🧑\u200d🧒" if _tipo == "familia" else "🩺"
                         clear_multi_tenant_selection_state(from_whatsapp)
-                        add_pending_view(from_whatsapp, tenant, cuil, "", origin="CERT")
+                        add_pending_view(from_whatsapp, tenant, cuil, "", origin=action)
                         p = get_latest_pending_view(from_whatsapp)
                         set_pending_step(p["id"], "AWAIT_CERT")
                         return twiml(
-                            "🩺 Mandame una *foto* o *PDF* de tu certificado médico.\n\n"
+                            f"{_emoji} Mandame una *foto* o *PDF* de tu {_label}.\n\n"
                             "Si querés salir, escribí *CANCELAR*."
                         )
 
@@ -10679,17 +10722,20 @@ def twilio_inbound():
             )
 
         try:
+            # tipo según el origin guardado al iniciar el flujo (CERT_FAMILIA -> familia)
+            cert_tipo = "familia" if (pending.get("origin") or "") == "CERT_FAMILIA" else "medico"
+
             # 1) descargar de Twilio
             data, content_type = download_twilio_media(media_url)
             if content_type == "application/octet-stream" and media_ct:
                 content_type = media_ct
 
-            # 2) subir a Drive
-            file_id, file_name = upload_certificado_to_drive(tenant, cuil, data, content_type)
+            # 2) subir a Drive (a la subcarpeta del tipo)
+            file_id, file_name = upload_certificado_to_drive(tenant, cuil, data, content_type, cert_tipo)
 
             # 3) registrar en BD
             nombre = pending.get("nombre", "") or get_nombre_for_cuil(tenant, cuil)
-            save_certificado(tenant, cuil, nombre, from_whatsapp, file_id, file_name, content_type)
+            save_certificado(tenant, cuil, nombre, from_whatsapp, file_id, file_name, content_type, cert_tipo)
 
             # 4) volver a READY y confirmar
             set_pending_step(pending["id"], "READY")
