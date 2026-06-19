@@ -2046,7 +2046,13 @@ def _portal_certificados_render(tipo: str = "medico"):
     empresa_nombre = t.get('display_name', tenant) if t else tenant
 
     certificados = get_certificados(tenant, tipo=tipo)
- 
+    msg = request.args.get("msg", "")
+
+    # Botón "Descargar todos" (solo si hay certificados)
+    dl_btn = ""
+    if certificados:
+        dl_btn = f"<a href='/portal/certificados-zip?tipo={esc(tipo)}' class='btn primary'>⬇️ Descargar todos</a>"
+
     html = []
     html.append("""<!doctype html>
 <html lang="es">
@@ -2068,6 +2074,11 @@ def _portal_certificados_render(tipo: str = "medico"):
     thead th { position:sticky; top:0; background:var(--card); z-index:1; color:var(--text-muted); font-size:13px; }
     tr:hover td { background:var(--card-hover); }
     .btn-sm { padding:6px 12px; font-size:13px; border-radius:8px; }
+    th.sortable { cursor:pointer; user-select:none; }
+    th.sortable:hover { color:var(--text); }
+    th .arrow { font-size:11px; opacity:.7; }
+    .btn-del { padding:6px 12px; font-size:13px; border-radius:8px; background:#b91c1c; color:#fff; border:none; cursor:pointer; }
+    .btn-del:hover { background:#991b1b; }
   </style>
 </head>
 <body>
@@ -2083,7 +2094,8 @@ def _portal_certificados_render(tipo: str = "medico"):
           <h1>""" + titulo + """</h1>
           <div class="subtitle">🏢 """ + esc(empresa_nombre) + """</div>
         </div>
-        <div class="header-actions">
+        <div class="header-actions" style="display:flex; gap:10px; flex-wrap:wrap">
+          """ + dl_btn + """
           <a href="/portal" class="btn">← Volver al inicio</a>
         </div>
       </div>
@@ -2091,24 +2103,49 @@ def _portal_certificados_render(tipo: str = "medico"):
  
     <div class="card">
 """)
- 
+
+    # Mensajes
+    if msg == "deleted":
+        html.append("<div class='alert alert-info'>✅ Certificado borrado.</div>")
+    elif msg == "forbidden":
+        html.append("<div class='alert alert-error'>❌ No tenés permiso sobre ese certificado.</div>")
+    elif msg == "not_found":
+        html.append("<div class='alert alert-error'>❌ No se encontró el certificado.</div>")
+
     html.append(f"<h2>Recibidos: {len(certificados)}</h2>")
  
     if certificados:
         html.append("<div class='table-wrap'>")
-        html.append("<table>")
-        html.append("<thead><tr><th>Fecha</th><th>Nombre</th><th>CUIL</th><th>WhatsApp</th><th>Archivo</th></tr></thead>")
+        html.append("<table id='cert-table'>")
+        html.append(
+            "<thead><tr>"
+            "<th class='sortable' data-key='fecha'>Fecha <span class='arrow'></span></th>"
+            "<th class='sortable' data-key='nombre'>Nombre <span class='arrow'></span></th>"
+            "<th>CUIL</th><th>WhatsApp</th><th>Archivo</th><th>Acciones</th>"
+            "</tr></thead>"
+        )
         html.append("<tbody>")
         for c in certificados:
             ver_url = f"/portal/certificado?id={c['id']}"
             # Si el nombre quedó vacío al guardar, lo buscamos por CUIL
             nombre_cert = c.get('nombre','') or get_nombre_for_cuil(tenant, c.get('cuil',''))
+            ts = int(c.get('created_at') or 0)
             html.append("<tr>")
-            html.append(f"<td>{esc(ts_str(c.get('created_at')))}</td>")
+            html.append(f"<td data-ts='{ts}'>{esc(ts_str(c.get('created_at')))}</td>")
             html.append(f"<td>{esc(nombre_cert)}</td>")
             html.append(f"<td>{esc(c.get('cuil',''))}</td>")
             html.append(f"<td>{esc(c.get('to_whatsapp','') or '')}</td>")
             html.append(f"<td><a class='btn primary btn-sm' href='{ver_url}' target='_blank'>Ver / Descargar</a></td>")
+            html.append(
+                "<td>"
+                "<form method='post' action='/portal/certificado/delete' style='margin:0' "
+                "onsubmit=\"return confirm('¿Borrar este certificado? Se quita del portal y va a la papelera de Drive.');\">"
+                f"<input type='hidden' name='id' value='{c['id']}'>"
+                f"<input type='hidden' name='tipo' value='{esc(tipo)}'>"
+                "<button type='submit' class='btn-del'>🗑 Borrar</button>"
+                "</form>"
+                "</td>"
+            )
             html.append("</tr>")
         html.append("</tbody></table></div>")
     else:
@@ -2117,13 +2154,189 @@ def _portal_certificados_render(tipo: str = "medico"):
     html.append("""
     </div>
   </div>
+  <script>
+  (function(){
+    var table = document.getElementById('cert-table');
+    if(!table) return;
+    var tbody = table.querySelector('tbody');
+    var dir = {};
+    table.querySelectorAll('th.sortable').forEach(function(th){
+      th.addEventListener('click', function(){
+        var key = th.getAttribute('data-key');
+        var idx = Array.prototype.indexOf.call(th.parentNode.children, th);
+        dir[key] = !dir[key];
+        var asc = dir[key];
+        var rows = Array.prototype.slice.call(tbody.querySelectorAll('tr'));
+        rows.sort(function(a, b){
+          var ca = a.children[idx], cb = b.children[idx], va, vb;
+          if(key === 'fecha'){
+            va = parseInt(ca.getAttribute('data-ts') || '0', 10);
+            vb = parseInt(cb.getAttribute('data-ts') || '0', 10);
+          } else {
+            va = (ca.textContent || '').trim().toLowerCase();
+            vb = (cb.textContent || '').trim().toLowerCase();
+          }
+          if(va < vb) return asc ? -1 : 1;
+          if(va > vb) return asc ? 1 : -1;
+          return 0;
+        });
+        rows.forEach(function(r){ tbody.appendChild(r); });
+        table.querySelectorAll('th.sortable .arrow').forEach(function(a){ a.textContent = ''; });
+        var arrow = th.querySelector('.arrow');
+        if(arrow) arrow.textContent = asc ? '▲' : '▼';
+      });
+    });
+  })();
+  </script>
 </body>
 </html>
 """)
  
-    return Response("".join(html), mimetype="text/html")
+    return Response("".join(html), mimetype="text/html") 
  
- 
+
+@app.get("/portal/certificados-zip")
+def portal_certificados_zip():
+    """Descarga todos los certificados de un tipo en un ZIP (solo del tenant del usuario)."""
+    import zipfile
+    auth = require_portal_login()
+    if auth:
+        return auth
+
+    user_id = session.get('portal_user_id')
+    user = get_portal_user_by_id(user_id)
+    tenant = user['tenant']
+
+    tipo = (request.args.get("tipo") or "medico").strip().lower()
+    if tipo not in ("medico", "familia"):
+        tipo = "medico"
+
+    certificados = get_certificados(tenant, tipo=tipo)
+    if not certificados:
+        return Response("No hay certificados para descargar", status=404)
+
+    service = drive_service()
+    mem = io.BytesIO()
+    usados = set()
+
+    with zipfile.ZipFile(mem, "w", zipfile.ZIP_DEFLATED) as zf:
+        for c in certificados:
+            file_id = (c.get("file_id") or "").strip()
+            if not file_id:
+                continue
+
+            # Nombre original (para conservar la extensión)
+            try:
+                meta = service.files().get(fileId=file_id, fields='name', supportsAllDrives=True).execute()
+                drive_name = meta.get('name') or c.get('file_name') or f"certificado_{c['id']}"
+            except Exception as e:
+                log.warning(f"No se pudo leer meta del cert {c.get('id')}: {e}")
+                drive_name = c.get('file_name') or f"certificado_{c['id']}"
+
+            ext = ('.' + drive_name.rsplit('.', 1)[1]) if '.' in drive_name else ''
+
+            # Nombre legible dentro del zip: fecha_nombre_cuil.ext
+            nombre_cert = c.get('nombre', '') or get_nombre_for_cuil(tenant, c.get('cuil', ''))
+            fecha = ts_str(c.get('created_at')).replace('/', '-').replace(':', '.').replace(' ', '_')
+            base = f"{fecha}_{nombre_cert or 'sin_nombre'}_{c.get('cuil', '')}".strip('_')
+            base = re.sub(r'[^\w\-. ]', '_', base)
+            arcname = f"{base}{ext}"
+
+            # Evitar nombres repetidos dentro del zip
+            final, n = arcname, 1
+            while final.lower() in usados:
+                final = f"{base}_{n}{ext}"
+                n += 1
+            usados.add(final.lower())
+
+            try:
+                req = service.files().get_media(fileId=file_id, supportsAllDrives=True)
+                fh = io.BytesIO()
+                downloader = MediaIoBaseDownload(fh, req, chunksize=5 * 1024 * 1024)
+                done = False
+                while not done:
+                    _, done = downloader.next_chunk()
+                fh.seek(0)
+                zf.writestr(final, fh.read())
+            except Exception as e:
+                log.exception(f"Error agregando cert {c.get('id')} al zip: {e}")
+                continue
+
+    mem.seek(0)
+    data = mem.read()
+
+    empresa = (t['display_name'] if (t := get_tenant(tenant)) else tenant) or tenant
+    empresa_slug = re.sub(r'[^\w\-]', '_', empresa)
+    tipo_label = "familia" if tipo == "familia" else "medicos"
+    zip_name = f"certificados_{tipo_label}_{empresa_slug}.zip"
+
+    resp = Response(data, mimetype="application/zip")
+    resp.headers["Content-Disposition"] = f'attachment; filename="{zip_name}"'
+    resp.headers["Content-Length"] = str(len(data))
+    return resp
+
+@app.post("/portal/certificado/delete")
+def portal_certificado_delete():
+    """Borra un certificado del portal (solo si pertenece al tenant del usuario)."""
+    auth = require_portal_login()
+    if auth:
+        return auth
+
+    user_id = session.get('portal_user_id')
+    user = get_portal_user_by_id(user_id)
+    tenant = user['tenant']
+
+    try:
+        cert_id = int(request.form.get("id") or "0")
+    except ValueError:
+        cert_id = 0
+
+    tipo = (request.form.get("tipo") or "medico").strip().lower()
+    if tipo not in ("medico", "familia"):
+        tipo = "medico"
+    dest = "/portal/certificados-familia" if tipo == "familia" else "/portal/certificados"
+
+    if not cert_id:
+        return redirect(f"{dest}?msg=not_found")
+
+    # Buscar y validar que sea del tenant del usuario
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT id, tenant, file_id FROM certificados WHERE id = %s", (cert_id,))
+    row = cur.fetchone()
+
+    if not row:
+        conn.close()
+        return redirect(f"{dest}?msg=not_found")
+
+    cert = dict(row)
+    if (cert.get("tenant") or "") != tenant:
+        conn.close()
+        return redirect(f"{dest}?msg=forbidden")
+
+    # Borrar el registro de la BD
+    cur.execute("DELETE FROM certificados WHERE id = %s", (cert_id,))
+    conn.commit()
+    conn.close()
+
+    # Mandar el archivo de Drive a la papelera (recuperable)
+    file_id = (cert.get("file_id") or "").strip()
+    if file_id:
+        try:
+            service = drive_service()
+            service.files().update(fileId=file_id, body={'trashed': True}, supportsAllDrives=True).execute()
+        except Exception as e:
+            log.warning(f"No se pudo enviar a papelera el archivo {file_id}: {e}")
+
+    # Auditoría
+    try:
+        ip = request.headers.get('X-Forwarded-For', request.remote_addr)
+        log_portal_action(user_id, tenant, 'delete_certificado', f"id={cert_id} tipo={tipo}", ip)
+    except Exception:
+        pass
+
+    return redirect(f"{dest}?msg=deleted")
+
 # ╔══════════════════════════════════════════════════════════════════════╗
 # ║ PIEZA B — DESCARGA /portal/certificado                                 ║
 # ║ Sirve el archivo desde Drive. Protegido por login del portal.          ║
