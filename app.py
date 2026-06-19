@@ -939,6 +939,74 @@ def send_password_reset_email(email: str, username: str, reset_url: str) -> bool
     return send_email(email, subject, html_body)
 
 # ========================================
+
+def get_tenant_user_emails(tenant: str) -> list[str]:
+    """Emails de los usuarios activos del portal de una empresa."""
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT email FROM client_users
+        WHERE tenant = %s AND active = TRUE AND email IS NOT NULL AND email <> ''
+    """, (tenant,))
+    rows = cur.fetchall()
+    conn.close()
+    emails = []
+    for r in rows:
+        e = (dict(r).get('email') or '').strip()
+        if e:
+            emails.append(e)
+    return emails
+
+
+def send_certificado_notification(tenant: str, nombre: str, cuil: str, tipo: str = "medico"):
+    """Avisa por email a los usuarios del portal que llegó un certificado nuevo."""
+    try:
+        emails = get_tenant_user_emails(tenant)
+        if not emails:
+            return
+
+        t = get_tenant(tenant)
+        empresa = (t.get('display_name', tenant) if t else tenant) or tenant
+
+        if tipo == "familia":
+            tipo_label = "certificado de asignaciones familiares"
+            portal_path = "/portal/certificados-familia"
+        else:
+            tipo_label = "certificado médico"
+            portal_path = "/portal/certificados"
+
+        base_url = "https://twilio-webhook-lddc.onrender.com"
+        portal_url = base_url + portal_path
+        fecha = ts_str(int(time.time()))
+
+        subject = f"Nuevo {tipo_label} recibido - {empresa}"
+        html_body = f"""
+        <html>
+        <body style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto; padding: 20px;">
+            <h2 style="color: #5aa7ff;">Nuevo {tipo_label}</h2>
+            <p>Se recibió un nuevo {tipo_label} en el portal de <strong>{empresa}</strong>.</p>
+            <div style="background: #f5f5f5; padding: 15px; border-radius: 8px; margin: 20px 0;">
+                <p style="margin: 5px 0;"><strong>Empleado:</strong> {nombre or 'Sin nombre'}</p>
+                <p style="margin: 5px 0;"><strong>CUIL:</strong> {cuil or '-'}</p>
+                <p style="margin: 5px 0;"><strong>Fecha:</strong> {fecha}</p>
+            </div>
+            <p>
+                <a href="{portal_url}" style="display:inline-block; background:#2E3B8E; color:#fff; padding:10px 18px; border-radius:8px; text-decoration:none;">Ver en el portal</a>
+            </p>
+            <hr style="border: none; border-top: 1px solid #ddd; margin: 30px 0;">
+            <p style="color: #999; font-size: 12px;">Este es un email automático, por favor no respondas a este mensaje.</p>
+        </body>
+        </html>
+        """
+
+        for email in emails:
+            try:
+                send_email(email, subject, html_body)
+            except Exception as e:
+                log.warning(f"No se pudo notificar a {email}: {e}")
+    except Exception as e:
+        log.exception(f"Error en send_certificado_notification: {e}")
+
 # Gestión de usuarios del portal
 # ========================================
 
@@ -1145,6 +1213,32 @@ def log_portal_action(user_id: int, tenant: str, action: str, details: str = "",
     conn.commit()
     conn.close()
 
+
+def get_user_audit_log(user_id: int, limit: int = 100) -> list[dict]:
+    """Historial de actividad de un usuario del portal (más reciente primero)."""
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT action, details, ip_address, created_at
+        FROM client_audit_log
+        WHERE user_id = %s
+        ORDER BY created_at DESC
+        LIMIT %s
+    """, (user_id, limit))
+    rows = cur.fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def _accion_label(action: str) -> str:
+    """Traduce el código de acción a un texto legible."""
+    return {
+        'login': '🔓 Inicio de sesión',
+        'logout': '🔒 Cierre de sesión',
+        'change_password': '🔑 Cambio de contraseña',
+        'password_reset': '🔑 Restablecimiento de contraseña',
+        'delete_certificado': '🗑 Borró un certificado',
+    }.get(action or '', action or '—')
 
 def require_portal_login():
     """
@@ -2139,7 +2233,7 @@ def _portal_certificados_render(tipo: str = "medico"):
             html.append(
                 "<td>"
                 "<form method='post' action='/portal/certificado/delete' style='margin:0' "
-                "onsubmit=\"return confirm('¿Borrar este certificado? Se quita del portal y va a la papelera de Drive.');\">"
+                "onsubmit=\"return confirm('¿Borrar este certificado? Se quita del portal y no se puede recuperar.');\">"
                 f"<input type='hidden' name='id' value='{c['id']}'>"
                 f"<input type='hidden' name='tipo' value='{esc(tipo)}'>"
                 "<button type='submit' class='btn-del'>🗑 Borrar</button>"
@@ -2336,6 +2430,44 @@ def portal_certificado_delete():
         pass
 
     return redirect(f"{dest}?msg=deleted")
+
+
+def _accion_label(action: str) -> str:
+    """Traduce el código de acción a un texto legible."""
+    return {
+        'login': '🔓 Inicio de sesión',
+        'logout': '🔒 Cierre de sesión',
+        'change_password': '🔑 Cambio de contraseña',
+        'password_reset': '🔑 Restablecimiento de contraseña',
+        'delete_certificado': '🗑 Borró un certificado',
+    }.get(action or '', action or '—')
+
+
+def get_admin_audit_log(tenant: str = "", action: str = "", limit: int = 300) -> list[dict]:
+    """Historial de actividad de TODOS los usuarios del portal (vista admin)."""
+    conn = get_db_connection()
+    cur = conn.cursor()
+    sql = """
+        SELECT a.created_at, a.action, a.details, a.ip_address, a.tenant, a.user_id,
+               u.username, u.email, u.full_name
+        FROM client_audit_log a
+        LEFT JOIN client_users u ON u.id = a.user_id
+        WHERE 1=1
+    """
+    params = []
+    if tenant:
+        sql += " AND a.tenant = %s"
+        params.append(tenant)
+    if action:
+        sql += " AND a.action = %s"
+        params.append(action)
+    sql += " ORDER BY a.created_at DESC LIMIT %s"
+    params.append(limit)
+    cur.execute(sql, tuple(params))
+    rows = cur.fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
 
 # ╔══════════════════════════════════════════════════════════════════════╗
 # ║ PIEZA B — DESCARGA /portal/certificado                                 ║
@@ -6492,6 +6624,7 @@ def admin_home():
     html.append("<button class='eye-btn' type='button' id='eyeAll' title='Mostrar/ocultar todas'>👁️</button>")
     html.append(f"<div class='muted'>Token: <code>{esc(token)}</code></div>")
     html.append("<a href='/admin/portal_users' class='btn'>👥 Usuarios del Portal</a>")
+    html.append("<a href='/admin/portal_activity' class='btn'>🕑 Actividad del Portal</a>")
     html.append("<a href='/admin/logout' class='btn secondary' style='float:right'>Salir</a>")
     html.append("</div>")
 
@@ -8000,7 +8133,103 @@ def admin_portal_users():
     
     html.append("</div></body></html>")
     return Response("".join(html), mimetype="text/html")
+@app.route("/admin/portal_activity")
+def admin_portal_activity():
+    """Historial de actividad de los usuarios del portal (vista admin)."""
+    auth = require_admin()
+    if auth:
+        return auth
 
+    filtro_tenant = (request.args.get("tenant") or "").strip().lower()
+    filtro_action = (request.args.get("action") or "").strip()
+
+    eventos = get_admin_audit_log(tenant=filtro_tenant, action=filtro_action, limit=300)
+    tenants = get_all_tenants()
+    acciones = ['login', 'logout', 'change_password', 'password_reset', 'delete_certificado']
+
+    html = []
+    html.append("""<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Actividad del Portal</title>
+  <style>
+    :root{
+      --bg:#0b1220; --card:#0f1b33; --muted:#9fb2d0; --text:#eaf0ff;
+      --line:rgba(255,255,255,.08); --ok:#34d399; --bad:#fb7185;
+      --radius:14px; --mono: monospace;
+    }
+    *{box-sizing:border-box}
+    body{
+      margin:0; font-family:system-ui;
+      background: radial-gradient(1200px 700px at 20% -20%, rgba(90,167,255,.25), transparent 60%), var(--bg);
+      color:var(--text); padding:20px;
+    }
+    .wrap{max-width:1100px;margin:0 auto}
+    .card{ border:1px solid var(--line); background:rgba(255,255,255,.03); border-radius:var(--radius); padding:20px; margin-bottom:20px; }
+    h2{margin:0 0 10px 0}
+    .muted{color:var(--muted);font-size:13px}
+    select{ background:rgba(0,0,0,.25); border:1px solid var(--line); color:var(--text); padding:10px; border-radius:8px; margin:5px 0; }
+    .btn{ display:inline-block; padding:10px 16px; border-radius:8px; border:1px solid var(--line); background:rgba(255,255,255,.06); cursor:pointer; font-weight:600; text-decoration:none; color:var(--text); margin:5px; }
+    .btn:hover{background:rgba(255,255,255,.1)}
+    table{width:100%; border-collapse:collapse; margin-top:15px}
+    th, td{padding:10px 12px; text-align:left; border-bottom:1px solid var(--line); font-size:13px}
+    th{color:var(--muted); font-size:12px}
+    .mono{font-family:var(--mono); font-size:12px; color:var(--muted)}
+  </style>
+</head>
+<body>
+<div class="wrap">
+""")
+    html.append("<a href='/admin' class='btn'>← Volver al admin</a>")
+
+    html.append("<div class='card'>")
+    html.append("<h2>🕑 Actividad del Portal</h2>")
+    html.append("<div class='muted'>Accesos y acciones de los usuarios de los clientes</div>")
+
+    # Filtros
+    html.append("<form method='get' style='margin-top:14px'>")
+    html.append("<select name='tenant'>")
+    html.append("<option value=''>-- Todas las empresas --</option>")
+    for t in tenants:
+        sel = " selected" if (t['slug'] == filtro_tenant) else ""
+        html.append(f"<option value='{esc(t['slug'])}'{sel}>{esc(t['display_name'])}</option>")
+    html.append("</select> ")
+    html.append("<select name='action'>")
+    html.append("<option value=''>-- Todas las acciones --</option>")
+    for a in acciones:
+        sel = " selected" if (a == filtro_action) else ""
+        html.append(f"<option value='{esc(a)}'{sel}>{esc(_accion_label(a))}</option>")
+    html.append("</select> ")
+    html.append("<button type='submit' class='btn'>Filtrar</button>")
+    html.append("</form>")
+    html.append("</div>")
+
+    # Tabla
+    html.append("<div class='card'>")
+    html.append(f"<h3>Últimos {len(eventos)} movimientos</h3>")
+    if eventos:
+        html.append("<table>")
+        html.append("<thead><tr><th>Fecha</th><th>Empresa</th><th>Usuario</th><th>Acción</th><th>Detalle</th><th>IP</th></tr></thead>")
+        html.append("<tbody>")
+        for e in eventos:
+            quien = e.get('full_name') or e.get('email') or e.get('username') or f"(user #{e.get('user_id','?')})"
+            html.append("<tr>")
+            html.append(f"<td>{esc(ts_str(e.get('created_at')))}</td>")
+            html.append(f"<td>{esc(e.get('tenant','') or '')}</td>")
+            html.append(f"<td>{esc(quien)}</td>")
+            html.append(f"<td>{esc(_accion_label(e.get('action','')))}</td>")
+            html.append(f"<td>{esc(e.get('details','') or '')}</td>")
+            html.append(f"<td class='mono'>{esc(e.get('ip_address','') or '')}</td>")
+            html.append("</tr>")
+        html.append("</tbody></table>")
+    else:
+        html.append("<div class='muted'>No hay actividad registrada con esos filtros.</div>")
+    html.append("</div>")
+
+    html.append("</div></body></html>")
+    return Response("".join(html), mimetype="text/html")
 
 @app.get("/admin/periodos")
 def admin_periodos():
@@ -10947,6 +11176,15 @@ def twilio_inbound():
             nombre = pending.get("nombre", "") or get_nombre_for_cuil(tenant, cuil)
             save_certificado(tenant, cuil, nombre, from_whatsapp, file_id, file_name, content_type, cert_tipo)
 
+            # 3.b) notificar por email a RRHH (en segundo plano para no demorar la respuesta a WhatsApp)
+            try:
+                threading.Thread(
+                    target=send_certificado_notification,
+                    args=(tenant, nombre, cuil, cert_tipo),
+                    daemon=True
+                ).start()
+            except Exception as e:
+                log.warning(f"No se pudo lanzar la notificación de certificado: {e}")
             # 4) volver a READY y confirmar
             set_pending_step(pending["id"], "READY")
             return twiml("✅ Recibí tu certificado. RRHH lo va a revisar. ¡Gracias!")
