@@ -959,22 +959,24 @@ def create_client_user(tenant: str, username: str, email: str, full_name: str, c
     """
     Crea un nuevo usuario del portal.
     Genera contraseña temporal y envía email.
+    El email es la credencial de acceso.
     Returns: {'ok': True/False, 'message': str, 'temp_password': str}
     """
     tenant = tenant.strip().lower()
-    username = username.strip().lower()
     email = email.strip().lower()
+    # El usuario de acceso es el email
+    username = (username.strip().lower() or email)
     
-    if not tenant or not username or not email:
-        return {'ok': False, 'message': 'Faltan datos requeridos'}
+    if not tenant or not email:
+        return {'ok': False, 'message': 'Faltan datos requeridos (empresa y email)'}
     
-    # Verificar que no exista
+    # Verificar que el email no esté ya registrado (es la credencial de acceso)
     conn = get_db_connection()
     cur = conn.cursor()
-    cur.execute("SELECT id FROM client_users WHERE tenant = %s AND username = %s", (tenant, username))
+    cur.execute("SELECT id FROM client_users WHERE LOWER(email) = %s", (email,))
     if cur.fetchone():
         conn.close()
-        return {'ok': False, 'message': 'El usuario ya existe para este tenant'}
+        return {'ok': False, 'message': 'Ya existe un usuario con ese email'}
     
     # Generar contraseña temporal
     temp_password = generate_temp_password()
@@ -1009,7 +1011,6 @@ def create_client_user(tenant: str, username: str, email: str, full_name: str, c
         'message': 'Usuario creado y email enviado correctamente',
         'temp_password': temp_password
     }
-
 
 def get_all_client_users():
     """
@@ -1055,12 +1056,12 @@ def delete_client_user(user_id: int):
 # Autenticación del portal
 # ========================================
 
-def authenticate_portal_user(username: str, password: str) -> dict:
+def authenticate_portal_user(login: str, password: str) -> dict:
     """
-    Autentica un usuario del portal.
+    Autentica un usuario del portal por email (o username, retrocompat).
     Returns: {'ok': True/False, 'user': dict, 'message': str}
     """
-    username = username.strip().lower()
+    login = login.strip().lower()
     
     conn = get_db_connection()
     cur = conn.cursor()
@@ -1069,8 +1070,8 @@ def authenticate_portal_user(username: str, password: str) -> dict:
         SELECT id, tenant, username, password_hash, email, full_name, 
                role, active, must_change_password
         FROM client_users
-        WHERE username = %s
-    """, (username,))
+        WHERE LOWER(email) = %s OR username = %s
+    """, (login, login))
     
     user = cur.fetchone()
     conn.close()
@@ -1097,7 +1098,6 @@ def authenticate_portal_user(username: str, password: str) -> dict:
         'user': dict(user),
         'message': 'Login exitoso'
     }
-
 
 def get_portal_user_by_id(user_id: int):
     """
@@ -1168,10 +1168,10 @@ def portal_login():
     Login del portal de clientes.
     """
     if request.method == "POST":
-        username = request.form.get("username", "").strip()
+        login = request.form.get("email", "").strip() or request.form.get("username", "").strip()
         password = request.form.get("password", "").strip()
         
-        result = authenticate_portal_user(username, password)
+        result = authenticate_portal_user(login, password)
         
         if result['ok']:
             user = result['user']
@@ -1256,8 +1256,8 @@ def portal_login():
 
     html.append("""
     <form method="post">
-      <label>Usuario</label>
-      <input type="text" name="username" required autofocus placeholder="rrhh.empresa">
+      <label>Email</label>
+      <input type="email" name="email" required autofocus placeholder="tu@email.com">
       
       <label>Contraseña</label>
       <input type="password" name="password" required placeholder="••••••••">
@@ -1281,6 +1281,7 @@ def portal_login():
 """)
     
     return Response("".join(html), mimetype="text/html")
+
 
 @app.route("/portal")
 def portal_dashboard():
@@ -7727,10 +7728,7 @@ def admin_portal_users():
         html.append(f"<option value='{esc(t['slug'])}'>{esc(t['display_name'])}</option>")
     html.append("</select><br>")
     
-    html.append("<label>Usuario (ej: rrhh.empresa):</label><br>")
-    html.append("<input type='text' name='username' required placeholder='rrhh.empresa' style='width:100%;max-width:400px'><br>")
-    
-    html.append("<label>Email:</label><br>")
+    html.append("<label>Email (será el usuario de acceso):</label><br>")
     html.append("<input type='email' name='email' required placeholder='rrhh@empresa.com' style='width:100%;max-width:400px'><br>")
     
     html.append("<label>Nombre completo:</label><br>")
@@ -7739,7 +7737,6 @@ def admin_portal_users():
     html.append("<button type='submit' class='btn'>Crear usuario</button>")
     html.append("</form>")
     html.append("</div>")
-    
     # Lista de usuarios
     html.append("<div class='card'>")
     html.append(f"<h3>📋 Usuarios existentes ({len(users)})</h3>")
