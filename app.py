@@ -11259,7 +11259,7 @@ def twilio_inbound():
     if button == "VIEW_NOW" or body == "VIEW_NOW":
         if not is_verified_contact(tenant, cuil, from_whatsapp):
             set_pending_step(pending["id"], "AWAIT_DNI")
-            return twiml("🔐 Para cofirmar tu identidad, enviá tu DNI (solo números, sin puntos).")
+            return twiml("🔐 Para confirmar tu identidad, enviá tu DNI (solo números, sin puntos).")
 
         cnt = get_receipt_request_count(tenant, cuil, period, from_whatsapp)
         if cnt >= 3:
