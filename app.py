@@ -588,6 +588,54 @@ def find_pdf_file_id_for_cuil_period(tenant: str, cuil: str, period: str, *, qui
         log.error(f"❌ No encontré {filename_exact} dentro de carpeta período {period_folder_name} ({period_id})")
     return None
 
+
+def list_recibos_for_period(tenant: str, period_label: str) -> list[dict]:
+    """
+    Lista los recibos (PDFs) de un período leyendo la carpeta de Drive del tenant.
+    period_label esperado: "MM/YYYY". Devuelve [{cuil, nombre, file_id}] ordenado por nombre.
+    """
+    t = get_tenant(tenant)
+    if not t:
+        return []
+    root_id = (t.get("recibos_root_id") or t.get("drive_root_id") or "").strip()
+    if not root_id:
+        return []
+
+    folder_name = label_to_period_folder(period_label)  # "MM/YYYY" -> "MM-YYYY"
+    if not folder_name:
+        return []
+
+    service = drive_service()
+    period_id = _drive_find_child_folder_id(service, root_id, folder_name)
+    if not period_id:
+        return []
+
+    files = _drive_list_children(
+        service, parent_id=period_id, mime_type="application/pdf", page_size=1000
+    )
+
+    # Mapa CUIL(11 dígitos) -> nombre desde la planilla de envíos (una sola lectura, ya cacheada)
+    nombre_por_cuil = {}
+    for r in load_envios_rows(tenant):
+        archivo = strip_pdf(r.get("archivo") or r.get("Archivo") or "")
+        cd = norm_digits(archivo)
+        if len(cd) == 11:
+            nombre_por_cuil[cd] = str(r.get("nombre") or r.get("Nombre") or "").strip()
+
+    recibos = []
+    for f in files:
+        cuil_digits = norm_digits(strip_pdf((f.get("name") or "").strip()))
+        if len(cuil_digits) != 11:
+            continue
+        recibos.append({
+            "cuil": format_cuil_with_dashes(cuil_digits),
+            "nombre": nombre_por_cuil.get(cuil_digits, ""),
+            "file_id": f.get("id"),
+        })
+
+    recibos.sort(key=lambda x: (x["nombre"] or "zzz").lower())
+    return recibos
+
 from typing import List, Optional
 import re
 
@@ -1713,6 +1761,10 @@ def portal_dashboard():
         html.append("<div class='action-icon'>🧑\u200d🧑\u200d🧒</div>")
         html.append("<div class='action-title'>Certificados de familia</div>")
         html.append("<div class='action-desc'>Asignaciones familiares recibidas</div>")
+        html.append(f"<a href='/portal/recibos?period={esc(selected_period)}' class='action-card'>")
+        html.append("<div class='action-icon'>🧾</div>")
+        html.append("<div class='action-title'>Recibos</div>")
+        html.append("<div class='action-desc'>Ver y descargar los del período</div>")
         html.append("</a>")
         html.append("</div>")
         html.append("</div>")
@@ -2288,6 +2340,159 @@ def _portal_certificados_render(tipo: str = "medico"):
  
     return Response("".join(html), mimetype="text/html") 
  
+@app.route("/portal/recibos")
+def portal_recibos():
+    """Recibos de sueldo de un período (portal). Cada cliente ve solo los de su empresa."""
+    auth = require_portal_login()
+    if auth:
+        return auth
+
+    user_id = session.get('portal_user_id')
+    user = get_portal_user_by_id(user_id)
+    tenant = (user['tenant'] or "").strip().lower()
+
+    t = get_tenant(tenant)
+    empresa_nombre = t.get('display_name', tenant) if t else tenant
+
+    # Períodos disponibles (etiquetas "MM/YYYY")
+    period_labels = [period_folder_to_label(p) for p in list_tenant_period_folders(tenant)]
+    period_labels = [p for p in period_labels if p]
+
+    selected_period = request.args.get("period", "").strip()
+    if selected_period:
+        selected_period = normalize_period_label(selected_period)
+    if not selected_period and period_labels:
+        selected_period = period_labels[0]
+
+    recibos = list_recibos_for_period(tenant, selected_period) if selected_period else []
+
+    # Selector de período
+    sel = ["<form method='get' style='margin:0'>",
+           "<select name='period' onchange='this.form.submit()' class='btn' "
+           "style='padding:8px 12px; min-width:140px'>"]
+    for p in period_labels:
+        selflag = " selected" if p == selected_period else ""
+        sel.append(f"<option value='{esc(p)}'{selflag}>{esc(p)}</option>")
+    sel.append("</select></form>")
+    sel_html = "".join(sel) if period_labels else ""
+
+    html = []
+    html.append("""<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Portal - Recibos</title>
+  <link rel="manifest" href="/static/manifest.json">
+  <meta name="theme-color" content="#2E3B8E">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta name="apple-mobile-web-app-title" content="Recibos">
+  <link rel="apple-touch-icon" href="/static/icon-192.png">
+  <link rel="stylesheet" href="/static/portal-theme.css">
+  <style>
+    .table-wrap { overflow:auto; max-height:560px; border:1px solid var(--line); border-radius:var(--radius); margin-top:16px; }
+    table { width:100%; border-collapse:separate; border-spacing:0; }
+    th, td { padding:12px 14px; border-bottom:1px solid var(--line); font-size:14px; text-align:left; }
+    thead th { position:sticky; top:0; background:var(--card); z-index:1; color:var(--text-muted); font-size:13px; }
+    tr:hover td { background:var(--card-hover); }
+    .btn-sm { padding:6px 12px; font-size:13px; border-radius:8px; }
+    th.sortable { cursor:pointer; user-select:none; }
+    th.sortable:hover { color:var(--text); }
+    th .arrow { font-size:11px; opacity:.7; }
+  </style>
+</head>
+<body>
+  <div class="top-logo">
+    <img src="/static/icon-192.png" alt="SIA Sueldos">
+    <span class="top-logo-text">SIA</span>
+  </div>
+
+  <div class="container">
+    <div class="header">
+      <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:16px">
+        <div>
+          <h1>🧾 Recibos</h1>
+          <div class="subtitle">🏢 """ + esc(empresa_nombre) + """</div>
+        </div>
+        <div class="header-actions" style="display:flex; gap:10px; flex-wrap:wrap; align-items:center">
+          """ + sel_html + """
+          <a href="/portal" class="btn">← Volver al inicio</a>
+        </div>
+      </div>
+    </div>
+
+    <div class="card">
+""")
+
+    if not period_labels:
+        html.append("<p class='subtitle'>Todavía no hay períodos cargados.</p>")
+    else:
+        html.append(f"<h2>Período {esc(selected_period)} · {len(recibos)} recibos</h2>")
+        if recibos:
+            html.append("<div class='table-wrap'>")
+            html.append("<table id='rec-table'>")
+            html.append(
+                "<thead><tr>"
+                "<th class='sortable' data-key='nombre'>Nombre <span class='arrow'></span></th>"
+                "<th class='sortable' data-key='cuil'>CUIL <span class='arrow'></span></th>"
+                "<th>Recibo</th>"
+                "</tr></thead><tbody>"
+            )
+            for r in recibos:
+                qs = urlencode({
+                    "tenant": tenant,
+                    "cuil": r["cuil"],
+                    "period": selected_period,
+                    "token": make_media_token("pdf", tenant=tenant, cuil=r["cuil"], period=selected_period),
+                })
+                ver_url = f"/media/pdf?{qs}"
+                html.append("<tr>")
+                html.append(f"<td>{esc(r['nombre'] or '—')}</td>")
+                html.append(f"<td>{esc(r['cuil'])}</td>")
+                html.append(f"<td><a class='btn primary btn-sm' href='{ver_url}' target='_blank' rel='noopener'>Ver / Descargar</a></td>")
+                html.append("</tr>")
+            html.append("</tbody></table></div>")
+        else:
+            html.append("<p class='subtitle'>No hay recibos en este período.</p>")
+
+    html.append("""
+    </div>
+  </div>
+  <script>
+  (function(){
+    var table = document.getElementById('rec-table');
+    if(!table) return;
+    var tbody = table.querySelector('tbody');
+    var dir = {};
+    table.querySelectorAll('th.sortable').forEach(function(th){
+      th.addEventListener('click', function(){
+        var key = th.getAttribute('data-key');
+        var idx = Array.prototype.indexOf.call(th.parentNode.children, th);
+        dir[key] = !dir[key];
+        var asc = dir[key];
+        var rows = Array.prototype.slice.call(tbody.querySelectorAll('tr'));
+        rows.sort(function(a, b){
+          var va = (a.children[idx].textContent || '').trim().toLowerCase();
+          var vb = (b.children[idx].textContent || '').trim().toLowerCase();
+          if(va < vb) return asc ? -1 : 1;
+          if(va > vb) return asc ? 1 : -1;
+          return 0;
+        });
+        rows.forEach(function(r){ tbody.appendChild(r); });
+        table.querySelectorAll('th.sortable .arrow').forEach(function(a){ a.textContent = ''; });
+        var arrow = th.querySelector('.arrow');
+        if(arrow) arrow.textContent = asc ? '▲' : '▼';
+      });
+    });
+  })();
+  </script>
+</body>
+</html>
+""")
+
+    return Response("".join(html), mimetype="text/html")
+
 
 @app.get("/portal/certificados-zip")
 def portal_certificados_zip():
