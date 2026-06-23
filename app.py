@@ -9957,9 +9957,21 @@ def notify_billing_batch_done(tenant: str, period: str, enviados: int) -> None:
 
     now = int(time.time())
 
-    # Claim atómico: si la fila ya existe, no reenviamos.
     conn = get_db_connection()
     cur = conn.cursor()
+
+    # Self-healing: asegura la tabla candado si init_db no la creó todavía.
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS template_batch_notice (
+            tenant TEXT NOT NULL,
+            period TEXT NOT NULL,
+            enviados INTEGER,
+            notified_at BIGINT NOT NULL,
+            PRIMARY KEY (tenant, period)
+        )
+    """)
+
+    # Claim atómico: si la fila ya existe, no reenviamos.
     cur.execute("""
         INSERT INTO template_batch_notice (tenant, period, enviados, notified_at)
         VALUES (%s, %s, %s, %s)
@@ -9993,7 +10005,7 @@ def notify_billing_batch_done(tenant: str, period: str, enviados: int) -> None:
         log.info(f"📧 Aviso de facturación enviado: {empresa} {period} ({enviados} msgs)")
     except Exception as e:
         log.exception(f"No se pudo enviar el aviso de facturación: {e}")
-
+        
 @app.post("/admin/send_template_queue_tick")
 def admin_send_template_queue_tick():
     # Único endpoint del panel que acepta token por URL/form: lo usan el cron
