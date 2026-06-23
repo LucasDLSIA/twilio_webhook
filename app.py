@@ -62,7 +62,8 @@ TWILIO_MESSAGING_SERVICE_SID = os.environ.get("TWILIO_MESSAGING_SERVICE_SID", ""
 TWILIO_TEMPLATE_SID = os.environ.get("TWILIO_TEMPLATE_SID", "").strip()            # template con botón VIEW_NOW
 TWILIO_SIGN_TEMPLATE_SID = os.environ.get("TWILIO_SIGN_TEMPLATE_SID", "").strip()  # (opcional) template con botones SIGN_OK / SIGN_OBS
 
-
+# Casilla que recibe el aviso de facturación cuando termina un envío INITIAL.
+BILLING_NOTIFY_EMAIL = os.environ.get("BILLING_NOTIFY_EMAIL", "").strip()
 
 # Cache
 _EMP_CACHE = {"ts": 0.0, "rows": []}
@@ -5239,6 +5240,16 @@ def init_db():
             created_at INTEGER NOT NULL
         )
     """)
+    # Candado para avisar 1 sola vez por tanda de envío INITIAL (facturación)
+    cur.execute('''
+        CREATE TABLE IF NOT EXISTS template_batch_notice (
+            tenant TEXT NOT NULL,
+            period TEXT NOT NULL,
+            enviados INTEGER,
+            notified_at BIGINT NOT NULL,
+            PRIMARY KEY (tenant, period)
+        )
+    ''')
 
     _try_alter(cur, "ALTER TABLE certificados ADD COLUMN tipo TEXT DEFAULT 'medico';")
     _try_alter(cur, "CREATE INDEX IF NOT EXISTS idx_cert_tenant ON certificados(tenant, created_at);")
@@ -9935,6 +9946,53 @@ def _mark_queue_row(row_id: int, status: str, error: str = "", sent_sid: str | N
     conn.commit()
     conn.close()
 
+def notify_billing_batch_done(tenant: str, period: str, enviados: int) -> None:
+    """
+    Avisa por mail (1 sola vez por tanda) que terminó el envío INITIAL de un período.
+    El candado en template_batch_notice evita duplicar el aviso si el tick se vuelve
+    a ejecutar con la cola ya vacía.
+    """
+    if not BILLING_NOTIFY_EMAIL:
+        return
+
+    now = int(time.time())
+
+    # Claim atómico: si la fila ya existe, no reenviamos.
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute("""
+        INSERT INTO template_batch_notice (tenant, period, enviados, notified_at)
+        VALUES (%s, %s, %s, %s)
+        ON CONFLICT (tenant, period) DO NOTHING
+    """, (tenant, period, enviados, now))
+    claimed = (cur.rowcount == 1)
+    conn.commit()
+    conn.close()
+
+    if not claimed:
+        return  # ya se había avisado para esta tanda
+
+    t = get_tenant(tenant)
+    empresa = (t.get("display_name") if t else tenant) or tenant
+    momento = ts_str(now)
+
+    subject = f"[Facturación] Envío completado · {empresa} · {period}"
+    html_body = f"""
+    <div style="font-family:system-ui,Arial,sans-serif;font-size:15px;color:#1a1a1a">
+      <h2 style="margin:0 0 12px">Envío de recibos completado</h2>
+      <table cellpadding="6" style="border-collapse:collapse">
+        <tr><td><strong>Empresa</strong></td><td>{esc(empresa)}</td></tr>
+        <tr><td><strong>Período</strong></td><td>{esc(period)}</td></tr>
+        <tr><td><strong>Momento</strong></td><td>{esc(momento)}</td></tr>
+        <tr><td><strong>Mensajes enviados</strong></td><td>{enviados}</td></tr>
+      </table>
+    </div>
+    """
+    try:
+        send_email(BILLING_NOTIFY_EMAIL, subject, html_body)
+        log.info(f"📧 Aviso de facturación enviado: {empresa} {period} ({enviados} msgs)")
+    except Exception as e:
+        log.exception(f"No se pudo enviar el aviso de facturación: {e}")
 
 @app.post("/admin/send_template_queue_tick")
 def admin_send_template_queue_tick():
@@ -10021,6 +10079,10 @@ def admin_send_template_queue_tick():
             failed += 1
 
     stats = count_queue_status(tenant, period)
+
+    # 🧾 Facturación: si la cola quedó vacía, avisar (1 sola vez) que terminó la tanda
+    if stats.get("PENDING", 0) == 0 and stats.get("SENT", 0) > 0:
+        notify_billing_batch_done(tenant, period, stats.get("SENT", 0))
 
     if (request.form.get("mode") or request.args.get("mode") or "").lower() == "json":
         return {
