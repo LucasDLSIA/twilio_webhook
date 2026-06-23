@@ -6765,7 +6765,6 @@ def generate_signature_certificate_pdf(tenant: str, cuil: str, period: str) -> b
     story.append(Paragraph("Trazabilidad de la operación", st_section))
     story.append(kv_table([
         ("PDF entregado", _fmt_ar(msg.get("delivered_at"))),
-        ("PDF leído", _fmt_ar(msg.get("read_at"))),
         ("Fecha y hora de firma", _fmt_ar(firma_ts)),
         ("WhatsApp del firmante", whatsapp),
     ]))
