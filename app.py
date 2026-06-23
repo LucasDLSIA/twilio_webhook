@@ -6615,11 +6615,16 @@ def generate_signature_certificate_pdf(tenant: str, cuil: str, period: str) -> b
     cuil = norm_cuil(cuil)
     period = norm_period_label(period)
 
-    _AR_TZ = _dt.timezone(_dt.timedelta(hours=-3))
+    try:
+        from zoneinfo import ZoneInfo
+        _AR_TZ = ZoneInfo("America/Argentina/Buenos_Aires")
+    except Exception:
+        _AR_TZ = _dt.timezone(_dt.timedelta(hours=-3))
 
     def _fmt_ar(ts):
         if not ts:
             return "—"
+        # ts es epoch UTC (int(time.time())); lo mostramos en hora de Argentina.
         return _dt.datetime.fromtimestamp(int(ts), _AR_TZ).strftime("%d/%m/%Y %H:%M:%S") + " hs (ART)"
 
     # --- 1) Estado de firma (obligatorio) ---
@@ -6641,21 +6646,30 @@ def generate_signature_certificate_pdf(tenant: str, cuil: str, period: str) -> b
     firma_ts = est_row["updated_at"]
 
     # --- 2) Identidad verificada (la más reciente) ---
+    # --- 2) Identidad verificada (la más reciente). Normalizamos el CUIL en SQL
+    #         porque verifications puede guardarlo con guiones. ---
     cur.execute("""
         SELECT nombre, dni_last4, dni_hash, to_whatsapp, verified_at
         FROM verifications
-        WHERE tenant=%s AND cuil=%s
+        WHERE tenant=%s
+          AND regexp_replace(COALESCE(cuil,''), '\\D', '', 'g') = %s
         ORDER BY verified_at DESC NULLS LAST
         LIMIT 1
     """, (tenant, cuil))
     ver = cur.fetchone() or {}
 
     # --- 3) Trazabilidad del envío del PDF (entregado / leído) ---
+    # --- 3) Trazabilidad del envío del PDF (entregado / leído).
+    #         El PDF se registra con kind='media' (a veces 'pdf') y el CUIL/período
+    #         pueden venir con guiones, así que normalizamos ambos lados en SQL. ---
     cur.execute("""
         SELECT delivered_at, read_at, to_whatsapp
         FROM message_status
-        WHERE tenant=%s AND cuil=%s AND period=%s AND COALESCE(kind,'')='pdf'
-        ORDER BY COALESCE(delivered_at, created_at, 0) DESC
+        WHERE tenant=%s
+          AND regexp_replace(COALESCE(cuil,''), '\\D', '', 'g') = %s
+          AND replace(COALESCE(period,''), '-', '/') = %s
+          AND lower(COALESCE(kind,'')) IN ('media', 'pdf')
+        ORDER BY COALESCE(delivered_at, read_at, created_at, 0) DESC
         LIMIT 1
     """, (tenant, cuil, period))
     msg = cur.fetchone() or {}
