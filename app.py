@@ -2375,7 +2375,11 @@ def portal_recibos():
         sel.append(f"<option value='{esc(p)}'{selflag}>{esc(p)}</option>")
     sel.append("</select></form>")
     sel_html = "".join(sel) if period_labels else ""
-
+    dl_btn = ""
+    if recibos:
+        from urllib.parse import quote
+        dl_btn = (f"<a href='/portal/recibos-zip?period={quote(selected_period)}' "
+                  f"class='btn primary'>⬇️ Descargar todos</a>")
     html = []
     html.append("""<!doctype html>
 <html lang="es">
@@ -2416,6 +2420,7 @@ def portal_recibos():
           <div class="subtitle">🏢 """ + esc(empresa_nombre) + """</div>
         </div>
         <div class="header-actions" style="display:flex; gap:10px; flex-wrap:wrap; align-items:center">
+          """ + dl_btn + """
           """ + sel_html + """
           <a href="/portal" class="btn">← Volver al inicio</a>
         </div>
@@ -2493,6 +2498,73 @@ def portal_recibos():
 
     return Response("".join(html), mimetype="text/html")
 
+@app.get("/portal/recibos-zip")
+def portal_recibos_zip():
+    """Descarga todos los recibos de un período en un ZIP (solo del tenant del usuario)."""
+    import zipfile
+    auth = require_portal_login()
+    if auth:
+        return auth
+
+    user_id = session.get('portal_user_id')
+    user = get_portal_user_by_id(user_id)
+    tenant = (user['tenant'] or "").strip().lower()
+
+    selected_period = normalize_period_label((request.args.get("period") or "").strip())
+    if not selected_period:
+        return Response("Falta el período", status=400)
+
+    recibos = list_recibos_for_period(tenant, selected_period)
+    if not recibos:
+        return Response("No hay recibos para descargar", status=404)
+
+    service = drive_service()
+    mem = io.BytesIO()
+    usados = set()
+
+    with zipfile.ZipFile(mem, "w", zipfile.ZIP_DEFLATED) as zf:
+        for r in recibos:
+            file_id = (r.get("file_id") or "").strip()
+            if not file_id:
+                continue
+
+            # Nombre legible dentro del zip: nombre_cuil.pdf
+            base = f"{r.get('nombre') or 'sin_nombre'}_{r.get('cuil', '')}".strip('_')
+            base = re.sub(r'[^\w\-. ]', '_', base)
+            arcname = f"{base}.pdf"
+
+            # Evitar nombres repetidos dentro del zip
+            final, n = arcname, 1
+            while final.lower() in usados:
+                final = f"{base}_{n}.pdf"
+                n += 1
+            usados.add(final.lower())
+
+            try:
+                req = service.files().get_media(fileId=file_id, supportsAllDrives=True)
+                fh = io.BytesIO()
+                downloader = MediaIoBaseDownload(fh, req, chunksize=5 * 1024 * 1024)
+                done = False
+                while not done:
+                    _, done = downloader.next_chunk()
+                fh.seek(0)
+                zf.writestr(final, fh.read())
+            except Exception as e:
+                log.exception(f"Error agregando recibo {r.get('cuil')} al zip: {e}")
+                continue
+
+    mem.seek(0)
+    data = mem.read()
+
+    empresa = (t['display_name'] if (t := get_tenant(tenant)) else tenant) or tenant
+    empresa_slug = re.sub(r'[^\w\-]', '_', empresa)
+    period_slug = selected_period.replace('/', '-')
+    zip_name = f"recibos_{period_slug}_{empresa_slug}.zip"
+
+    resp = Response(data, mimetype="application/zip")
+    resp.headers["Content-Disposition"] = f'attachment; filename="{zip_name}"'
+    resp.headers["Content-Length"] = str(len(data))
+    return resp
 
 @app.get("/portal/certificados-zip")
 def portal_certificados_zip():
