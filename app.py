@@ -6400,6 +6400,271 @@ def generate_pdf_report_v2(tenant: str, period_filter: str = ""):
     out.seek(0)
     return out
 
+# =========================================================================
+# Constancia (comprobante) de firma de recibo de sueldo  ->  PDF
+# Pegar esta función en app.py (sugerido: justo después de set_recibo_estado).
+#
+# Reutiliza lo que el sistema YA guarda:
+#   - recibo_estado : estado (FIRMADO/OBSERVADO) + fecha/hora de firma
+#   - verifications : identidad verificada (nombre, DNI últimos 4, hash, WhatsApp)
+#   - message_status: cuándo se ENTREGÓ y se LEYÓ el PDF en WhatsApp
+# y emite un PDF A4 con un código de verificación HMAC (detecta adulteración).
+#
+# Requisitos ya presentes en app.py: hmac, hashlib, time, reportlab,
+# get_db_connection, get_tenant, get_nombre_for_cuil, norm_cuil,
+# norm_period_label, format_cuil_with_dashes, MEDIA_SECRET, log.
+# =========================================================================
+
+def generate_signature_certificate_pdf(tenant: str, cuil: str, period: str) -> bytes | None:
+    """
+    Genera una constancia de firma de recibo en PDF (bytes).
+
+    Devuelve None si el recibo todavía NO está FIRMADO ni OBSERVADO
+    (no hay nada que certificar).
+    """
+    from io import BytesIO
+    import datetime as _dt
+    from reportlab.lib.pagesizes import A4
+    from reportlab.lib.units import cm
+    from reportlab.lib import colors
+    from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+    from reportlab.platypus import (
+        SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer,
+    )
+
+    tenant = (tenant or "").strip().lower()
+    cuil = norm_cuil(cuil)
+    period = norm_period_label(period)
+
+    # --- Fechas en hora de Argentina (UTC-3) ---
+    _AR_TZ = _dt.timezone(_dt.timedelta(hours=-3))
+
+    def _fmt_ar(ts):
+        if not ts:
+            return "—"
+        return _dt.datetime.fromtimestamp(int(ts), _AR_TZ).strftime("%d/%m/%Y %H:%M:%S") + " hs (ART)"
+
+    # --- 1) Estado de firma (obligatorio) ---
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT estado, updated_at
+        FROM recibo_estado
+        WHERE tenant=%s AND cuil=%s AND period=%s
+    """, (tenant, cuil, period))
+    est_row = cur.fetchone()
+
+    estado = (est_row["estado"].strip().upper() if est_row and est_row["estado"] else "")
+    if estado not in ("FIRMADO", "OBSERVADO"):
+        conn.close()
+        log.info("Constancia: recibo no firmado (%s/%s/%s estado=%s)",
+                 tenant, cuil, period, estado or "NINGUNO")
+        return None
+    firma_ts = est_row["updated_at"]
+
+    # --- 2) Identidad verificada (la más reciente) ---
+    cur.execute("""
+        SELECT nombre, dni_last4, dni_hash, to_whatsapp, verified_at
+        FROM verifications
+        WHERE tenant=%s AND cuil=%s
+        ORDER BY verified_at DESC NULLS LAST
+        LIMIT 1
+    """, (tenant, cuil))
+    ver = cur.fetchone() or {}
+
+    # --- 3) Trazabilidad del envío del PDF (entregado / leído) ---
+    cur.execute("""
+        SELECT delivered_at, read_at, to_whatsapp
+        FROM message_status
+        WHERE tenant=%s AND cuil=%s AND period=%s AND COALESCE(kind,'')='pdf'
+        ORDER BY COALESCE(delivered_at, created_at, 0) DESC
+        LIMIT 1
+    """, (tenant, cuil, period))
+    msg = cur.fetchone() or {}
+    conn.close()
+
+    # --- Datos para mostrar ---
+    empresa = (get_tenant(tenant) or {}).get("display_name") or tenant
+    nombre = (ver.get("nombre") or get_nombre_for_cuil(tenant, cuil) or "—").strip()
+    whatsapp = (ver.get("to_whatsapp") or msg.get("to_whatsapp") or "").replace("whatsapp:", "").strip() or "—"
+    cuil_fmt = format_cuil_with_dashes(cuil)
+    dni_last4 = (ver.get("dni_last4") or "").strip()
+    dni_hash = (ver.get("dni_hash") or "").strip()
+    estado_txt = "FIRMADO" if estado == "FIRMADO" else "OBSERVADO"
+    emitido_ts = int(time.time())
+
+    # --- Código de verificación (HMAC: detecta adulteración) ---
+    base = f"sigcert|{tenant}|{cuil}|{period}|{estado}|{firma_ts}"
+    codigo = hmac.new(MEDIA_SECRET.encode("utf-8"), base.encode("utf-8"),
+                      hashlib.sha256).hexdigest()[:16].upper()
+    codigo_fmt = "-".join(codigo[i:i + 4] for i in range(0, len(codigo), 4))
+
+    # --- Colores de marca ---
+    AZUL = colors.HexColor("#1f2766")
+    ORO = colors.HexColor("#F4C430")
+    GRIS = colors.HexColor("#5b6478")
+    LINEA = colors.HexColor("#d7dbe6")
+
+    # --- Estilos ---
+    ss = getSampleStyleSheet()
+    st_title = ParagraphStyle("ct_title", parent=ss["Title"], fontName="Helvetica-Bold",
+                              fontSize=18, textColor=AZUL, spaceAfter=2, leading=22)
+    st_sub = ParagraphStyle("ct_sub", parent=ss["Normal"], fontName="Helvetica",
+                            fontSize=10, textColor=GRIS, spaceAfter=2)
+    st_section = ParagraphStyle("ct_section", parent=ss["Normal"], fontName="Helvetica-Bold",
+                                fontSize=11, textColor=AZUL, spaceBefore=14, spaceAfter=6)
+    st_body = ParagraphStyle("ct_body", parent=ss["Normal"], fontName="Helvetica",
+                             fontSize=10, textColor=colors.black, leading=15)
+    st_label = ParagraphStyle("ct_label", parent=ss["Normal"], fontName="Helvetica",
+                              fontSize=9.5, textColor=GRIS)
+    st_value = ParagraphStyle("ct_value", parent=ss["Normal"], fontName="Helvetica-Bold",
+                              fontSize=10.5, textColor=colors.black)
+    st_small = ParagraphStyle("ct_small", parent=ss["Normal"], fontName="Helvetica",
+                              fontSize=8, textColor=GRIS, leading=11)
+    st_code = ParagraphStyle("ct_code", parent=ss["Normal"], fontName="Courier-Bold",
+                             fontSize=13, textColor=AZUL)
+
+    def kv_table(rows):
+        """Tabla de 2 columnas (etiqueta / valor) con estilo limpio."""
+        data = [[Paragraph(k, st_label), Paragraph(v, st_value)] for k, v in rows]
+        t = Table(data, colWidths=[5.5 * cm, 11.0 * cm])
+        t.setStyle(TableStyle([
+            ("VALIGN", (0, 0), (-1, -1), "TOP"),
+            ("TOPPADDING", (0, 0), (-1, -1), 5),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
+            ("LEFTPADDING", (0, 0), (-1, -1), 0),
+            ("LINEBELOW", (0, 0), (-1, -2), 0.4, LINEA),
+        ]))
+        return t
+
+    # --- Encabezado (ícono opcional de marca) ---
+    story = []
+    header_cells = []
+    try:
+        icon = _load_icon_flowable()
+    except Exception:
+        icon = None
+    title_block = [Paragraph("Constancia de firma de recibo de sueldo", st_title),
+                   Paragraph(f"{empresa}", st_sub)]
+    if icon is not None:
+        header = Table([[icon, title_block]], colWidths=[2.2 * cm, 14.3 * cm])
+        header.setStyle(TableStyle([
+            ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+            ("LEFTPADDING", (0, 0), (-1, -1), 0),
+        ]))
+        story.append(header)
+    else:
+        story.extend(title_block)
+
+    story.append(Spacer(1, 6))
+    story.append(Table([[""]], colWidths=[16.5 * cm],
+                       style=TableStyle([("LINEABOVE", (0, 0), (-1, -1), 2, ORO)])))
+    story.append(Spacer(1, 10))
+
+    # --- Texto introductorio ---
+    verbo = "firmó de conformidad" if estado == "FIRMADO" else "registró con observaciones"
+    story.append(Paragraph(
+        f"Se deja constancia de que el/la empleado/a identificado/a a continuación "
+        f"{verbo} el recibo de sueldo correspondiente al período <b>{period}</b>, "
+        f"a través del canal oficial de WhatsApp de la empresa, "
+        f"previa verificación de identidad.", st_body))
+
+    # --- Datos del recibo ---
+    story.append(Paragraph("Datos del recibo", st_section))
+    story.append(kv_table([
+        ("Empresa", empresa),
+        ("Empleado/a", nombre),
+        ("CUIL", cuil_fmt),
+        ("Período", period),
+        ("Estado", estado_txt),
+    ]))
+
+    # --- Trazabilidad ---
+    story.append(Paragraph("Trazabilidad de la operación", st_section))
+    story.append(kv_table([
+        ("PDF entregado", _fmt_ar(msg.get("delivered_at"))),
+        ("PDF leído", _fmt_ar(msg.get("read_at"))),
+        ("Fecha y hora de firma", _fmt_ar(firma_ts)),
+        ("WhatsApp del firmante", whatsapp),
+    ]))
+
+    # --- Verificación de identidad ---
+    story.append(Paragraph("Verificación de identidad", st_section))
+    id_rows = [("Identidad verificada", _fmt_ar(ver.get("verified_at")) if ver.get("verified_at") else "—")]
+    if dni_last4:
+        id_rows.append(("DNI (últimos 4 dígitos)", f"•••••{dni_last4}"))
+    if dni_hash:
+        id_rows.append(("Huella del DNI (SHA-256)", dni_hash[:32] + "…"))
+    story.append(kv_table(id_rows))
+
+    # --- Bloque del código de verificación ---
+    story.append(Spacer(1, 16))
+    code_block = Table(
+        [[Paragraph("Código de verificación", st_label)],
+         [Paragraph(codigo_fmt, st_code)]],
+        colWidths=[16.5 * cm])
+    code_block.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, -1), colors.HexColor("#f3f5fb")),
+        ("BOX", (0, 0), (-1, -1), 0.6, LINEA),
+        ("TOPPADDING", (0, 0), (-1, -1), 8),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 8),
+        ("LEFTPADDING", (0, 0), (-1, -1), 12),
+    ]))
+    story.append(code_block)
+
+    story.append(Spacer(1, 10))
+    story.append(Paragraph(
+        f"Documento generado electrónicamente el {_fmt_ar(emitido_ts)}. "
+        f"El código de verificación es único e inalterable: cualquier modificación "
+        f"de los datos de esta constancia invalida dicho código. "
+        f"Este comprobante refleja los registros del sistema de distribución de "
+        f"recibos al momento de su emisión.", st_small))
+
+    # --- Pie de página con numeración ---
+    def _on_page(canvas, doc_obj):
+        canvas.saveState()
+        canvas.setFont("Helvetica", 7.5)
+        canvas.setFillColor(GRIS)
+        canvas.drawString(2 * cm, 1.2 * cm, f"Constancia {codigo_fmt}")
+        canvas.drawRightString(A4[0] - 2 * cm, 1.2 * cm, "Página %d" % doc_obj.page)
+        canvas.restoreState()
+
+    buf = BytesIO()
+    doc = SimpleDocTemplate(
+        buf, pagesize=A4,
+        leftMargin=2 * cm, rightMargin=2 * cm,
+        topMargin=1.8 * cm, bottomMargin=1.8 * cm,
+        title=f"Constancia de firma {cuil_fmt} {period}",
+        author=empresa,
+    )
+    doc.build(story, onFirstPage=_on_page, onLaterPages=_on_page)
+    return buf.getvalue()
+
+
+# =========================================================================
+# (OPCIONAL) Ruta de admin para descargar la constancia.
+# Pegar junto al resto de rutas @app.get del panel admin.
+# =========================================================================
+@app.get("/admin/constancia_firma.pdf")
+@admin_required
+def admin_constancia_firma_pdf():
+    tenant = (request.args.get("tenant") or "").strip().lower()
+    cuil = (request.args.get("cuil") or "").strip()
+    period = (request.args.get("period") or "").strip()
+
+    if not (tenant and cuil and period):
+        return Response("Faltan parámetros: tenant, cuil, period", status=400)
+
+    pdf = generate_signature_certificate_pdf(tenant, cuil, period)
+    if pdf is None:
+        return Response("El recibo no está firmado ni observado todavía.", status=404)
+
+    fname = f"constancia_firma_{norm_cuil(cuil)}_{period.replace('/', '-')}.pdf"
+    resp = Response(pdf, mimetype="application/pdf")
+    resp.headers["Content-Disposition"] = f'attachment; filename="{fname}"'
+    resp.headers["Content-Length"] = str(len(pdf))
+    return resp
+
 
 @app.get("/admin/report_recibos.pdf")
 @admin_required
@@ -10005,7 +10270,7 @@ def notify_billing_batch_done(tenant: str, period: str, enviados: int) -> None:
         log.info(f"📧 Aviso de facturación enviado: {empresa} {period} ({enviados} msgs)")
     except Exception as e:
         log.exception(f"No se pudo enviar el aviso de facturación: {e}")
-        
+
 @app.post("/admin/send_template_queue_tick")
 def admin_send_template_queue_tick():
     # Único endpoint del panel que acepta token por URL/form: lo usan el cron
