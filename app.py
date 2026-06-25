@@ -9165,9 +9165,9 @@ def admin_reenviar_template():
     """
     Reenviar template INITIAL a personas específicas (override).
     """
-    token = request.args.get("token") or request.form.get("token")
-    if token != ADMIN_TOKEN:
-        return Response("Unauthorized", status=401)
+    auth = require_admin()
+    if auth:
+        return auth
     
     if request.method == "POST":
         tenant = request.form.get("tenant", "").strip()
@@ -10584,6 +10584,7 @@ def admin_send_test():
     tenant = (request.values.get("tenant") or "").strip().lower()
     cuil = (request.values.get("cuil") or "").strip()
     period = (request.values.get("period") or "").strip()
+    whatsapp_override = (request.values.get("whatsapp_override") or "").strip()
 
     t = get_tenant(tenant)
     if not t:
@@ -10621,6 +10622,9 @@ def admin_send_test():
       <label>Período (mm/aaaa)</label>
       <input type="text" name="period" value="{esc(period)}" placeholder="04/2025" required>
 
+      <label>WhatsApp (opcional — solo si cambió de número)</label>
+      <input type="text" name="whatsapp_override" value="{esc(whatsapp_override)}" placeholder="+54 9 11 1234-5678 (dejar vacío = usar el del Excel)">
+
       <button type="submit">🔍 Buscar y enviar</button>
     </form>
     """)
@@ -10652,6 +10656,13 @@ def admin_send_test():
             return Response("".join(html) + "</div></body></html>", mimetype="text/html")
 
         to_whatsapp = person.get("to_whatsapp", "")
+        if whatsapp_override:
+            ow = normalize_whatsapp(whatsapp_override)
+            if not ow:
+                html.append("<div class='error'>❌ El WhatsApp ingresado no es válido.</div>")
+                return Response("".join(html) + "</div></body></html>", mimetype="text/html")
+            to_whatsapp = ow
+            html.append(f"<div class='info'>📱 Enviando al número ingresado manualmente: <span class='mono'>{esc(to_whatsapp)}</span> (no al del Excel).</div>")
         if not to_whatsapp:
             html.append("<div class='error'>❌ Esa persona no tiene WhatsApp configurado en el Excel.</div>")
             return Response("".join(html) + "</div></body></html>", mimetype="text/html")
