@@ -11990,10 +11990,10 @@ def admin_reenviar_fallidos():
     """
     Reenviar PDFs a empleados específicos.
     """
-    token = request.args.get("token") or request.form.get("token")
-    if token != ADMIN_TOKEN:
-        return Response("Unauthorized", status=401)
-    
+    auth = require_admin()
+    if auth:
+        return auth
+
     if request.method == "POST":
         tenant = request.form.get("tenant", "").strip()
         period = request.form.get("period", "").strip()
