@@ -4945,6 +4945,12 @@ def _try_alter(cur, sql: str):
 
 def init_db():
     conn = get_db_connection()
+    # ⚠️ Autocommit: en Postgres, si UNA sentencia falla, la transacción entera
+    # queda "abortada" y todo lo que sigue se descarta en silencio (los
+    # _try_alter de abajo fallan a propósito cuando la columna ya existe).
+    # Con autocommit cada sentencia se aplica por separado: un ALTER fallido
+    # ya no arrastra a los CREATE que vienen después.
+    conn.autocommit = True
     cur = conn.cursor()
     
     DATABASE_URL = os.environ.get("DATABASE_URL")
@@ -5006,9 +5012,20 @@ def init_db():
                 created_at BIGINT NOT NULL
             )
         ''')
-        _try_alter(cur, "ALTER TABLE certificados ADD COLUMN tipo TEXT DEFAULT 'medico';")
+        _try_alter(cur, "ALTER TABLE certificados ADD COLUMN IF NOT EXISTS tipo TEXT DEFAULT 'medico';")
         _try_alter(cur, "CREATE INDEX IF NOT EXISTS idx_cert_tenant ON certificados(tenant, created_at);")
         _try_alter(cur, "CREATE INDEX IF NOT EXISTS idx_cert_tenant_tipo ON certificados(tenant, tipo, created_at);")
+
+        # Branding del portal por empresa (logo + color de acento)
+        cur.execute("""
+          CREATE TABLE IF NOT EXISTS tenant_branding (
+            tenant TEXT PRIMARY KEY,
+            accent TEXT DEFAULT '',
+            logo BYTEA,
+            logo_mime TEXT DEFAULT '',
+            updated_at BIGINT
+          );
+        """)
 
         conn.commit()
         conn.close()
@@ -5282,16 +5299,6 @@ def init_db():
     _try_alter(cur, "CREATE INDEX IF NOT EXISTS idx_rre_key ON receipt_request_events(tenant, cuil, period, to_whatsapp, created_at);")
     _try_alter(cur, "CREATE INDEX IF NOT EXISTS idx_multi_tenant_expires ON multi_tenant_selection(expires_at);")
     _try_alter(cur, "CREATE INDEX IF NOT EXISTS idx_ts_queue_pending ON template_send_queue(status, tenant, period, created_at);")
-
-    cur.execute("""
-      CREATE TABLE IF NOT EXISTS tenant_branding (
-        tenant TEXT PRIMARY KEY,
-        accent TEXT DEFAULT '',
-        logo BYTEA,
-        logo_mime TEXT DEFAULT '',
-        updated_at INTEGER
-      );
-    """)
 
     conn.commit()
     conn.close()
@@ -7128,7 +7135,10 @@ def inject_portal_branding(resp):
                 new_img = ('<img src="/branding/logo?t=%s&v=%d" alt="Logo" '
                            'style="object-fit:contain">' % (quote(tenant), v))
                 html = html.replace(old_img, new_img)
-                t_info = get_tenant(tenant) or {}
+                try:
+                    t_info = get_tenant(tenant) or {}
+                except Exception:
+                    t_info = {}
                 disp = esc(t_info.get("display_name") or "")
                 if disp:
                     html = html.replace(
