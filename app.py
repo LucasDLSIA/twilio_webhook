@@ -70,6 +70,8 @@ _EMP_CACHE = {"ts": 0.0, "rows": []}
 _ENV_CACHE: Dict[str, Dict] = {}  # tenant_slug -> {"ts":..., "rows":[...] }
 CACHE_TTL = int(os.environ.get("CACHE_TTL", "120"))
 
+
+PUBLIC_BASE_URL = os.environ.get("PUBLIC_BASE_URL", "").strip()  # ej: https://miapp.com
 # =========================
 
 
@@ -1024,7 +1026,7 @@ def send_certificado_notification(tenant: str, nombre: str, cuil: str, tipo: str
             tipo_label = "certificado médico"
             portal_path = "/portal/certificados"
 
-        base_url = "https://twilio-webhook-lddc.onrender.com"
+        base_url = PUBLIC_BASE_URL
         portal_url = base_url + portal_path
         fecha = ts_str(int(time.time()))
 
@@ -1113,7 +1115,7 @@ def create_client_user(tenant: str, username: str, email: str, full_name: str, c
     conn.close()
     
     # Enviar email
-    portal_url = "https://twilio-webhook-lddc.onrender.com/portal/login"
+    portal_url = f"{PUBLIC_BASE_URL}/portal/login"
     email_sent = send_welcome_email(email, username, temp_password, portal_url)
     
     if not email_sent:
@@ -4138,7 +4140,7 @@ def portal_forgot_password():
             token = create_password_reset_token(user['id'])
             
             # Enviar email
-            reset_url = f"https://twilio-webhook-lddc.onrender.com/portal/reset/{token}"
+            reset_url = PUBLIC_BASE_URL + f"/portal/reset/{token}"
             send_password_reset_email(user['email'], user['username'], reset_url)
         
         # Siempre mostrar el mismo mensaje (seguridad)
