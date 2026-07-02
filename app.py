@@ -1658,6 +1658,7 @@ def portal_dashboard():
           <div class="subtitle">🏢 """ + esc(empresa_nombre) + """</div>
         </div>
         <div class="header-actions">
+          <a href="/portal/apariencia" class="btn">🎨 Apariencia</a>
           <a href="/portal/change_password" class="btn">🔐 Cambiar contraseña</a>
           <a href="/portal/logout" class="btn">🚪 Salir</a>
         </div>
@@ -5027,6 +5028,19 @@ def init_db():
           );
         """)
 
+        # Preferencias de apariencia por usuario del portal (nivel 2)
+        cur.execute("""
+          CREATE TABLE IF NOT EXISTS portal_user_prefs (
+            user_id BIGINT PRIMARY KEY,
+            theme TEXT DEFAULT '',
+            font TEXT DEFAULT '',
+            font_size TEXT DEFAULT '',
+            avatar BYTEA,
+            avatar_mime TEXT DEFAULT '',
+            updated_at BIGINT
+          );
+        """)
+
         conn.commit()
         conn.close()
         return
@@ -7147,6 +7161,16 @@ def inject_portal_branding(resp):
                     )
                 changed = True
 
+        # 3) Preferencias personales del usuario (fondo, tipografia, letra, foto)
+        uid = session.get("portal_user_id")
+        if uid and "</head>" in html:
+            p = get_user_prefs(uid)
+            if p:
+                css_prefs = _user_prefs_css(p)
+                if css_prefs:
+                    html = html.replace("</head>", '<style id="user-prefs">' + css_prefs + "</style></head>", 1)
+                    changed = True
+
         if changed:
             resp.set_data(html)
     except Exception as e:
@@ -7355,6 +7379,342 @@ def admin_branding():
             html.append("<button class='btn' type='submit' style='margin-top:14px'>💾 Guardar</button>")
             html.append("</form>")
 
+    html.append("</div></body></html>")
+    return Response("".join(html), mimetype="text/html")
+
+
+# =========================
+# Apariencia por usuario (portal de clientes) — nivel 2
+# =========================
+# Cada usuario del portal puede elegir SU fondo, tipografía, tamaño de letra
+# y foto (avatar). Son opciones curadas: presets probados sobre el tema
+# oscuro, así nadie puede dejarse el portal ilegible. Convive con el
+# branding por empresa: la empresa define la identidad (logo + acento),
+# el usuario define su comodidad.
+# - Se configura en /portal/apariencia (link en el dashboard).
+# - Se aplica en todas las páginas vía el mismo hook after_request.
+# - El avatar se guarda en Postgres (BYTEA, máx. 300 KB) y se sirve SOLO
+#   al propio usuario logueado desde /portal/avatar (sin parámetros:
+#   siempre devuelve el avatar de la sesión activa, no se puede espiar
+#   el de otro).
+
+AVATAR_MAX_BYTES = 300 * 1024
+
+PORTAL_THEMES = [
+    # (clave, etiqueta, --bg, --card, --card-hover) — "" = no tocar (original)
+    ("nocturno", "Nocturno (original)", "",        "",        ""),
+    ("grafito",  "Grafito",            "#0c0d10", "#15171c", "#1b1e24"),
+    ("oceano",   "Océano",             "#071722", "#0c2434", "#113049"),
+    ("bosque",   "Bosque",             "#08150f", "#0e241a", "#133024"),
+    ("vino",     "Vino",               "#170a12", "#26101d", "#331628"),
+]
+PORTAL_FONTS = [
+    ("sistema", "Sistema (original)", ""),
+    ("clasica", "Clásica",  "Georgia, 'Times New Roman', serif"),
+    ("maquina", "Máquina",  "ui-monospace, SFMono-Regular, Menlo, Consolas, monospace"),
+]
+PORTAL_FONT_SIZES = [
+    ("normal", "Normal", ""),
+    ("grande", "Grande", "1.15"),
+]
+
+_PREFS_CACHE: Dict[int, Dict] = {}  # user_id -> {"ts": float, "data": dict|None}
+
+def get_user_prefs(user_id: int, force: bool = False) -> Optional[Dict]:
+    """Preferencias de apariencia del usuario (sin el binario del avatar)."""
+    try:
+        uid = int(user_id)
+    except (TypeError, ValueError):
+        return None
+    now = time.time()
+    hit = _PREFS_CACHE.get(uid)
+    if hit and not force and (now - hit["ts"] < CACHE_TTL):
+        return hit["data"]
+    data = None
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT theme, font, font_size, (avatar IS NOT NULL) AS has_avatar, updated_at "
+            "FROM portal_user_prefs WHERE user_id = %s",
+            (uid,),
+        )
+        row = cur.fetchone()
+        conn.close()
+        if row:
+            data = {
+                "theme": (row.get("theme") or "").strip(),
+                "font": (row.get("font") or "").strip(),
+                "font_size": (row.get("font_size") or "").strip(),
+                "has_avatar": bool(row.get("has_avatar")),
+                "updated_at": int(row.get("updated_at") or 0),
+            }
+    except Exception as e:
+        log.exception("prefs: error leyendo preferencias de user %s: %s", uid, e)
+    _PREFS_CACHE[uid] = {"ts": now, "data": data}
+    return data
+
+def save_user_prefs(user_id: int, theme: str, font: str, font_size: str,
+                    avatar: bytes | None = None, avatar_mime: str = "",
+                    clear_avatar: bool = False) -> None:
+    """Upsert de preferencias. avatar=None deja el actual; clear_avatar lo borra."""
+    uid = int(user_id)
+    now = int(time.time())
+    conn = get_db_connection()
+    cur = conn.cursor()
+    if clear_avatar:
+        cur.execute(
+            "INSERT INTO portal_user_prefs (user_id, theme, font, font_size, avatar, avatar_mime, updated_at) "
+            "VALUES (%s, %s, %s, %s, NULL, '', %s) "
+            "ON CONFLICT (user_id) DO UPDATE SET theme = EXCLUDED.theme, font = EXCLUDED.font, "
+            "font_size = EXCLUDED.font_size, avatar = NULL, avatar_mime = '', "
+            "updated_at = EXCLUDED.updated_at",
+            (uid, theme, font, font_size, now),
+        )
+    elif avatar is not None:
+        cur.execute(
+            "INSERT INTO portal_user_prefs (user_id, theme, font, font_size, avatar, avatar_mime, updated_at) "
+            "VALUES (%s, %s, %s, %s, %s, %s, %s) "
+            "ON CONFLICT (user_id) DO UPDATE SET theme = EXCLUDED.theme, font = EXCLUDED.font, "
+            "font_size = EXCLUDED.font_size, avatar = EXCLUDED.avatar, "
+            "avatar_mime = EXCLUDED.avatar_mime, updated_at = EXCLUDED.updated_at",
+            (uid, theme, font, font_size, psycopg2.Binary(avatar), avatar_mime, now),
+        )
+    else:
+        cur.execute(
+            "INSERT INTO portal_user_prefs (user_id, theme, font, font_size, updated_at) "
+            "VALUES (%s, %s, %s, %s, %s) "
+            "ON CONFLICT (user_id) DO UPDATE SET theme = EXCLUDED.theme, font = EXCLUDED.font, "
+            "font_size = EXCLUDED.font_size, updated_at = EXCLUDED.updated_at",
+            (uid, theme, font, font_size, now),
+        )
+    conn.commit()
+    conn.close()
+    _PREFS_CACHE.pop(uid, None)
+
+def _user_prefs_css(p: Dict) -> str:
+    """Arma el CSS a inyectar según las preferencias guardadas."""
+    parts = []
+    theme = next((t for t in PORTAL_THEMES if t[0] == (p.get("theme") or "")), None)
+    if theme and theme[2]:
+        _k, _l, bg, card, hover = theme
+        parts.append(
+            ":root{--bg:%s;--card:%s;--card-hover:%s;}"
+            "body{background:radial-gradient(1200px 700px at 20%% -20%%, rgba(90,167,255,.15), transparent 60%%), %s !important;}"
+            % (bg, card, hover, bg)
+        )
+    font = next((f for f in PORTAL_FONTS if f[0] == (p.get("font") or "")), None)
+    if font and font[2]:
+        parts.append("body, input, select, textarea, button{font-family:%s !important;}" % font[2])
+    size = next((s for s in PORTAL_FONT_SIZES if s[0] == (p.get("font_size") or "")), None)
+    if size and size[2]:
+        parts.append("body{zoom:%s;}" % size[2])
+    if p.get("has_avatar"):
+        v = int(p.get("updated_at") or 0)
+        parts.append(
+            ".top-logo{position:relative;}"
+            ".top-logo::after{content:'';position:absolute;right:14px;top:50%%;"
+            "transform:translateY(-50%%);width:38px;height:38px;border-radius:50%%;"
+            "border:1px solid rgba(255,255,255,.3);"
+            "background:url('/portal/avatar?v=%d') center/cover;}" % v
+        )
+    return "".join(parts)
+
+@app.get("/portal/avatar")
+def portal_avatar():
+    """Sirve el avatar del usuario logueado (solo el propio, nunca el de otro)."""
+    uid = session.get("portal_user_id")
+    if not uid:
+        return Response("Unauthorized", status=401)
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute("SELECT avatar, avatar_mime FROM portal_user_prefs WHERE user_id = %s", (int(uid),))
+        row = cur.fetchone()
+        conn.close()
+    except Exception as e:
+        log.exception("prefs: error sirviendo avatar de %s: %s", uid, e)
+        return Response("Error", status=500)
+    if not row or row.get("avatar") is None:
+        return Response("Not found", status=404)
+    data = bytes(row["avatar"])
+    resp = Response(data, mimetype=(row.get("avatar_mime") or "image/png"))
+    resp.headers["Content-Length"] = str(len(data))
+    resp.headers["Cache-Control"] = "private, max-age=86400"
+    return resp
+
+@app.route("/portal/apariencia", methods=["GET", "POST"])
+def portal_apariencia():
+    """Preferencias de apariencia del usuario: fondo, tipografía, letra y foto."""
+    auth = require_portal_login()
+    if auth:
+        return auth
+    uid = int(session.get("portal_user_id"))
+
+    if request.method == "POST":
+        theme = (request.form.get("theme") or "").strip()
+        if theme not in {t[0] for t in PORTAL_THEMES}:
+            theme = ""
+        font = (request.form.get("font") or "").strip()
+        if font not in {f[0] for f in PORTAL_FONTS}:
+            font = ""
+        font_size = (request.form.get("font_size") or "").strip()
+        if font_size not in {s[0] for s in PORTAL_FONT_SIZES}:
+            font_size = ""
+
+        clear_avatar = request.form.get("clear_avatar") == "1"
+        avatar_bytes = None
+        avatar_mime = ""
+        f = request.files.get("avatar")
+        if f and f.filename and not clear_avatar:
+            mime = (f.mimetype or "").lower()
+            if mime not in BRANDING_ALLOWED_MIMES:
+                return redirect("/portal/apariencia?msg=err_tipo")
+            data = f.read()
+            if not data:
+                return redirect("/portal/apariencia?msg=err_tipo")
+            if len(data) > AVATAR_MAX_BYTES:
+                return redirect("/portal/apariencia?msg=err_peso")
+            avatar_bytes, avatar_mime = data, mime
+
+        try:
+            save_user_prefs(uid, theme, font, font_size, avatar=avatar_bytes,
+                            avatar_mime=avatar_mime, clear_avatar=clear_avatar)
+        except Exception as e:
+            log.exception("prefs: error guardando user %s: %s", uid, e)
+            return redirect("/portal/apariencia?msg=err_db")
+        return redirect("/portal/apariencia?msg=ok")
+
+    # ---- GET ----
+    msg = (request.args.get("msg") or "").strip()
+    p = get_user_prefs(uid, force=True) or {}
+    cur_theme = p.get("theme") or "nocturno"
+    cur_font = p.get("font") or "sistema"
+    cur_size = p.get("font_size") or "normal"
+
+    MSGS = {
+        "ok": ("alert-success", "✅ Guardado. Ya estás viendo tu portal con la nueva apariencia."),
+        "err_tipo": ("alert-error", "❌ Formato de foto no soportado: subí PNG, JPG o WebP."),
+        "err_peso": ("alert-error", "❌ La foto es muy pesada: máximo 300 KB."),
+        "err_db": ("alert-error", "❌ No se pudo guardar. Probá de nuevo en un rato."),
+    }
+
+    html = []
+    html.append("""<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Apariencia</title>
+  <link rel="manifest" href="/static/manifest.json">
+  <meta name="theme-color" content="#2E3B8E">
+  <link rel="apple-touch-icon" href="/static/icon-192.png">
+  <link rel="stylesheet" href="/static/portal-theme.css">
+  <style>
+    .opciones{display:flex; flex-wrap:wrap; gap:10px; margin:10px 0 4px 0}
+    .chip{
+      display:inline-flex; align-items:center; gap:10px;
+      border:1px solid var(--line); border-radius:999px; padding:10px 16px;
+      cursor:pointer; font-size:14px; color:var(--text);
+    }
+    .chip:hover{border-color:var(--accent)}
+    .chip input{accent-color:var(--accent)}
+    .chip .muestra{
+      width:34px; height:22px; border-radius:6px; display:inline-block;
+      border:1px solid rgba(255,255,255,.25); position:relative; overflow:hidden;
+    }
+    .chip .muestra i{
+      position:absolute; left:5px; top:5px; right:5px; bottom:5px;
+      border-radius:4px; display:block;
+    }
+    .seccion{margin-top:22px}
+    .seccion h3{margin:0 0 4px 0}
+    .ayuda{font-size:13px; color:var(--text-muted); margin:2px 0 6px 0}
+    .avatar-prev{
+      width:64px; height:64px; border-radius:50%; object-fit:cover;
+      border:2px solid var(--line); vertical-align:middle;
+    }
+    .alert-success{background:rgba(52,211,153,.1); border:1px solid rgba(52,211,153,.3); padding:12px; border-radius:8px; margin:12px 0}
+    .alert-error{background:rgba(251,113,133,.1); border:1px solid rgba(251,113,133,.3); padding:12px; border-radius:8px; margin:12px 0}
+    input[type=file]{
+      background:rgba(0,0,0,.25); border:1px solid var(--line); color:var(--text);
+      padding:9px; border-radius:8px; margin:6px 0; max-width:100%;
+    }
+  </style>
+</head>
+<body>
+  <div class="top-logo">
+    <img src="/static/icon-192.png" alt="SIA Sueldos">
+    <span class="top-logo-text">SIA</span>
+  </div>
+
+  <div class="container">
+    <div class="header">
+      <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:16px">
+        <div>
+          <h1>🎨 Apariencia</h1>
+          <div class="subtitle">Personalizá cómo ves tu portal. Solo lo ves vos.</div>
+        </div>
+        <div><a href="/portal" class="btn">← Volver al inicio</a></div>
+      </div>
+    </div>
+""")
+
+    if msg in MSGS:
+        css, texto = MSGS[msg]
+        html.append(f"<div class='{css}'>{texto}</div>")
+
+    html.append("<form method='post' enctype='multipart/form-data' class='card'>")
+
+    # --- Fondo ---
+    html.append("<div class='seccion'><h3>🌌 Fondo</h3>")
+    html.append("<div class='ayuda'>Elegí el tono de fondo del portal.</div>")
+    html.append("<div class='opciones'>")
+    for key, label, bg, card, _hover in PORTAL_THEMES:
+        ck = " checked" if cur_theme == key else ""
+        bg_show = bg or "#0f1629"
+        card_show = card or "#1a2332"
+        html.append(
+            f"<label class='chip'><input type='radio' name='theme' value='{key}'{ck}>"
+            f"<span class='muestra' style='background:{bg_show}'><i style='background:{card_show}'></i></span>"
+            f"{esc(label)}</label>"
+        )
+    html.append("</div></div>")
+
+    # --- Tipografía ---
+    html.append("<div class='seccion'><h3>🔤 Tipografía</h3>")
+    html.append("<div class='ayuda'>La letra de todo el portal.</div>")
+    html.append("<div class='opciones'>")
+    for key, label, stack in PORTAL_FONTS:
+        ck = " checked" if cur_font == key else ""
+        style = f" style='font-family:{esc(stack)}'" if stack else ""
+        html.append(
+            f"<label class='chip'{style}><input type='radio' name='font' value='{key}'{ck}>{esc(label)}</label>"
+        )
+    html.append("</div></div>")
+
+    # --- Tamaño ---
+    html.append("<div class='seccion'><h3>🔍 Tamaño de letra</h3>")
+    html.append("<div class='opciones'>")
+    for key, label, _z in PORTAL_FONT_SIZES:
+        ck = " checked" if cur_size == key else ""
+        html.append(f"<label class='chip'><input type='radio' name='font_size' value='{key}'{ck}>{esc(label)}</label>")
+    html.append("</div></div>")
+
+    # --- Foto ---
+    html.append("<div class='seccion'><h3>📷 Tu foto</h3>")
+    html.append("<div class='ayuda'>Aparece en la barra de arriba, en todas las páginas.</div>")
+    if p.get("has_avatar"):
+        v = int(p.get("updated_at") or 0)
+        html.append(f"<img class='avatar-prev' src='/portal/avatar?v={v}' alt='Tu foto'> ")
+        html.append("<label style='display:inline-flex;align-items:center;gap:6px;margin-left:10px;cursor:pointer'>"
+                    "<input type='checkbox' name='clear_avatar' value='1'> Quitar foto</label><br>")
+    html.append("<input type='file' name='avatar' accept='.png,.jpg,.jpeg,.webp'>")
+    html.append("<div class='ayuda'>PNG, JPG o WebP · máximo 300 KB · ideal cuadrada.</div>")
+    html.append("</div>")
+
+    html.append("<button class='btn' type='submit' style='margin-top:18px'>💾 Guardar</button>")
+    html.append("</form>")
     html.append("</div></body></html>")
     return Response("".join(html), mimetype="text/html")
 
