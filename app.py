@@ -1637,6 +1637,11 @@ def portal_dashboard():
         grid-template-columns: 1fr;
       }
     }
+    select{
+      background:#0f1b33; color:#eaf0ff; border:1px solid rgba(255,255,255,.2);
+      padding:10px 12px; border-radius:10px; font-size:15px; color-scheme:dark;
+    }
+    select option{ background-color:#0f1b33; color:#eaf0ff; }
   </style>
 </head>
 <body>
@@ -2407,6 +2412,8 @@ def portal_recibos():
     th.sortable { cursor:pointer; user-select:none; }
     th.sortable:hover { color:var(--text); }
     th .arrow { font-size:11px; opacity:.7; }
+    select{ color-scheme:dark; }
+    select option{ background-color:#0f1b33; color:#eaf0ff; }
   </style>
 </head>
 <body>
@@ -6953,7 +6960,12 @@ def pdf_exists_for_tenant_period_cuil(tenant, cuil, period):
 def root():
     tok = request.args.get("token", "")
     if tok:
-        return redirect(f"/admin")
+        return redirect("/admin")
+    # El dominio publico (portalsia.com.ar) manda a la home del portal.
+    # Cualquier otro host (URL interna de Render, localhost, etc.) sigue yendo a /admin.
+    host = (request.host or "").split(":")[0].lower()
+    if host == "portalsia.com.ar" or host.endswith(".portalsia.com.ar"):
+        return redirect("/portal")
     return redirect("/admin")
 
 
@@ -7942,7 +7954,9 @@ def admin_seguimiento():
     select, input{
       background:rgba(0,0,0,.25);border:1px solid var(--line);
       color:var(--text);padding:10px;border-radius:12px;outline:none;
+      color-scheme:dark;
     }
+    select option{background-color:#0f1b33;color:var(--text)}
     .sep{height:1px;background:var(--line);margin:12px 0}
     table{width:100%;border-collapse:separate;border-spacing:0}
     th, td{padding:10px;border-bottom:1px solid var(--line);font-size:13px}
@@ -8237,7 +8251,9 @@ def admin_panel():
       border-radius:12px;
       outline:none;
       min-width: 180px;
+      color-scheme:dark;
     }
+    select option{background-color:#0f1b33;color:var(--text)}
     label{font-size:12px;color:var(--muted)}
     .badge{
       display:inline-flex;align-items:center;gap:6px;
@@ -8628,7 +8644,9 @@ def admin_portal_users():
     input, select{
       background:rgba(0,0,0,.25); border:1px solid var(--line);
       color:var(--text); padding:10px; border-radius:8px; margin:5px 0;
+      color-scheme:dark;
     }
+    select option{background-color:#0f1b33;color:var(--text)}
     .btn{
       display:inline-block; padding:10px 16px; border-radius:8px;
       border:1px solid var(--line); background:rgba(255,255,255,.06);
@@ -8781,7 +8799,8 @@ def admin_portal_activity():
     .card{ border:1px solid var(--line); background:rgba(255,255,255,.03); border-radius:var(--radius); padding:20px; margin-bottom:20px; }
     h2{margin:0 0 10px 0}
     .muted{color:var(--muted);font-size:13px}
-    select{ background:rgba(0,0,0,.25); border:1px solid var(--line); color:var(--text); padding:10px; border-radius:8px; margin:5px 0; }
+    select{ background:rgba(0,0,0,.25); border:1px solid var(--line); color:var(--text); padding:10px; border-radius:8px; margin:5px 0; color-scheme:dark; }
+    select option{ background-color:#0f1b33; color:var(--text); }
     .btn{ display:inline-block; padding:10px 16px; border-radius:8px; border:1px solid var(--line); background:rgba(255,255,255,.06); cursor:pointer; font-weight:600; text-decoration:none; color:var(--text); margin:5px; }
     .btn:hover{background:rgba(255,255,255,.1)}
     table{width:100%; border-collapse:collapse; margin-top:15px}
