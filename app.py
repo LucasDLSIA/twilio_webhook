@@ -2842,8 +2842,23 @@ def portal_search():
     user = get_portal_user_by_id(user_id)
     tenant = user['tenant']
     
-    period = request.args.get("period", "")
+    period = (request.args.get("period", "") or "").strip()
     query = request.args.get("q", "").strip()
+
+    # Si venimos sin período (link viejo, marcador, "volver" de antes),
+    # usamos el último disponible: buscar con período vacío daba 0 resultados.
+    if not period:
+        try:
+            for _pf in list_tenant_period_folders(tenant):
+                _lbl = period_folder_to_label(_pf)
+                if _lbl:
+                    period = _lbl
+                    break
+        except Exception:
+            log.exception("search: no pude resolver el período por defecto")
+
+    # Querystring para que 'Ver historial' sepa volver a ESTA búsqueda.
+    hist_qs = esc(urlencode({"period": period, "q": query}))
     
     # Obtener info del tenant
     t = get_tenant(tenant)
@@ -3046,7 +3061,7 @@ def portal_search():
             html.append("<div class='result-details'>")
             html.append(f"CUIL: {esc(r['cuil'])} · DNI: {esc(r['dni'])} · WhatsApp: {esc(r['whatsapp'])}")
             html.append("</div>")
-            html.append(f"<div style='margin-top:12px'><a href='/portal/historial/{esc(r['cuil'])}' class='btn' style='font-size:13px; padding:8px 16px'>📜 Ver historial</a></div>")
+            html.append(f"<div style='margin-top:12px'><a href='/portal/historial/{esc(r['cuil'])}?{hist_qs}' class='btn' style='font-size:13px; padding:8px 16px'>📜 Ver historial</a></div>")
             html.append("</div>")
     
     html.append("</div>")
@@ -3070,6 +3085,18 @@ def portal_historial(cuil):
     tenant = user['tenant']
     
     cuil = norm_cuil(cuil)
+
+    # Para volver a la búsqueda exactamente como estaba (mismo período y
+    # mismo texto). Antes 'Volver' caía en /portal/search pelado: búsqueda
+    # vacía y período en blanco, que encima hacía que buscar de nuevo dé 0.
+    back_params = {}
+    _bp = (request.args.get("period") or "").strip()
+    _bq = (request.args.get("q") or "").strip()
+    if _bp:
+        back_params["period"] = _bp
+    if _bq:
+        back_params["q"] = _bq
+    back_url = "/portal/search" + (("?" + urlencode(back_params)) if back_params else "")
     
     # Obtener info del tenant
     t = get_tenant(tenant)
@@ -3080,7 +3107,7 @@ def portal_historial(cuil):
     person = find_person_by_cuil(envios, cuil)
     
     if not person:
-        return redirect('/portal/search')
+        return redirect(back_url)
     
     nombre = person.get('nombre', '')
     whatsapp = person.get('whatsapp', '')
@@ -3297,7 +3324,7 @@ def portal_historial(cuil):
   
   <div class="container">
     <div class="header">
-      <a href="/portal/search" class="btn">← Volver a búsqueda</a>
+      <a href='""" + esc(back_url) + """' class="btn">← Volver a búsqueda</a>
     </div>
     
     <div class="employee-header">
