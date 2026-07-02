@@ -5283,6 +5283,16 @@ def init_db():
     _try_alter(cur, "CREATE INDEX IF NOT EXISTS idx_multi_tenant_expires ON multi_tenant_selection(expires_at);")
     _try_alter(cur, "CREATE INDEX IF NOT EXISTS idx_ts_queue_pending ON template_send_queue(status, tenant, period, created_at);")
 
+    cur.execute("""
+      CREATE TABLE IF NOT EXISTS tenant_branding (
+        tenant TEXT PRIMARY KEY,
+        accent TEXT DEFAULT '',
+        logo BYTEA,
+        logo_mime TEXT DEFAULT '',
+        updated_at INTEGER
+      );
+    """)
+
     conn.commit()
     conn.close()
 
@@ -6954,6 +6964,392 @@ def pdf_exists_for_tenant_period_cuil(tenant, cuil, period):
 
 
 # =========================
+# Branding por empresa (portal de clientes) — nivel 1
+# =========================
+# Personalización visual del portal por tenant: logo + color de acento.
+# - Se configura desde /admin/branding (requiere sesión de admin).
+# - Se aplica a TODAS las páginas del portal sin tocarlas una por una:
+#   un hook after_request inyecta un <style> con el override de --accent
+#   y reemplaza el logo/texto de la barra superior por los de la empresa.
+# - El logo se guarda en Postgres (BYTEA, máx. 400 KB) y se sirve desde
+#   /branding/logo con cache de 1 día; la URL lleva ?v=updated_at para
+#   que el cambio se vea al instante cuando se actualiza.
+
+BRANDING_MAX_LOGO_BYTES = 400 * 1024
+BRANDING_ALLOWED_MIMES = {"image/png", "image/jpeg", "image/webp"}
+BRANDING_PRESETS = [
+    ("dorado",  "Dorado (SIA)", "#F4C430"),
+    ("azul",    "Azul",         "#5aa7ff"),
+    ("verde",   "Verde",        "#34d399"),
+    ("violeta", "Violeta",      "#a78bfa"),
+    ("coral",   "Coral",        "#fb7185"),
+    ("celeste", "Celeste",      "#22d3ee"),
+]
+
+_BRANDING_CACHE: Dict[str, Dict] = {}  # tenant -> {"ts": float, "data": dict|None}
+
+def _branding_hex_ok(c: str) -> bool:
+    return bool(re.fullmatch(r"#[0-9a-fA-F]{6}", (c or "").strip()))
+
+def _branding_hex_rgb(c: str):
+    c = (c or "").lstrip("#")
+    return int(c[0:2], 16), int(c[2:4], 16), int(c[4:6], 16)
+
+def get_tenant_branding(tenant: str, force: bool = False) -> Optional[Dict]:
+    """Config de branding del tenant (sin el binario del logo) o None si no hay."""
+    t = (tenant or "").strip().lower()
+    if not t:
+        return None
+    now = time.time()
+    hit = _BRANDING_CACHE.get(t)
+    if hit and not force and (now - hit["ts"] < CACHE_TTL):
+        return hit["data"]
+    data = None
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT accent, logo_mime, (logo IS NOT NULL) AS has_logo, updated_at "
+            "FROM tenant_branding WHERE tenant = %s",
+            (t,),
+        )
+        row = cur.fetchone()
+        conn.close()
+        if row:
+            data = {
+                "accent": (row.get("accent") or "").strip(),
+                "logo_mime": (row.get("logo_mime") or "").strip(),
+                "has_logo": bool(row.get("has_logo")),
+                "updated_at": int(row.get("updated_at") or 0),
+            }
+    except Exception as e:
+        log.exception("branding: error leyendo config de %s: %s", t, e)
+    _BRANDING_CACHE[t] = {"ts": now, "data": data}
+    return data
+
+def save_tenant_branding(tenant: str, accent: str, logo: bytes | None = None,
+                         logo_mime: str = "", clear_logo: bool = False) -> None:
+    """Upsert de branding. logo=None deja el logo actual; clear_logo=True lo borra."""
+    t = (tenant or "").strip().lower()
+    now = int(time.time())
+    conn = get_db_connection()
+    cur = conn.cursor()
+    if clear_logo:
+        cur.execute(
+            "INSERT INTO tenant_branding (tenant, accent, logo, logo_mime, updated_at) "
+            "VALUES (%s, %s, NULL, '', %s) "
+            "ON CONFLICT (tenant) DO UPDATE SET accent = EXCLUDED.accent, "
+            "logo = NULL, logo_mime = '', updated_at = EXCLUDED.updated_at",
+            (t, accent, now),
+        )
+    elif logo is not None:
+        cur.execute(
+            "INSERT INTO tenant_branding (tenant, accent, logo, logo_mime, updated_at) "
+            "VALUES (%s, %s, %s, %s, %s) "
+            "ON CONFLICT (tenant) DO UPDATE SET accent = EXCLUDED.accent, "
+            "logo = EXCLUDED.logo, logo_mime = EXCLUDED.logo_mime, "
+            "updated_at = EXCLUDED.updated_at",
+            (t, accent, psycopg2.Binary(logo), logo_mime, now),
+        )
+    else:
+        cur.execute(
+            "INSERT INTO tenant_branding (tenant, accent, updated_at) "
+            "VALUES (%s, %s, %s) "
+            "ON CONFLICT (tenant) DO UPDATE SET accent = EXCLUDED.accent, "
+            "updated_at = EXCLUDED.updated_at",
+            (t, accent, now),
+        )
+    conn.commit()
+    conn.close()
+    _BRANDING_CACHE.pop(t, None)
+
+@app.get("/branding/logo")
+def branding_logo():
+    """Sirve el logo del tenant (público: un logo no es información sensible)."""
+    t = (request.args.get("t") or "").strip().lower()
+    if not t:
+        return Response("Not found", status=404)
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute("SELECT logo, logo_mime FROM tenant_branding WHERE tenant = %s", (t,))
+        row = cur.fetchone()
+        conn.close()
+    except Exception as e:
+        log.exception("branding: error sirviendo logo de %s: %s", t, e)
+        return Response("Error", status=500)
+    if not row or row.get("logo") is None:
+        return Response("Not found", status=404)
+    data = bytes(row["logo"])
+    resp = Response(data, mimetype=(row.get("logo_mime") or "image/png"))
+    resp.headers["Content-Length"] = str(len(data))
+    # Cache fuerte: la URL cambia con ?v= cuando se actualiza el logo.
+    resp.headers["Cache-Control"] = "public, max-age=86400"
+    return resp
+
+@app.after_request
+def inject_portal_branding(resp):
+    """Aplica el branding del tenant a todas las páginas HTML del portal."""
+    try:
+        if not request.path.startswith("/portal"):
+            return resp
+        if resp.status_code != 200 or resp.direct_passthrough:
+            return resp
+        if "text/html" not in (resp.headers.get("Content-Type") or ""):
+            return resp
+        tenant = (session.get("portal_tenant") or "").strip().lower()
+        if not tenant:
+            return resp
+        b = get_tenant_branding(tenant)
+        if not b:
+            return resp
+
+        html = resp.get_data(as_text=True)
+        changed = False
+
+        # 1) Color de acento: pisa la variable del theme + el glow dorado hardcodeado.
+        accent = b.get("accent") or ""
+        if _branding_hex_ok(accent) and "</head>" in html:
+            r_, g_, b_ = _branding_hex_rgb(accent)
+            style = (
+                '<style id="tenant-branding">'
+                ':root{--accent:%s;}'
+                '.action-card:hover{box-shadow:0 8px 24px rgba(%d,%d,%d,.18);}'
+                '</style>' % (accent, r_, g_, b_)
+            )
+            html = html.replace("</head>", style + "</head>", 1)
+            changed = True
+
+        # 2) Logo: reemplaza el bloque .top-logo (idéntico en todas las páginas).
+        if b.get("has_logo"):
+            old_img = '<img src="/static/icon-192.png" alt="SIA Sueldos">'
+            if old_img in html:
+                v = int(b.get("updated_at") or 0)
+                new_img = ('<img src="/branding/logo?t=%s&v=%d" alt="Logo" '
+                           'style="object-fit:contain">' % (quote(tenant), v))
+                html = html.replace(old_img, new_img)
+                t_info = get_tenant(tenant) or {}
+                disp = esc(t_info.get("display_name") or "")
+                if disp:
+                    html = html.replace(
+                        '<span class="top-logo-text">SIA</span>',
+                        '<span class="top-logo-text">%s</span>' % disp,
+                    )
+                changed = True
+
+        if changed:
+            resp.set_data(html)
+    except Exception as e:
+        log.exception("branding: error inyectando branding en %s: %s", request.path, e)
+    return resp
+
+@app.route("/admin/branding", methods=["GET", "POST"])
+def admin_branding():
+    """Pantalla de personalización del portal por empresa (logo + color)."""
+    auth = require_admin()
+    if auth:
+        return auth
+
+    tenant = (request.values.get("tenant") or "").strip().lower()
+
+    if request.method == "POST":
+        t_info = get_tenant(tenant)
+        if not t_info:
+            return redirect("/admin/branding?msg=err_tenant")
+
+        # Color: preset o personalizado
+        preset = (request.form.get("preset") or "").strip()
+        accent = ""
+        if preset == "custom":
+            accent = (request.form.get("accent_custom") or "").strip()
+            if not _branding_hex_ok(accent):
+                return redirect(f"/admin/branding?tenant={quote(tenant)}&msg=err_color")
+        else:
+            for key, _label, hexv in BRANDING_PRESETS:
+                if key == preset:
+                    accent = hexv
+                    break
+            if not accent:
+                return redirect(f"/admin/branding?tenant={quote(tenant)}&msg=err_color")
+
+        clear_logo = request.form.get("clear_logo") == "1"
+        logo_bytes = None
+        logo_mime = ""
+        f = request.files.get("logo")
+        if f and f.filename and not clear_logo:
+            mime = (f.mimetype or "").lower()
+            if mime not in BRANDING_ALLOWED_MIMES:
+                return redirect(f"/admin/branding?tenant={quote(tenant)}&msg=err_tipo")
+            data = f.read()
+            if not data:
+                return redirect(f"/admin/branding?tenant={quote(tenant)}&msg=err_tipo")
+            if len(data) > BRANDING_MAX_LOGO_BYTES:
+                return redirect(f"/admin/branding?tenant={quote(tenant)}&msg=err_peso")
+            logo_bytes, logo_mime = data, mime
+
+        try:
+            save_tenant_branding(tenant, accent, logo=logo_bytes,
+                                 logo_mime=logo_mime, clear_logo=clear_logo)
+        except Exception as e:
+            log.exception("branding: error guardando %s: %s", tenant, e)
+            return redirect(f"/admin/branding?tenant={quote(tenant)}&msg=err_db")
+        return redirect(f"/admin/branding?tenant={quote(tenant)}&msg=ok")
+
+    # ---- GET ----
+    msg = (request.args.get("msg") or "").strip()
+    tenants = get_all_tenants()
+    b = get_tenant_branding(tenant, force=True) if tenant else None
+    cur_accent = (b or {}).get("accent") or ""
+
+    preset_checked = ""
+    if cur_accent:
+        for key, _label, hexv in BRANDING_PRESETS:
+            if hexv.lower() == cur_accent.lower():
+                preset_checked = key
+                break
+        if not preset_checked:
+            preset_checked = "custom"
+    else:
+        preset_checked = BRANDING_PRESETS[0][0]
+    custom_value = cur_accent if (preset_checked == "custom" and _branding_hex_ok(cur_accent)) else "#F4C430"
+
+    MSGS = {
+        "ok": ("success", "✅ Guardado. Los usuarios del portal ya lo ven (con varios workers puede demorar hasta 2 minutos por cache)."),
+        "err_tenant": ("error", "❌ Empresa inválida."),
+        "err_color": ("error", "❌ Color inválido: elegí un preset o un hex tipo #AABBCC."),
+        "err_tipo": ("error", "❌ Formato de logo no soportado: subí PNG, JPG o WebP."),
+        "err_peso": ("error", "❌ El logo es muy pesado: máximo 400 KB."),
+        "err_db": ("error", "❌ Error guardando en la base. Mirá los logs."),
+    }
+
+    html = []
+    html.append("""<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Personalización del portal</title>
+  <style>
+    :root{
+      --bg:#0b1220; --card:#0f1b33; --muted:#9fb2d0; --text:#eaf0ff;
+      --line:rgba(255,255,255,.08); --radius:14px;
+    }
+    *{box-sizing:border-box}
+    body{
+      margin:0; font-family:system-ui; color:var(--text); padding:20px;
+      background: radial-gradient(1200px 700px at 20% -20%, rgba(90,167,255,.25), transparent 60%), var(--bg);
+    }
+    .wrap{max-width:760px;margin:0 auto}
+    .card{
+      border:1px solid var(--line); background:rgba(255,255,255,.03);
+      border-radius:var(--radius); padding:20px; margin:16px 0;
+    }
+    h2{margin:0 0 6px 0} h3{margin:0 0 10px 0}
+    .muted{color:var(--muted);font-size:13px}
+    label{font-size:13px;color:var(--muted);font-weight:600}
+    input, select{
+      background:rgba(0,0,0,.25); border:1px solid var(--line);
+      color:var(--text); padding:10px; border-radius:8px; margin:6px 0;
+      color-scheme:dark;
+    }
+    select option{ background-color:#0f1b33; color:var(--text); }
+    input[type=file]{padding:8px}
+    input[type=color]{ padding:0; width:42px; height:28px; border:1px solid var(--line); border-radius:6px; cursor:pointer; background:none; }
+    .btn{
+      display:inline-block; padding:10px 16px; border-radius:8px; border:1px solid var(--line);
+      background:rgba(255,255,255,.06); cursor:pointer; font-weight:600;
+      text-decoration:none; color:var(--text);
+    }
+    .btn:hover{background:rgba(255,255,255,.1)}
+    .presets{display:flex; flex-wrap:wrap; gap:10px; margin:10px 0}
+    .preset{
+      display:inline-flex; align-items:center; gap:8px; border:1px solid var(--line);
+      border-radius:999px; padding:8px 14px; cursor:pointer; font-size:13px; color:var(--text);
+    }
+    .preset:hover{background:rgba(255,255,255,.05)}
+    .sw{width:16px;height:16px;border-radius:50%;display:inline-block;border:1px solid rgba(255,255,255,.25)}
+    .sep{height:1px;background:var(--line);margin:14px 0}
+    .hint{font-size:12px;color:var(--muted);margin-top:6px}
+    .logo-prev{
+      height:48px; max-width:220px; object-fit:contain; vertical-align:middle;
+      background:rgba(255,255,255,.06); border:1px solid var(--line); border-radius:8px; padding:6px;
+    }
+    .success{background:rgba(52,211,153,.1); border:1px solid rgba(52,211,153,.3); padding:12px; border-radius:8px; margin:10px 0}
+    .error{background:rgba(251,113,133,.1); border:1px solid rgba(251,113,133,.3); padding:12px; border-radius:8px; margin:10px 0}
+  </style>
+</head>
+<body>
+<div class="wrap">
+""")
+
+    if tenant:
+        html.append(f"<a href='/admin/panel?tenant={quote(tenant)}' class='btn'>← Volver al panel</a>")
+    else:
+        html.append("<a href='/admin' class='btn'>← Volver al admin</a>")
+
+    html.append("<div class='card'>")
+    html.append("<h2>🎨 Personalización del portal</h2>")
+    html.append("<div class='muted'>Logo y color de acento que ven los usuarios del portal de cada empresa.</div>")
+    html.append("<form method='get' style='margin-top:12px'>")
+    html.append("<label>Empresa</label><br>")
+    html.append("<select name='tenant' onchange='this.form.submit()' style='min-width:280px'>")
+    html.append("<option value=''>-- Seleccionar empresa --</option>")
+    for t_ in tenants:
+        s = " selected" if (t_.get("slug") == tenant) else ""
+        html.append(f"<option value='{esc(t_.get('slug',''))}'{s}>{esc(t_.get('display_name',''))}</option>")
+    html.append("</select>")
+    html.append("</form>")
+    html.append("</div>")
+
+    if tenant:
+        t_info = get_tenant(tenant)
+        if not t_info:
+            html.append("<div class='error'>❌ Empresa inválida.</div>")
+        else:
+            if msg in MSGS:
+                css, texto = MSGS[msg]
+                html.append(f"<div class='{css}'>{texto}</div>")
+
+            html.append("<form method='post' enctype='multipart/form-data' class='card'>")
+            html.append(f"<input type='hidden' name='tenant' value='{esc(tenant)}'>")
+            html.append(f"<h3>{esc(t_info.get('display_name',''))}</h3>")
+
+            html.append("<label>Color de acento</label>")
+            html.append("<div class='presets'>")
+            for key, label, hexv in BRANDING_PRESETS:
+                ck = " checked" if preset_checked == key else ""
+                html.append(
+                    f"<label class='preset'><input type='radio' name='preset' value='{key}'{ck}>"
+                    f"<span class='sw' style='background:{hexv}'></span>{esc(label)}</label>"
+                )
+            ck = " checked" if preset_checked == "custom" else ""
+            html.append(
+                f"""<label class='preset'><input type='radio' name='preset' value='custom'{ck}>"""
+                f"""<input type='color' name='accent_custom' value='{esc(custom_value)}' """
+                f"""onclick="this.parentNode.querySelector('input[type=radio]').checked=true">"""
+                """Personalizado</label>"""
+            )
+            html.append("</div>")
+            html.append("<div class='hint'>El acento se usa en resaltados y hovers del portal. El fondo es oscuro: evitá colores muy oscuros o quedan invisibles.</div>")
+
+            html.append("<div class='sep'></div>")
+            html.append("<label>Logo de la empresa</label><br>")
+            if (b or {}).get("has_logo"):
+                v = int((b or {}).get("updated_at") or 0)
+                html.append(f"<img class='logo-prev' src='/branding/logo?t={quote(tenant)}&v={v}' alt='Logo actual'>")
+                html.append("<label style='display:inline-flex;align-items:center;gap:6px;margin-left:12px;cursor:pointer'>"
+                            "<input type='checkbox' name='clear_logo' value='1'> Quitar logo</label><br>")
+            html.append("<input type='file' name='logo' accept='.png,.jpg,.jpeg,.webp'>")
+            html.append("<div class='hint'>PNG, JPG o WebP · máximo 400 KB · ideal apaisado y con fondo transparente.</div>")
+
+            html.append("<button class='btn' type='submit' style='margin-top:14px'>💾 Guardar</button>")
+            html.append("</form>")
+
+    html.append("</div></body></html>")
+    return Response("".join(html), mimetype="text/html")
+
+
+# =========================
 # Routes
 # =========================
 @app.get("/")
@@ -8310,6 +8706,7 @@ def admin_panel():
     html.append(f"<a class='btn' href='/admin/send_test?tenant={esc(tenant)}'>📤 Envío individual</a>")
     html.append(f"<a class='btn' href='/admin/reenviar_fallidos'>🔄 Reenviar fallidos</a>")
     html.append(f"<a class='btn' href='/admin/seguimiento?tenant={esc(tenant)}'>⚠️ Seguimiento</a>")
+    html.append(f"<a class='btn' href='/admin/branding?tenant={esc(tenant)}'>🎨 Personalización</a>")
     html.append("</div>")
     html.append("</div>")
 
