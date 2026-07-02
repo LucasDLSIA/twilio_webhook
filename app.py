@@ -5035,11 +5035,15 @@ def init_db():
             theme TEXT DEFAULT '',
             font TEXT DEFAULT '',
             font_size TEXT DEFAULT '',
+            density TEXT DEFAULT '',
+            motion TEXT DEFAULT '',
             avatar BYTEA,
             avatar_mime TEXT DEFAULT '',
             updated_at BIGINT
           );
         """)
+        _try_alter(cur, "ALTER TABLE portal_user_prefs ADD COLUMN IF NOT EXISTS density TEXT DEFAULT '';")
+        _try_alter(cur, "ALTER TABLE portal_user_prefs ADD COLUMN IF NOT EXISTS motion TEXT DEFAULT '';")
 
         conn.commit()
         conn.close()
@@ -7016,6 +7020,11 @@ def _branding_hex_rgb(c: str):
     c = (c or "").lstrip("#")
     return int(c[0:2], 16), int(c[2:4], 16), int(c[4:6], 16)
 
+def _branding_darker(c: str, factor: float = 0.8) -> str:
+    """Version mas oscura del color (para --accent-dark del theme)."""
+    r, g, b = _branding_hex_rgb(c)
+    return "#%02x%02x%02x" % (int(r * factor), int(g * factor), int(b * factor))
+
 def get_tenant_branding(tenant: str, force: bool = False) -> Optional[Dict]:
     """Config de branding del tenant (sin el binario del logo) o None si no hay."""
     t = (tenant or "").strip().lower()
@@ -7132,11 +7141,18 @@ def inject_portal_branding(resp):
         accent = b.get("accent") or ""
         if _branding_hex_ok(accent) and "</head>" in html:
             r_, g_, b_ = _branding_hex_rgb(accent)
+            dark = _branding_darker(accent)
+            # Pisa la variable del theme + su version oscura (gradientes de
+            # botones) + las sombras doradas hardcodeadas en portal-theme.css.
             style = (
                 '<style id="tenant-branding">'
-                ':root{--accent:%s;}'
+                ':root{--accent:%s;--accent-dark:%s;}'
                 '.action-card:hover{box-shadow:0 8px 24px rgba(%d,%d,%d,.18);}'
-                '</style>' % (accent, r_, g_, b_)
+                '.btn.primary{box-shadow:0 4px 12px rgba(%d,%d,%d,.3);}'
+                '.btn.primary:hover{box-shadow:0 6px 20px rgba(%d,%d,%d,.4);}'
+                '.stat:hover{box-shadow:0 4px 16px rgba(%d,%d,%d,.15);}'
+                'input:focus,select:focus,textarea:focus{box-shadow:0 0 0 3px rgba(%d,%d,%d,.1);}'
+                '</style>' % (accent, dark, r_, g_, b_, r_, g_, b_, r_, g_, b_, r_, g_, b_, r_, g_, b_)
             )
             html = html.replace("</head>", style + "</head>", 1)
             changed = True
@@ -7386,37 +7402,98 @@ def admin_branding():
 # =========================
 # Apariencia por usuario (portal de clientes) — nivel 2
 # =========================
-# Cada usuario del portal puede elegir SU fondo, tipografía, tamaño de letra
-# y foto (avatar). Son opciones curadas: presets probados sobre el tema
-# oscuro, así nadie puede dejarse el portal ilegible. Convive con el
-# branding por empresa: la empresa define la identidad (logo + acento),
-# el usuario define su comodidad.
-# - Se configura en /portal/apariencia (link en el dashboard).
-# - Se aplica en todas las páginas vía el mismo hook after_request.
+# Cada usuario del portal elige SU apariencia: fondo (paleta de temas,
+# incluido modo claro), tipografía (Google Fonts, como la Montserrat del
+# theme), tamaño de letra, densidad, animaciones y su foto (avatar).
+# Son opciones curadas y probadas contra portal-theme.css, así nadie puede
+# dejarse el portal ilegible. Convive con el branding por empresa: la
+# empresa define la identidad (logo + acento), el usuario su comodidad.
+# - Se configura en /portal/apariencia (link en el dashboard), con
+#   PREVISUALIZACIÓN EN VIVO: al tocar una opción, la misma página se
+#   redibuja al instante con el mismo CSS que después inyecta el servidor.
+# - Se aplica en todas las páginas vía el hook after_request.
 # - El avatar se guarda en Postgres (BYTEA, máx. 300 KB) y se sirve SOLO
-#   al propio usuario logueado desde /portal/avatar (sin parámetros:
-#   siempre devuelve el avatar de la sesión activa, no se puede espiar
-#   el de otro).
+#   al propio usuario logueado desde /portal/avatar.
 
 AVATAR_MAX_BYTES = 300 * 1024
 
+# Paleta de fondos. "pd" es --primary-dark (la otra punta del gradiente del
+# body en portal-theme.css). El tema "claro" además pisa texto/línea y trae
+# overrides extra para los fondos rgba oscuros hardcodeados del theme.
 PORTAL_THEMES = [
-    # (clave, etiqueta, --bg, --card, --card-hover) — "" = no tocar (original)
-    ("nocturno", "Nocturno (original)", "",        "",        ""),
-    ("grafito",  "Grafito",            "#0c0d10", "#15171c", "#1b1e24"),
-    ("oceano",   "Océano",             "#071722", "#0c2434", "#113049"),
-    ("bosque",   "Bosque",             "#08150f", "#0e241a", "#133024"),
-    ("vino",     "Vino",               "#170a12", "#26101d", "#331628"),
+    {"key": "nocturno",   "label": "Nocturno (original)", "bg": "",        "card": "",        "hover": "",        "pd": "",        "mode": "dark"},
+    {"key": "medianoche", "label": "Medianoche",          "bg": "#070b14", "card": "#10182b", "hover": "#16203a", "pd": "#0d1326", "mode": "dark"},
+    {"key": "grafito",    "label": "Grafito",             "bg": "#0c0d10", "card": "#16181d", "hover": "#1c1f26", "pd": "#131417", "mode": "dark"},
+    {"key": "acero",      "label": "Acero",               "bg": "#0d1117", "card": "#161b22", "hover": "#1c232e", "pd": "#10151d", "mode": "dark"},
+    {"key": "oceano",     "label": "Océano",              "bg": "#071722", "card": "#0d2434", "hover": "#123049", "pd": "#0a2536", "mode": "dark"},
+    {"key": "petroleo",   "label": "Petróleo",            "bg": "#06171a", "card": "#0c2529", "hover": "#113238", "pd": "#0a2a2c", "mode": "dark"},
+    {"key": "bosque",     "label": "Bosque",              "bg": "#08150f", "card": "#0e241a", "hover": "#133024", "pd": "#0c2418", "mode": "dark"},
+    {"key": "vino",       "label": "Vino",                "bg": "#170a12", "card": "#26101d", "hover": "#331628", "pd": "#240f1c", "mode": "dark"},
+    {"key": "purpura",    "label": "Púrpura",             "bg": "#100a1c", "card": "#1c1232", "hover": "#251944", "pd": "#1a0f33", "mode": "dark"},
+    {"key": "cacao",      "label": "Cacao",               "bg": "#140e08", "card": "#241a10", "hover": "#302316", "pd": "#201509", "mode": "dark"},
+    {"key": "claro",      "label": "Claro",               "bg": "#eef1f7", "card": "#ffffff", "hover": "#f4f6fb", "pd": "#dfe5f2", "mode": "light",
+     "text": "#182035", "muted": "#5c6b8a", "line": "rgba(20,30,60,.12)"},
 ]
+
+# Tipografías: mismas Google Fonts que ya usa el theme (Montserrat).
 PORTAL_FONTS = [
-    ("sistema", "Sistema (original)", ""),
-    ("clasica", "Clásica",  "Georgia, 'Times New Roman', serif"),
-    ("maquina", "Máquina",  "ui-monospace, SFMono-Regular, Menlo, Consolas, monospace"),
+    {"key": "sistema",    "label": "Montserrat (original)", "stack": "", "gf": ""},
+    {"key": "moderna",    "label": "Moderna",    "stack": "'Inter', system-ui, sans-serif",                                  "gf": "Inter:wght@400;600;700"},
+    {"key": "redondeada", "label": "Redondeada", "stack": "'Nunito', system-ui, sans-serif",                                 "gf": "Nunito:wght@400;600;700"},
+    {"key": "clasica",    "label": "Clásica",    "stack": "'Lora', Georgia, serif",                                          "gf": "Lora:wght@400;600;700"},
+    {"key": "maquina",    "label": "Máquina",    "stack": "'JetBrains Mono', ui-monospace, Menlo, Consolas, monospace",      "gf": "JetBrains+Mono:wght@400;600;700"},
 ]
+
 PORTAL_FONT_SIZES = [
-    ("normal", "Normal", ""),
-    ("grande", "Grande", "1.15"),
+    {"key": "normal", "label": "Normal", "zoom": ""},
+    {"key": "grande", "label": "Grande", "zoom": "1.15"},
+    {"key": "xl",     "label": "Extra grande", "zoom": "1.3"},
 ]
+
+PORTAL_DENSITIES = [
+    {"key": "comoda",   "label": "Cómoda (original)"},
+    {"key": "compacta", "label": "Compacta"},
+]
+
+PORTAL_MOTION = [
+    {"key": "si", "label": "Con animaciones (original)"},
+    {"key": "no", "label": "Sin animaciones"},
+]
+
+# Overrides extra del modo claro: pisa los fondos rgba() oscuros que
+# portal-theme.css tiene hardcodeados (inputs, botones, th, stats).
+PORTAL_LIGHT_EXTRA_CSS = (
+    "input,select,textarea{background:rgba(0,0,0,.05)!important;}"
+    "input:focus,select:focus,textarea:focus{background:rgba(0,0,0,.07)!important;}"
+    ".btn{background:rgba(0,0,0,.05)!important;}"
+    ".btn:hover{background:rgba(0,0,0,.09)!important;}"
+    ".btn.secondary{color:#fff!important;}"
+    "th{background:rgba(0,0,0,.05)!important;}"
+    ".stat{background:rgba(0,0,0,.04)!important;}"
+    "tr:hover{background:rgba(0,0,0,.03)!important;}"
+    ".stat-value{background:linear-gradient(135deg,var(--accent-dark,#b8860b),#182035)!important;"
+    "-webkit-background-clip:text!important;background-clip:text!important;}"
+    ".top-logo img{box-shadow:0 4px 12px rgba(0,0,0,.18);}"
+)
+
+PORTAL_COMPACT_CSS = (
+    ".card,.header{padding:16px!important;}"
+    ".card{margin-bottom:14px!important;}"
+    "th,td{padding:9px 12px!important;}"
+    ".btn{padding:9px 16px!important;font-size:13px!important;}"
+    ".stat{padding:16px!important;}"
+    ".stat-value{font-size:30px!important;}"
+    "h1{font-size:24px!important;}"
+    "body:not(.login-page) .container{padding-top:72px!important;}"
+)
+
+# Ojo: .top-logo se centra con transform:translateX(-50%); en el hover hay
+# que RESTAURAR ese transform, no anularlo, o el logo se corre al pasar el mouse.
+PORTAL_NOMOTION_CSS = (
+    "*,*::before,*::after{animation:none!important;transition:none!important;}"
+    ".card:hover,.btn:hover,.btn.primary:hover,.stat:hover,.action-card:hover{transform:none!important;}"
+    ".top-logo:hover{transform:translateX(-50%)!important;}"
+)
 
 _PREFS_CACHE: Dict[int, Dict] = {}  # user_id -> {"ts": float, "data": dict|None}
 
@@ -7435,7 +7512,8 @@ def get_user_prefs(user_id: int, force: bool = False) -> Optional[Dict]:
         conn = get_db_connection()
         cur = conn.cursor()
         cur.execute(
-            "SELECT theme, font, font_size, (avatar IS NOT NULL) AS has_avatar, updated_at "
+            "SELECT theme, font, font_size, density, motion, "
+            "(avatar IS NOT NULL) AS has_avatar, updated_at "
             "FROM portal_user_prefs WHERE user_id = %s",
             (uid,),
         )
@@ -7446,6 +7524,8 @@ def get_user_prefs(user_id: int, force: bool = False) -> Optional[Dict]:
                 "theme": (row.get("theme") or "").strip(),
                 "font": (row.get("font") or "").strip(),
                 "font_size": (row.get("font_size") or "").strip(),
+                "density": (row.get("density") or "").strip(),
+                "motion": (row.get("motion") or "").strip(),
                 "has_avatar": bool(row.get("has_avatar")),
                 "updated_at": int(row.get("updated_at") or 0),
             }
@@ -7455,6 +7535,7 @@ def get_user_prefs(user_id: int, force: bool = False) -> Optional[Dict]:
     return data
 
 def save_user_prefs(user_id: int, theme: str, font: str, font_size: str,
+                    density: str, motion: str,
                     avatar: bytes | None = None, avatar_mime: str = "",
                     clear_avatar: bool = False) -> None:
     """Upsert de preferencias. avatar=None deja el actual; clear_avatar lo borra."""
@@ -7464,61 +7545,81 @@ def save_user_prefs(user_id: int, theme: str, font: str, font_size: str,
     cur = conn.cursor()
     if clear_avatar:
         cur.execute(
-            "INSERT INTO portal_user_prefs (user_id, theme, font, font_size, avatar, avatar_mime, updated_at) "
-            "VALUES (%s, %s, %s, %s, NULL, '', %s) "
+            "INSERT INTO portal_user_prefs (user_id, theme, font, font_size, density, motion, avatar, avatar_mime, updated_at) "
+            "VALUES (%s, %s, %s, %s, %s, %s, NULL, '', %s) "
             "ON CONFLICT (user_id) DO UPDATE SET theme = EXCLUDED.theme, font = EXCLUDED.font, "
-            "font_size = EXCLUDED.font_size, avatar = NULL, avatar_mime = '', "
-            "updated_at = EXCLUDED.updated_at",
-            (uid, theme, font, font_size, now),
+            "font_size = EXCLUDED.font_size, density = EXCLUDED.density, motion = EXCLUDED.motion, "
+            "avatar = NULL, avatar_mime = '', updated_at = EXCLUDED.updated_at",
+            (uid, theme, font, font_size, density, motion, now),
         )
     elif avatar is not None:
         cur.execute(
-            "INSERT INTO portal_user_prefs (user_id, theme, font, font_size, avatar, avatar_mime, updated_at) "
-            "VALUES (%s, %s, %s, %s, %s, %s, %s) "
+            "INSERT INTO portal_user_prefs (user_id, theme, font, font_size, density, motion, avatar, avatar_mime, updated_at) "
+            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s) "
             "ON CONFLICT (user_id) DO UPDATE SET theme = EXCLUDED.theme, font = EXCLUDED.font, "
-            "font_size = EXCLUDED.font_size, avatar = EXCLUDED.avatar, "
-            "avatar_mime = EXCLUDED.avatar_mime, updated_at = EXCLUDED.updated_at",
-            (uid, theme, font, font_size, psycopg2.Binary(avatar), avatar_mime, now),
+            "font_size = EXCLUDED.font_size, density = EXCLUDED.density, motion = EXCLUDED.motion, "
+            "avatar = EXCLUDED.avatar, avatar_mime = EXCLUDED.avatar_mime, updated_at = EXCLUDED.updated_at",
+            (uid, theme, font, font_size, density, motion, psycopg2.Binary(avatar), avatar_mime, now),
         )
     else:
         cur.execute(
-            "INSERT INTO portal_user_prefs (user_id, theme, font, font_size, updated_at) "
-            "VALUES (%s, %s, %s, %s, %s) "
+            "INSERT INTO portal_user_prefs (user_id, theme, font, font_size, density, motion, updated_at) "
+            "VALUES (%s, %s, %s, %s, %s, %s, %s) "
             "ON CONFLICT (user_id) DO UPDATE SET theme = EXCLUDED.theme, font = EXCLUDED.font, "
-            "font_size = EXCLUDED.font_size, updated_at = EXCLUDED.updated_at",
-            (uid, theme, font, font_size, now),
+            "font_size = EXCLUDED.font_size, density = EXCLUDED.density, motion = EXCLUDED.motion, "
+            "updated_at = EXCLUDED.updated_at",
+            (uid, theme, font, font_size, density, motion, now),
         )
     conn.commit()
     conn.close()
     _PREFS_CACHE.pop(uid, None)
 
 def _user_prefs_css(p: Dict) -> str:
-    """Arma el CSS a inyectar según las preferencias guardadas."""
+    """Arma el CSS a inyectar según las preferencias guardadas.
+    IMPORTANTE: el JS de vista previa en /portal/apariencia replica estas
+    mismas reglas; si tocás algo acá, tocá también el script de esa página."""
+    imports = []
     parts = []
-    theme = next((t for t in PORTAL_THEMES if t[0] == (p.get("theme") or "")), None)
-    if theme and theme[2]:
-        _k, _l, bg, card, hover = theme
-        parts.append(
-            ":root{--bg:%s;--card:%s;--card-hover:%s;}"
-            "body{background:radial-gradient(1200px 700px at 20%% -20%%, rgba(90,167,255,.15), transparent 60%%), %s !important;}"
-            % (bg, card, hover, bg)
-        )
-    font = next((f for f in PORTAL_FONTS if f[0] == (p.get("font") or "")), None)
-    if font and font[2]:
-        parts.append("body, input, select, textarea, button{font-family:%s !important;}" % font[2])
-    size = next((s for s in PORTAL_FONT_SIZES if s[0] == (p.get("font_size") or "")), None)
-    if size and size[2]:
-        parts.append("body{zoom:%s;}" % size[2])
+
+    theme = next((t for t in PORTAL_THEMES if t["key"] == (p.get("theme") or "")), None)
+    if theme and theme["bg"]:
+        root = "--bg:%s;--card:%s;--card-hover:%s;--primary-dark:%s;" % (
+            theme["bg"], theme["card"], theme["hover"], theme["pd"])
+        if theme.get("text"):
+            root += "--text:%s;--text-muted:%s;--line:%s;" % (
+                theme["text"], theme["muted"], theme["line"])
+        parts.append(":root{%s}" % root)
+        if theme.get("mode") == "light":
+            parts.append(PORTAL_LIGHT_EXTRA_CSS)
+
+    font = next((f for f in PORTAL_FONTS if f["key"] == (p.get("font") or "")), None)
+    if font and font["stack"]:
+        if font["gf"]:
+            imports.append("@import url('https://fonts.googleapis.com/css2?family=%s&display=swap');" % font["gf"])
+        parts.append("body,input,select,textarea,button,.btn{font-family:%s !important;}" % font["stack"])
+
+    size = next((s for s in PORTAL_FONT_SIZES if s["key"] == (p.get("font_size") or "")), None)
+    if size and size["zoom"]:
+        parts.append("body{zoom:%s;}" % size["zoom"])
+
+    if (p.get("density") or "") == "compacta":
+        parts.append(PORTAL_COMPACT_CSS)
+
+    if (p.get("motion") or "") == "no":
+        parts.append(PORTAL_NOMOTION_CSS)
+
     if p.get("has_avatar"):
         v = int(p.get("updated_at") or 0)
+        # .top-logo es position:fixed → sirve de contenedor del ::after.
+        # left:calc(100% + 10px) lo pone AL LADO del logo, no encima.
         parts.append(
-            ".top-logo{position:relative;}"
-            ".top-logo::after{content:'';position:absolute;right:14px;top:50%%;"
-            "transform:translateY(-50%%);width:38px;height:38px;border-radius:50%%;"
-            "border:1px solid rgba(255,255,255,.3);"
-            "background:url('/portal/avatar?v=%d') center/cover;}" % v
+            ".top-logo::after{content:'';position:absolute;left:calc(100% + 10px);top:50%;"
+            "transform:translateY(-50%);width:40px;height:40px;border-radius:50%;"
+            "border:2px solid var(--line);box-shadow:0 4px 12px rgba(0,0,0,.25);"
+            "background:url('/portal/avatar?v=" + str(v) + "') center/cover;}"
         )
-    return "".join(parts)
+
+    return "".join(imports) + "".join(parts)
 
 @app.get("/portal/avatar")
 def portal_avatar():
@@ -7543,9 +7644,88 @@ def portal_avatar():
     resp.headers["Cache-Control"] = "private, max-age=86400"
     return resp
 
+# Script de vista previa en vivo. Replica _user_prefs_css en el navegador:
+# al tocar una opción, arma el mismo CSS y lo mete en un <style> al vuelo.
+_APARIENCIA_PREVIEW_JS = """
+<script>
+(function(){
+  var THEMES = __THEMES__;
+  var FONTS = __FONTS__;
+  var SIZES = __SIZES__;
+  var LIGHT_EXTRA = __LIGHT__;
+  var COMPACT = __COMPACT__;
+  var NOMOTION = __NOMOTION__;
+
+  var styleEl = document.createElement('style');
+  styleEl.id = 'preview-style';
+  document.head.appendChild(styleEl);
+  var fontsLoaded = {};
+
+  function ensureFont(gf){
+    if (!gf || fontsLoaded[gf]) return;
+    fontsLoaded[gf] = 1;
+    var l = document.createElement('link');
+    l.rel = 'stylesheet';
+    l.href = 'https://fonts.googleapis.com/css2?family=' + gf + '&display=swap';
+    document.head.appendChild(l);
+  }
+  function val(name){
+    var e = document.querySelector('input[name="' + name + '"]:checked');
+    return e ? e.value : '';
+  }
+  function build(){
+    var css = '';
+    var t = THEMES[val('theme')] || {};
+    if (t.bg) {
+      css += ':root{--bg:' + t.bg + ';--card:' + t.card + ';--card-hover:' + t.hover + ';--primary-dark:' + t.pd + ';';
+      if (t.text) css += '--text:' + t.text + ';--text-muted:' + t.muted + ';--line:' + t.line + ';';
+      css += '}';
+      if (t.mode === 'light') css += LIGHT_EXTRA;
+    }
+    var f = FONTS[val('font')] || {};
+    if (f.stack) {
+      ensureFont(f.gf);
+      css += 'body,input,select,textarea,button,.btn{font-family:' + f.stack + ' !important;}';
+    }
+    var z = SIZES[val('font_size')];
+    if (z) css += 'body{zoom:' + z + ';}';
+    if (val('density') === 'compacta') css += COMPACT;
+    if (val('motion') === 'no') css += NOMOTION;
+    styleEl.textContent = css;
+  }
+  var radios = document.querySelectorAll('.opciones input[type=radio]');
+  for (var i = 0; i < radios.length; i++) radios[i].addEventListener('change', build);
+
+  // Vista previa de la foto elegida (antes de subirla)
+  var file = document.getElementById('avatar-file');
+  var clear = document.getElementById('clear-avatar');
+  if (file) {
+    file.addEventListener('change', function(){
+      var f = this.files && this.files[0];
+      if (!f) return;
+      if (clear) clear.checked = false;
+      var rd = new FileReader();
+      rd.onload = function(){
+        var prev = document.getElementById('avatar-prev');
+        if (!prev) {
+          prev = document.createElement('img');
+          prev.id = 'avatar-prev';
+          prev.className = 'avatar-prev';
+          file.parentNode.insertBefore(prev, file);
+        }
+        prev.src = rd.result;
+      };
+      rd.readAsDataURL(f);
+    });
+  }
+  build();
+})();
+</script>
+"""
+
 @app.route("/portal/apariencia", methods=["GET", "POST"])
 def portal_apariencia():
-    """Preferencias de apariencia del usuario: fondo, tipografía, letra y foto."""
+    """Preferencias de apariencia del usuario, con vista previa en vivo."""
     auth = require_portal_login()
     if auth:
         return auth
@@ -7553,14 +7733,20 @@ def portal_apariencia():
 
     if request.method == "POST":
         theme = (request.form.get("theme") or "").strip()
-        if theme not in {t[0] for t in PORTAL_THEMES}:
+        if theme not in {t["key"] for t in PORTAL_THEMES}:
             theme = ""
         font = (request.form.get("font") or "").strip()
-        if font not in {f[0] for f in PORTAL_FONTS}:
+        if font not in {f["key"] for f in PORTAL_FONTS}:
             font = ""
         font_size = (request.form.get("font_size") or "").strip()
-        if font_size not in {s[0] for s in PORTAL_FONT_SIZES}:
+        if font_size not in {s["key"] for s in PORTAL_FONT_SIZES}:
             font_size = ""
+        density = (request.form.get("density") or "").strip()
+        if density not in {d["key"] for d in PORTAL_DENSITIES}:
+            density = ""
+        motion = (request.form.get("motion") or "").strip()
+        if motion not in {m["key"] for m in PORTAL_MOTION}:
+            motion = ""
 
         clear_avatar = request.form.get("clear_avatar") == "1"
         avatar_bytes = None
@@ -7578,8 +7764,9 @@ def portal_apariencia():
             avatar_bytes, avatar_mime = data, mime
 
         try:
-            save_user_prefs(uid, theme, font, font_size, avatar=avatar_bytes,
-                            avatar_mime=avatar_mime, clear_avatar=clear_avatar)
+            save_user_prefs(uid, theme, font, font_size, density, motion,
+                            avatar=avatar_bytes, avatar_mime=avatar_mime,
+                            clear_avatar=clear_avatar)
         except Exception as e:
             log.exception("prefs: error guardando user %s: %s", uid, e)
             return redirect("/portal/apariencia?msg=err_db")
@@ -7591,13 +7778,23 @@ def portal_apariencia():
     cur_theme = p.get("theme") or "nocturno"
     cur_font = p.get("font") or "sistema"
     cur_size = p.get("font_size") or "normal"
+    cur_density = p.get("density") or "comoda"
+    cur_motion = p.get("motion") or "si"
 
     MSGS = {
-        "ok": ("alert-success", "✅ Guardado. Ya estás viendo tu portal con la nueva apariencia."),
+        "ok": ("alert-success", "✅ Guardado. Tu portal ya quedó así en todas las páginas."),
         "err_tipo": ("alert-error", "❌ Formato de foto no soportado: subí PNG, JPG o WebP."),
         "err_peso": ("alert-error", "❌ La foto es muy pesada: máximo 300 KB."),
         "err_db": ("alert-error", "❌ No se pudo guardar. Probá de nuevo en un rato."),
     }
+
+    # Cargamos TODAS las fuentes opcionales solo en esta página, para que los
+    # chips y la vista previa se rendericen al instante.
+    gf_families = "&family=".join(f["gf"] for f in PORTAL_FONTS if f["gf"])
+    fonts_preview_link = (
+        f"<link rel='stylesheet' href='https://fonts.googleapis.com/css2?family={gf_families}&display=swap'>"
+        if gf_families else ""
+    )
 
     html = []
     html.append("""<!doctype html>
@@ -7610,36 +7807,38 @@ def portal_apariencia():
   <meta name="theme-color" content="#2E3B8E">
   <link rel="apple-touch-icon" href="/static/icon-192.png">
   <link rel="stylesheet" href="/static/portal-theme.css">
+""" + fonts_preview_link + """
   <style>
     .opciones{display:flex; flex-wrap:wrap; gap:10px; margin:10px 0 4px 0}
     .chip{
       display:inline-flex; align-items:center; gap:10px;
       border:1px solid var(--line); border-radius:999px; padding:10px 16px;
-      cursor:pointer; font-size:14px; color:var(--text);
+      cursor:pointer; font-size:14px; color:var(--text); user-select:none;
     }
     .chip:hover{border-color:var(--accent)}
-    .chip input{accent-color:var(--accent)}
+    .chip:has(input:checked){border-color:var(--accent); background:rgba(244,196,48,.08)}
+    .chip input{width:auto; accent-color:var(--accent)}
     .chip .muestra{
       width:34px; height:22px; border-radius:6px; display:inline-block;
-      border:1px solid rgba(255,255,255,.25); position:relative; overflow:hidden;
+      border:1px solid rgba(255,255,255,.25); position:relative; overflow:hidden; flex:none;
     }
     .chip .muestra i{
       position:absolute; left:5px; top:5px; right:5px; bottom:5px;
       border-radius:4px; display:block;
     }
-    .seccion{margin-top:22px}
+    .seccion{margin-top:24px}
     .seccion h3{margin:0 0 4px 0}
     .ayuda{font-size:13px; color:var(--text-muted); margin:2px 0 6px 0}
     .avatar-prev{
       width:64px; height:64px; border-radius:50%; object-fit:cover;
-      border:2px solid var(--line); vertical-align:middle;
+      border:2px solid var(--line); vertical-align:middle; margin-right:10px;
     }
-    .alert-success{background:rgba(52,211,153,.1); border:1px solid rgba(52,211,153,.3); padding:12px; border-radius:8px; margin:12px 0}
-    .alert-error{background:rgba(251,113,133,.1); border:1px solid rgba(251,113,133,.3); padding:12px; border-radius:8px; margin:12px 0}
-    input[type=file]{
-      background:rgba(0,0,0,.25); border:1px solid var(--line); color:var(--text);
-      padding:9px; border-radius:8px; margin:6px 0; max-width:100%;
+    input[type=file]{width:auto; max-width:100%}
+    .muestrario{
+      border:1px dashed var(--line); border-radius:var(--radius);
+      padding:18px; margin-top:10px;
     }
+    .muestrario .fila{display:flex; gap:14px; align-items:center; flex-wrap:wrap; margin-top:12px}
   </style>
 </head>
 <body>
@@ -7653,7 +7852,7 @@ def portal_apariencia():
       <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:16px">
         <div>
           <h1>🎨 Apariencia</h1>
-          <div class="subtitle">Personalizá cómo ves tu portal. Solo lo ves vos.</div>
+          <div class="subtitle">Personalizá cómo ves tu portal. Solo lo ves vos, y los cambios se previsualizan al instante.</div>
         </div>
         <div><a href="/portal" class="btn">← Volver al inicio</a></div>
       </div>
@@ -7662,60 +7861,108 @@ def portal_apariencia():
 
     if msg in MSGS:
         css, texto = MSGS[msg]
-        html.append(f"<div class='{css}'>{texto}</div>")
+        html.append(f"<div class='alert {css}'>{texto}</div>")
 
     html.append("<form method='post' enctype='multipart/form-data' class='card'>")
 
     # --- Fondo ---
     html.append("<div class='seccion'><h3>🌌 Fondo</h3>")
-    html.append("<div class='ayuda'>Elegí el tono de fondo del portal.</div>")
+    html.append("<div class='ayuda'>Elegí tu paleta. Tocá una y mirá cómo cambia toda la página.</div>")
     html.append("<div class='opciones'>")
-    for key, label, bg, card, _hover in PORTAL_THEMES:
-        ck = " checked" if cur_theme == key else ""
-        bg_show = bg or "#0f1629"
-        card_show = card or "#1a2332"
+    for t in PORTAL_THEMES:
+        ck = " checked" if cur_theme == t["key"] else ""
+        bg_show = t["bg"] or "#0f1629"
+        card_show = t["card"] or "#1a2342"
         html.append(
-            f"<label class='chip'><input type='radio' name='theme' value='{key}'{ck}>"
+            f"<label class='chip'><input type='radio' name='theme' value='{t['key']}'{ck}>"
             f"<span class='muestra' style='background:{bg_show}'><i style='background:{card_show}'></i></span>"
-            f"{esc(label)}</label>"
+            f"{esc(t['label'])}</label>"
         )
     html.append("</div></div>")
 
     # --- Tipografía ---
     html.append("<div class='seccion'><h3>🔤 Tipografía</h3>")
-    html.append("<div class='ayuda'>La letra de todo el portal.</div>")
+    html.append("<div class='ayuda'>Cada opción está escrita en su propia letra.</div>")
     html.append("<div class='opciones'>")
-    for key, label, stack in PORTAL_FONTS:
-        ck = " checked" if cur_font == key else ""
-        style = f" style='font-family:{esc(stack)}'" if stack else ""
+    for f in PORTAL_FONTS:
+        ck = " checked" if cur_font == f["key"] else ""
+        style = f" style=\"font-family:{esc(f['stack'])}\"" if f["stack"] else ""
         html.append(
-            f"<label class='chip'{style}><input type='radio' name='font' value='{key}'{ck}>{esc(label)}</label>"
+            f"<label class='chip'{style}><input type='radio' name='font' value='{f['key']}'{ck}>{esc(f['label'])}</label>"
         )
     html.append("</div></div>")
 
     # --- Tamaño ---
     html.append("<div class='seccion'><h3>🔍 Tamaño de letra</h3>")
     html.append("<div class='opciones'>")
-    for key, label, _z in PORTAL_FONT_SIZES:
-        ck = " checked" if cur_size == key else ""
-        html.append(f"<label class='chip'><input type='radio' name='font_size' value='{key}'{ck}>{esc(label)}</label>")
+    for s in PORTAL_FONT_SIZES:
+        ck = " checked" if cur_size == s["key"] else ""
+        html.append(f"<label class='chip'><input type='radio' name='font_size' value='{s['key']}'{ck}>{esc(s['label'])}</label>")
+    html.append("</div></div>")
+
+    # --- Densidad ---
+    html.append("<div class='seccion'><h3>📐 Densidad</h3>")
+    html.append("<div class='ayuda'>Compacta = más información en pantalla (ideal para las tablas de recibos).</div>")
+    html.append("<div class='opciones'>")
+    for d in PORTAL_DENSITIES:
+        ck = " checked" if cur_density == d["key"] else ""
+        html.append(f"<label class='chip'><input type='radio' name='density' value='{d['key']}'{ck}>{esc(d['label'])}</label>")
+    html.append("</div></div>")
+
+    # --- Animaciones ---
+    html.append("<div class='seccion'><h3>✨ Animaciones</h3>")
+    html.append("<div class='opciones'>")
+    for m in PORTAL_MOTION:
+        ck = " checked" if cur_motion == m["key"] else ""
+        html.append(f"<label class='chip'><input type='radio' name='motion' value='{m['key']}'{ck}>{esc(m['label'])}</label>")
     html.append("</div></div>")
 
     # --- Foto ---
     html.append("<div class='seccion'><h3>📷 Tu foto</h3>")
-    html.append("<div class='ayuda'>Aparece en la barra de arriba, en todas las páginas.</div>")
+    html.append("<div class='ayuda'>Aparece al lado del logo, arriba de todas las páginas.</div>")
     if p.get("has_avatar"):
         v = int(p.get("updated_at") or 0)
-        html.append(f"<img class='avatar-prev' src='/portal/avatar?v={v}' alt='Tu foto'> ")
-        html.append("<label style='display:inline-flex;align-items:center;gap:6px;margin-left:10px;cursor:pointer'>"
-                    "<input type='checkbox' name='clear_avatar' value='1'> Quitar foto</label><br>")
-    html.append("<input type='file' name='avatar' accept='.png,.jpg,.jpeg,.webp'>")
+        html.append(f"<img class='avatar-prev' id='avatar-prev' src='/portal/avatar?v={v}' alt='Tu foto'>")
+        html.append("<label style='display:inline-flex;align-items:center;gap:6px;cursor:pointer;text-transform:none'>"
+                    "<input type='checkbox' name='clear_avatar' value='1' id='clear-avatar' style='width:auto'> Quitar foto</label><br>")
+    html.append("<input type='file' name='avatar' id='avatar-file' accept='.png,.jpg,.jpeg,.webp'>")
     html.append("<div class='ayuda'>PNG, JPG o WebP · máximo 300 KB · ideal cuadrada.</div>")
     html.append("</div>")
 
-    html.append("<button class='btn' type='submit' style='margin-top:18px'>💾 Guardar</button>")
+    # --- Muestrario para la vista previa ---
+    html.append("""
+    <div class='seccion'><h3>👀 Así se ve</h3>
+    <div class='muestrario'>
+      <h3 style='margin:0'>Recibos de sueldo</h3>
+      <div class='subtitle'>Un ejemplo de cómo queda tu portal con lo que elegiste.</div>
+      <div class='fila'>
+        <button type='button' class='btn primary'>Descargar recibo</button>
+        <button type='button' class='btn'>Ver historial</button>
+        <span class='badge badge-success'>✓ Firmado</span>
+      </div>
+      <div class='stat' style='max-width:220px; margin-top:14px'>
+        <div class='stat-value'>98%</div>
+        <div class='stat-label'>Tasa de firma</div>
+      </div>
+    </div>
+    </div>
+""")
+
+    html.append("<button class='btn primary' type='submit' style='margin-top:22px'>💾 Guardar</button>")
+    html.append("<span class='ayuda' style='margin-left:12px'>La vista previa no se guarda hasta que toques Guardar.</span>")
     html.append("</form>")
-    html.append("</div></body></html>")
+    html.append("</div>")
+
+    # Vista previa en vivo: mismo CSS que inyecta el servidor, armado en el navegador.
+    script = (_APARIENCIA_PREVIEW_JS
+              .replace("__THEMES__", json.dumps({t["key"]: t for t in PORTAL_THEMES}))
+              .replace("__FONTS__", json.dumps({f["key"]: {"stack": f["stack"], "gf": f["gf"]} for f in PORTAL_FONTS}))
+              .replace("__SIZES__", json.dumps({s["key"]: s["zoom"] for s in PORTAL_FONT_SIZES}))
+              .replace("__LIGHT__", json.dumps(PORTAL_LIGHT_EXTRA_CSS))
+              .replace("__COMPACT__", json.dumps(PORTAL_COMPACT_CSS))
+              .replace("__NOMOTION__", json.dumps(PORTAL_NOMOTION_CSS)))
+    html.append(script)
+    html.append("</body></html>")
     return Response("".join(html), mimetype="text/html")
 
 
