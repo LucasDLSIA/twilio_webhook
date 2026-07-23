@@ -12475,58 +12475,59 @@ def _community_find_in_padron(token: str, from_whatsapp: str) -> str:
 
 
 def _community_worker(from_whatsapp: str, token: str, period_hint: str):
-    """Corre en background: identifica por padr\u00f3n y entrega. Todo por API REST."""
+    """Corre en background: identifica por padrón y entrega. Todo por API REST."""
+    base_url = os.environ.get("PUBLIC_BASE_URL", "https://portalsia.com.ar")
     try:
-        cuil = _community_find_in_padron(token, from_whatsapp)
-        if not cuil:
-            _community_send_text(from_whatsapp, _COMMUNITY_REJECT_MSG)
-            log.info("COMMUNITY: %s no est\u00e1 en padr\u00f3n de %s -> rechazo", from_whatsapp, token)
-            return
+        with app.test_request_context(base_url=base_url):
+            cuil = _community_find_in_padron(token, from_whatsapp)
+            if not cuil:
+                _community_send_text(from_whatsapp, _COMMUNITY_REJECT_MSG)
+                log.info("COMMUNITY: %s no está en padrón de %s -> rechazo", from_whatsapp, token)
+                return
 
-        try:
-            available = list_periods_for_cuil2(token, cuil) or []
-        except Exception:
-            log.exception("community: error listando per\u00edodos")
-            available = []
-        if not available:
-            _community_send_text(from_whatsapp,
-                "\U0001F4ED Todav\u00eda no hay recibos disponibles para vos en el sistema. "
-                "Apenas se cargue el pr\u00f3ximo per\u00edodo te lo vamos a poder entregar. "
-                "Ante dudas, consult\u00e1 en administraci\u00f3n.")
-            return
-
-        def _key(p):
             try:
-                mm, yy = p.split("/")
-                return (int(yy), int(mm))
+                available = list_periods_for_cuil2(token, cuil) or []
             except Exception:
-                return (0, 0)
-        latest = sorted(available, key=_key, reverse=True)[0]
-
-        if period_hint and period_hint in available:
-            period = period_hint
-        else:
-            period = latest
-            if period_hint:
+                log.exception("community: error listando períodos")
+                available = []
+            if not available:
                 _community_send_text(from_whatsapp,
-                    f"\u2139\uFE0F El recibo de {period_hint} todav\u00eda no est\u00e1 disponible. "
-                    f"Te env\u00edo el \u00faltimo cargado ({period}).")
+                    "📭 Todavía no hay recibos disponibles para vos en el sistema. "
+                    "Apenas se cargue el próximo período te lo vamos a poder entregar. "
+                    "Ante dudas, consultá en administración.")
+                return
 
-        if not has_accepted_terms(from_whatsapp):
-            send_terms_and_conditions(from_whatsapp, token, cuil, period)
-            log.info("COMMUNITY: T&C enviados a %s (%s %s)", from_whatsapp, token, period)
-            return
+            def _key(p):
+                try:
+                    mm, yy = p.split("/")
+                    return (int(yy), int(mm))
+                except Exception:
+                    return (0, 0)
+            latest = sorted(available, key=_key, reverse=True)[0]
 
-        sid = _send_pdf_flow(from_whatsapp, token, cuil, period, origin="COMMUNITY")
-        if not sid:
-            _community_send_text(from_whatsapp,
-                "\u274C Hubo un error enviando el recibo. Prob\u00e1 de nuevo en unos "
-                "minutos o consult\u00e1 en administraci\u00f3n.")
-        else:
-            log.info("COMMUNITY: PDF %s enviado a %s (%s %s)", sid, from_whatsapp, token, period)
+            if period_hint and period_hint in available:
+                period = period_hint
+            else:
+                period = latest
+                if period_hint:
+                    _community_send_text(from_whatsapp,
+                        f"ℹ️ El recibo de {period_hint} todavía no está disponible. "
+                        f"Te envío el último cargado ({period}).")
+
+            if not has_accepted_terms(from_whatsapp):
+                send_terms_and_conditions(from_whatsapp, token, cuil, period)
+                log.info("COMMUNITY: T&C enviados a %s (%s %s)", from_whatsapp, token, period)
+                return
+
+            sid = _send_pdf_flow(from_whatsapp, token, cuil, period, origin="COMMUNITY")
+            if not sid:
+                _community_send_text(from_whatsapp,
+                    "❌ Hubo un error enviando el recibo. Probá de nuevo en unos "
+                    "minutos o consultá en administración.")
+            else:
+                log.info("COMMUNITY: PDF %s enviado a %s (%s %s)", sid, from_whatsapp, token, period)
     except Exception:
         log.exception("community worker: error inesperado")
-
 
 def handle_community_request(from_whatsapp: str, body: str):
     """
