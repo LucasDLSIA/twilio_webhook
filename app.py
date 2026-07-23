@@ -1,32 +1,25 @@
 import os
 import io
-import hmac
-import hashlib
-import logging
+from pydoc import html
 import re
 import time
-
+import sqlite3
 import json
 import threading
 from datetime import datetime
 import datetime as _dt
 
+import token
 from typing import Optional, Dict, List
-from urllib.parse import urlencode, quote
-from functools import wraps
 
 import pandas as pd
-from flask import Flask, request, redirect, Response, jsonify, session, g, has_app_context
-from werkzeug.middleware.proxy_fix import ProxyFix
+from flask import Flask, request, redirect, Response, jsonify, session
 
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload
-from googleapiclient.http import MediaIoBaseUpload
- 
 
 from twilio.rest import Client
-from twilio.request_validator import RequestValidator
 
 
 # =========================
@@ -34,15 +27,6 @@ from twilio.request_validator import RequestValidator
 # =========================
 ADMIN_TOKEN = os.environ.get("ADMIN_TOKEN", "").strip()
 EMPRESAS_FILE_ID = os.environ.get("EMPRESAS_FILE_ID", "").strip()
-
-# --- Seguridad (ver CAMBIOS.md) ---
-SECRET_KEY = os.environ.get("SECRET_KEY", "").strip()
-# Secreto para firmar las URLs de /media/pdf y /media/terms. Si no se define, usa SECRET_KEY.
-MEDIA_SECRET = os.environ.get("MEDIA_SECRET", "").strip() or SECRET_KEY
-# Vigencia (segundos) de los links de media firmados. Default: 24 hs.
-MEDIA_TOKEN_TTL = int(os.environ.get("MEDIA_TOKEN_TTL", "86400"))
-# Validación de firma de webhooks de Twilio (X-Twilio-Signature). Poner "0" solo para debug local.
-TWILIO_VALIDATE_WEBHOOKS = os.environ.get("TWILIO_VALIDATE_WEBHOOKS", "1").strip() != "0"
 
 # Google Service Account
 GOOGLE_SA_JSON = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON", "").strip()
@@ -62,16 +46,13 @@ TWILIO_MESSAGING_SERVICE_SID = os.environ.get("TWILIO_MESSAGING_SERVICE_SID", ""
 TWILIO_TEMPLATE_SID = os.environ.get("TWILIO_TEMPLATE_SID", "").strip()            # template con botón VIEW_NOW
 TWILIO_SIGN_TEMPLATE_SID = os.environ.get("TWILIO_SIGN_TEMPLATE_SID", "").strip()  # (opcional) template con botones SIGN_OK / SIGN_OBS
 
-# Casilla que recibe el aviso de facturación cuando termina un envío INITIAL.
-BILLING_NOTIFY_EMAIL = os.environ.get("BILLING_NOTIFY_EMAIL", "").strip()
+
 
 # Cache
 _EMP_CACHE = {"ts": 0.0, "rows": []}
 _ENV_CACHE: Dict[str, Dict] = {}  # tenant_slug -> {"ts":..., "rows":[...] }
 CACHE_TTL = int(os.environ.get("CACHE_TTL", "120"))
 
-
-PUBLIC_BASE_URL = os.environ.get("PUBLIC_BASE_URL", "").strip()  # ej: https://miapp.com
 # =========================
 
 
@@ -79,56 +60,7 @@ PUBLIC_BASE_URL = os.environ.get("PUBLIC_BASE_URL", "").strip()  # ej: https://m
 # Flask
 # =========================
 app = Flask(__name__)
-
-if not SECRET_KEY:
-    # Fail-fast: sin SECRET_KEY las sesiones del portal quedan rotas/inseguras en silencio.
-    raise RuntimeError("Falta SECRET_KEY en ENV: configurala antes de iniciar la app.")
-app.secret_key = SECRET_KEY
-
-# La app corre detrás de un proxy (Render/Heroku/etc.): respetar X-Forwarded-Proto/Host
-# para que request.url y request.host_url reflejen la URL pública real (https).
-app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1, x_port=1)
-
-# --- Logging ---
-# Nivel configurable con LOG_LEVEL (DEBUG/INFO/WARNING/ERROR). Default: INFO.
-# Los errores dentro de except ahora loguean el traceback completo (log.exception).
-_log_level = os.environ.get("LOG_LEVEL", "INFO").strip().upper()
-logging.basicConfig(
-    level=getattr(logging, _log_level, logging.INFO),
-    format="%(asctime)s %(levelname)s %(message)s",
-)
-log = logging.getLogger("app")
-# La librería de Twilio loguea cada request/response a su API a nivel INFO
-# (bloques "-- BEGIN Twilio API Request --"): puro ruido, lo subimos a WARNING.
-logging.getLogger("twilio").setLevel(logging.WARNING)
-
-# --- Cookies de sesión (admin y portal) ---
-# SameSite=Lax bloquea CSRF en los POST autenticados por sesión: el navegador
-# no manda la cookie en POSTs originados en otros sitios.
-# COOKIE_SECURE=0 solo para desarrollo local sin HTTPS.
-app.config.update(
-    SESSION_COOKIE_HTTPONLY=True,
-    SESSION_COOKIE_SAMESITE="Lax",
-    SESSION_COOKIE_SECURE=os.environ.get("COOKIE_SECURE", "1").strip() != "0",
-)
-
-# --- Sentry: alertas de errores por mail (opcional) ---
-# Se activa solo si SENTRY_DSN está definida en el entorno. Sin la variable,
-# este bloque no hace nada y la app funciona exactamente igual que siempre.
-# Solo errores (sin tracing de performance: cuida la cuota gratis) y sin PII
-# por defecto; Sentry además enmascara campos tipo token/password al recibir.
-# Los log.error / log.exception del código llegan como eventos con traceback;
-# los log.info quedan como "migas" de contexto del evento.
-SENTRY_DSN = (os.environ.get("SENTRY_DSN") or "").strip()
-if SENTRY_DSN:
-    import sentry_sdk
-    sentry_sdk.init(
-        dsn=SENTRY_DSN,
-        send_default_pii=False,
-        traces_sample_rate=0.0,
-        environment=os.environ.get("SENTRY_ENVIRONMENT", "production"),
-    )
-    log.info("Sentry activo (alertas de errores encendidas)")
+app.secret_key = os.environ.get("SECRET_KEY")
 
 
 
@@ -204,109 +136,21 @@ def period_to_folder_name(period: str) -> str:
 # =========================
 # Auth admin (token por query/header)
 # =========================
-def make_media_token(kind: str, tenant: str = "", cuil: str = "", period: str = "", ttl: int | None = None) -> str:
-    """Token firmado (HMAC) con vencimiento para los endpoints /media/*.
-    Reemplaza el uso de ADMIN_TOKEN en URLs que viajan a Twilio."""
-    exp = int(time.time()) + int(ttl if ttl is not None else MEDIA_TOKEN_TTL)
-    msg = f"{kind}|{tenant}|{cuil}|{period}|{exp}".encode("utf-8")
-    sig = hmac.new(MEDIA_SECRET.encode("utf-8"), msg, hashlib.sha256).hexdigest()
-    return f"{exp}.{sig}"
-
-def check_media_token(token: str, kind: str, tenant: str = "", cuil: str = "", period: str = "") -> bool:
-    """Valida un token generado por make_media_token (firma + vencimiento + alcance)."""
-    try:
-        exp_s, sig = (token or "").split(".", 1)
-        exp = int(exp_s)
-    except (ValueError, AttributeError):
-        return False
-    if exp < int(time.time()):
-        return False
-    msg = f"{kind}|{tenant}|{cuil}|{period}|{exp}".encode("utf-8")
-    expected = hmac.new(MEDIA_SECRET.encode("utf-8"), msg, hashlib.sha256).hexdigest()
-    return hmac.compare_digest(sig, expected)
-
-# =========================
-# Autenticación del admin (sesión + token para automatizaciones)
-# =========================
-# Vigencia de la sesión del admin (segundos). Default: 8 horas.
-ADMIN_SESSION_TTL = int(os.environ.get("ADMIN_SESSION_TTL", str(8 * 3600)))
-
-def admin_session_active() -> bool:
-    """True si hay una sesión de admin válida y no vencida."""
-    if not session.get("admin_authed"):
-        return False
-    since = session.get("admin_authed_at", 0)
-    try:
-        since = int(since)
-    except (TypeError, ValueError):
-        return False
-    return (int(time.time()) - since) < ADMIN_SESSION_TTL
-
-def _admin_token_match(tok: str) -> bool:
-    if not ADMIN_TOKEN:
-        return False
-    tok = (tok or "").strip()
-    return bool(tok) and hmac.compare_digest(tok, ADMIN_TOKEN)
-
-def admin_token_valid() -> bool:
-    """Token por CUALQUIER vía (query, form o header).
-    Reservado a los endpoints de automatización que lo necesitan por URL:
-    queue_tick (cron y self-call de fondo), reset_reenvios,
-    send_template_preview y media_certificado. El resto del panel NO
-    acepta token por URL: humanos por login, máquinas por header."""
-    return _admin_token_match(request.args.get("token") or request.form.get("token")
-                              or request.headers.get("X-Admin-Token", ""))
-
-def admin_token_valid_header() -> bool:
-    """Token solo por header X-Admin-Token (no queda en access logs ni historial)."""
-    return _admin_token_match(request.headers.get("X-Admin-Token", ""))
-
-def admin_authenticated() -> bool:
-    """Humanos: sesión (login). Máquinas: header X-Admin-Token.
-    El token por URL ya NO abre el panel (ver allowlist en admin_token_valid)."""
-    return admin_session_active() or admin_token_valid_header()
-
 def admin_ok() -> bool:
-    # Mantengo el nombre por compatibilidad: ahora acepta sesión o token.
-    # (Antes devolvía True si ADMIN_TOKEN estaba vacío, dejando el admin abierto.)
-    return admin_authenticated()
-
-def _admin_next_path() -> str:
-    """Destino post-login: path actual con su query pero SIN el token,
-    para que un ?token= viejo no siga paseando por la URL del login."""
-    qs = [(k, v) for k, v in request.args.items(multi=True) if k != "token"]
-    return request.path + ("?" + urlencode(qs) if qs else "")
+    if not ADMIN_TOKEN:
+        return True
+    tok = request.args.get("token", "") or request.headers.get("X-Admin-Token", "")
+    return tok.strip() == ADMIN_TOKEN
 
 def require_admin():
-    if admin_authenticated():
-        return None
-    # Si parece un navegador (acepta HTML) y no es POST, lo mandamos al login
-    # preservando el destino. Para clientes no-navegador / POST, 401 directo.
-    accepts_html = "text/html" in (request.headers.get("Accept") or "")
-    if request.method == "GET" and accepts_html:
-        return redirect("/admin/login?next=" + quote(_admin_next_path(), safe=""))
-    return Response("Unauthorized (admin login requerido)", status=401)
-
-def _get_admin_token_from_request() -> str:
-    return (request.args.get("token") or request.form.get("token") or "").strip()
-
-def admin_required(fn):
-    @wraps(fn)
-    def wrapper(*args, **kwargs):
-        # Acepta sesión de admin (humano logueado) o ADMIN_TOKEN (cron/background/self-call).
-        if admin_authenticated():
-            return fn(*args, **kwargs)
-        accepts_html = "text/html" in (request.headers.get("Accept") or "")
-        if request.method == "GET" and accepts_html:
-            return redirect("/admin/login?next=" + quote(_admin_next_path(), safe=""))
-        return Response("Unauthorized", status=401)
-    return wrapper
+    if not admin_ok():
+        return Response("Unauthorized (admin token requerido)", status=401)
 
 # =========================
 # Google Drive
 # =========================
 def drive_service():
-    scopes = ["https://www.googleapis.com/auth/drive"]
+    scopes = ["https://www.googleapis.com/auth/drive.readonly"]
     if GOOGLE_SA_JSON:
         info = json.loads(GOOGLE_SA_JSON) if isinstance(GOOGLE_SA_JSON, str) else GOOGLE_SA_JSON
         creds = service_account.Credentials.from_service_account_info(info, scopes=scopes)
@@ -519,11 +363,11 @@ def debug_list_pdfs_in_folder(folder_id: str):
     ).execute()
 
     files = res.get("files", [])
-    log.info("%s %s", "📂 DEBUG PDFs en carpeta", folder_id)
+    print("📂 DEBUG PDFs en carpeta", folder_id)
     if not files:
-        log.info("   (no hay PDFs)")
+        print("   (no hay PDFs)")
     for f in files:
-        log.info("%s %s %s %s", "   -", f["name"], "| id:", f["id"])
+        print("   -", f["name"], "| id:", f["id"])
 
 
 # Drive: PDF
@@ -538,17 +382,17 @@ def format_cuil_with_dashes(cuil: str) -> str:
 def find_pdf_file_id_for_cuil_period(tenant: str, cuil: str, period: str, *, quiet: bool = False) -> str | None:
     t = get_tenant(tenant)
     if not t:
-        if not quiet: log.error("%s %s", "❌ tenant inválido:", tenant)
+        if not quiet: print("❌ tenant inválido:", tenant)
         return None
 
     root_id = (t.get("recibos_root_id") or t.get("drive_root_id") or "").strip()
     if not root_id:
-        if not quiet: log.error("%s %s", "❌ tenant sin recibos_root_id:", tenant)
+        if not quiet: print("❌ tenant sin recibos_root_id:", tenant)
         return None
 
     cuil_digits = norm_digits(strip_pdf(cuil).strip())
     if len(cuil_digits) != 11:
-        if not quiet: log.error("%s %s", "❌ CUIL inválido:", cuil)
+        if not quiet: print("❌ CUIL inválido:", cuil)
         return None
 
     cuil_dash = format_cuil_with_dashes(cuil_digits)
@@ -566,7 +410,7 @@ def find_pdf_file_id_for_cuil_period(tenant: str, cuil: str, period: str, *, qui
     folders = res.get("files", [])
     if not folders:
         if not quiet:
-            log.error(f"❌ No encontré carpeta período '{period_folder_name}' en root {root_id}")
+            print(f"❌ No encontré carpeta período '{period_folder_name}' en root {root_id}")
         return None
 
     period_id = folders[0]["id"]
@@ -588,56 +432,8 @@ def find_pdf_file_id_for_cuil_period(tenant: str, cuil: str, period: str, *, qui
         return files2[0]["id"]
 
     if not quiet:
-        log.error(f"❌ No encontré {filename_exact} dentro de carpeta período {period_folder_name} ({period_id})")
+        print(f"❌ No encontré {filename_exact} dentro de carpeta período {period_folder_name} ({period_id})")
     return None
-
-
-def list_recibos_for_period(tenant: str, period_label: str) -> list[dict]:
-    """
-    Lista los recibos (PDFs) de un período leyendo la carpeta de Drive del tenant.
-    period_label esperado: "MM/YYYY". Devuelve [{cuil, nombre, file_id}] ordenado por nombre.
-    """
-    t = get_tenant(tenant)
-    if not t:
-        return []
-    root_id = (t.get("recibos_root_id") or t.get("drive_root_id") or "").strip()
-    if not root_id:
-        return []
-
-    folder_name = label_to_period_folder(period_label)  # "MM/YYYY" -> "MM-YYYY"
-    if not folder_name:
-        return []
-
-    service = drive_service()
-    period_id = _drive_find_child_folder_id(service, root_id, folder_name)
-    if not period_id:
-        return []
-
-    files = _drive_list_children(
-        service, parent_id=period_id, mime_type="application/pdf", page_size=1000
-    )
-
-    # Mapa CUIL(11 dígitos) -> nombre desde la planilla de envíos (una sola lectura, ya cacheada)
-    nombre_por_cuil = {}
-    for r in load_envios_rows(tenant):
-        archivo = strip_pdf(r.get("archivo") or r.get("Archivo") or "")
-        cd = norm_digits(archivo)
-        if len(cd) == 11:
-            nombre_por_cuil[cd] = str(r.get("nombre") or r.get("Nombre") or "").strip()
-
-    recibos = []
-    for f in files:
-        cuil_digits = norm_digits(strip_pdf((f.get("name") or "").strip()))
-        if len(cuil_digits) != 11:
-            continue
-        recibos.append({
-            "cuil": format_cuil_with_dashes(cuil_digits),
-            "nombre": nombre_por_cuil.get(cuil_digits, ""),
-            "file_id": f.get("id"),
-        })
-
-    recibos.sort(key=lambda x: (x["nombre"] or "zzz").lower())
-    return recibos
 
 from typing import List, Optional
 import re
@@ -742,12 +538,8 @@ def ensure_sqlite_columns(table: str, columns: dict[str, str]) -> None:
     conn = get_db_connection()
     cur = conn.cursor()
 
-    cur.execute("""
-        SELECT column_name AS name
-        FROM information_schema.columns
-        WHERE table_name = %s
-    """, (table,))
-    existing = {row['name'] for row in cur.fetchall()}  # row['name'] = name
+    cur.execute(f"PRAGMA table_info({table});")
+    existing = {row[1] for row in cur.fetchall()}  # row[1] = name
 
     for col, col_type in columns.items():
         if col not in existing:
@@ -766,16 +558,15 @@ def ensure_sqlite_columns(table: str, columns: dict[str, str]) -> None:
 @app.get("/media/pdf")
 def media_pdf():
     token = request.args.get("token", "").strip()
+    if ADMIN_TOKEN and token != ADMIN_TOKEN:
+        return Response("Unauthorized", status=401)
+
     tenant = (request.args.get("tenant") or "").strip().lower()
     cuil = (request.args.get("cuil") or "").strip()
     period = (request.args.get("period") or "").strip()
 
     if not (tenant and cuil and period):
         return Response("Faltan parámetros tenant/cuil/period", status=400)
-
-    # Token firmado y acotado a este tenant/cuil/period (ya no se usa ADMIN_TOKEN acá).
-    if not check_media_token(token, "pdf", tenant=tenant, cuil=cuil, period=period):
-        return Response("Unauthorized", status=401)
 
     file_id = find_pdf_file_id_for_cuil_period(tenant, cuil, period, quiet=True)
     if not file_id:
@@ -811,33 +602,12 @@ def media_pdf():
         return resp
         
     except Exception as e:
-        log.exception(f"❌ Error descargando PDF: {e}")
+        print(f"❌ Error descargando PDF: {e}")
         return Response("Error descargando PDF de Drive", status=500)
     
 
 # Twilio senders
 # =========================
-def _twilio_signature_ok() -> bool:
-    """Valida la firma X-Twilio-Signature de los webhooks entrantes.
-    Evita que terceros simulen mensajes/estados. Desactivable con TWILIO_VALIDATE_WEBHOOKS=0."""
-    if not TWILIO_VALIDATE_WEBHOOKS:
-        return True
-    if not TWILIO_AUTH_TOKEN:
-        log.warning("⚠️ TWILIO_AUTH_TOKEN no configurado: webhook rechazado (TWILIO_VALIDATE_WEBHOOKS=0 lo desactiva).")
-        return False
-    sig = request.headers.get("X-Twilio-Signature", "")
-    if not sig:
-        return False
-    validator = RequestValidator(TWILIO_AUTH_TOKEN)
-    params = request.form.to_dict()
-    if validator.validate(request.url, params, sig):
-        return True
-    # Fallback por si el proxy no reporta bien el esquema (http vs https).
-    if request.url.startswith("http://"):
-        return validator.validate("https://" + request.url[len("http://"):], params, sig)
-    return False
-
-
 def _twilio_client() -> Client:
     if not (TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN):
         raise RuntimeError("Faltan TWILIO_ACCOUNT_SID / TWILIO_AUTH_TOKEN en ENV")
@@ -889,7 +659,7 @@ def send_email(to_email: str, subject: str, html_body: str) -> bool:
     Returns True si se envió correctamente, False si hubo error.
     """
     if not SMTP_USER or not SMTP_PASSWORD:
-        log.error("ERROR: SMTP credentials not configured")
+        print("ERROR: SMTP credentials not configured")
         return False
     
     try:
@@ -907,11 +677,11 @@ def send_email(to_email: str, subject: str, html_body: str) -> bool:
         server.sendmail(SMTP_FROM, to_email, msg.as_string())
         server.quit()
         
-        log.info(f"Email sent to {to_email}")
+        print(f"Email sent to {to_email}")
         return True
         
     except Exception as e:
-        log.exception(f"Error sending email to {to_email}: {e}")
+        print(f"Error sending email to {to_email}: {e}")
         return False
 
 
@@ -990,74 +760,6 @@ def send_password_reset_email(email: str, username: str, reset_url: str) -> bool
     return send_email(email, subject, html_body)
 
 # ========================================
-
-def get_tenant_user_emails(tenant: str) -> list[str]:
-    """Emails de los usuarios activos del portal de una empresa."""
-    conn = get_db_connection()
-    cur = conn.cursor()
-    cur.execute("""
-        SELECT email FROM client_users
-        WHERE tenant = %s AND active = TRUE AND email IS NOT NULL AND email <> ''
-    """, (tenant,))
-    rows = cur.fetchall()
-    conn.close()
-    emails = []
-    for r in rows:
-        e = (dict(r).get('email') or '').strip()
-        if e:
-            emails.append(e)
-    return emails
-
-
-def send_certificado_notification(tenant: str, nombre: str, cuil: str, tipo: str = "medico"):
-    """Avisa por email a los usuarios del portal que llegó un certificado nuevo."""
-    try:
-        emails = get_tenant_user_emails(tenant)
-        if not emails:
-            return
-
-        t = get_tenant(tenant)
-        empresa = (t.get('display_name', tenant) if t else tenant) or tenant
-
-        if tipo == "familia":
-            tipo_label = "certificado de asignaciones familiares"
-            portal_path = "/portal/certificados-familia"
-        else:
-            tipo_label = "certificado médico"
-            portal_path = "/portal/certificados"
-
-        base_url = PUBLIC_BASE_URL
-        portal_url = base_url + portal_path
-        fecha = ts_str(int(time.time()))
-
-        subject = f"Nuevo {tipo_label} recibido - {empresa}"
-        html_body = f"""
-        <html>
-        <body style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto; padding: 20px;">
-            <h2 style="color: #5aa7ff;">Nuevo {tipo_label}</h2>
-            <p>Se recibió un nuevo {tipo_label} en el portal de <strong>{empresa}</strong>.</p>
-            <div style="background: #f5f5f5; padding: 15px; border-radius: 8px; margin: 20px 0;">
-                <p style="margin: 5px 0;"><strong>Empleado:</strong> {nombre or 'Sin nombre'}</p>
-                <p style="margin: 5px 0;"><strong>CUIL:</strong> {cuil or '-'}</p>
-                <p style="margin: 5px 0;"><strong>Fecha:</strong> {fecha}</p>
-            </div>
-            <p>
-                <a href="{portal_url}" style="display:inline-block; background:#2E3B8E; color:#fff; padding:10px 18px; border-radius:8px; text-decoration:none;">Ver en el portal</a>
-            </p>
-            <hr style="border: none; border-top: 1px solid #ddd; margin: 30px 0;">
-            <p style="color: #999; font-size: 12px;">Este es un email automático, por favor no respondas a este mensaje.</p>
-        </body>
-        </html>
-        """
-
-        for email in emails:
-            try:
-                send_email(email, subject, html_body)
-            except Exception as e:
-                log.warning(f"No se pudo notificar a {email}: {e}")
-    except Exception as e:
-        log.exception(f"Error en send_certificado_notification: {e}")
-
 # Gestión de usuarios del portal
 # ========================================
 
@@ -1078,24 +780,22 @@ def create_client_user(tenant: str, username: str, email: str, full_name: str, c
     """
     Crea un nuevo usuario del portal.
     Genera contraseña temporal y envía email.
-    El email es la credencial de acceso.
     Returns: {'ok': True/False, 'message': str, 'temp_password': str}
     """
     tenant = tenant.strip().lower()
+    username = username.strip().lower()
     email = email.strip().lower()
-    # El usuario de acceso es el email
-    username = (username.strip().lower() or email)
     
-    if not tenant or not email:
-        return {'ok': False, 'message': 'Faltan datos requeridos (empresa y email)'}
+    if not tenant or not username or not email:
+        return {'ok': False, 'message': 'Faltan datos requeridos'}
     
-    # Verificar que el email no esté ya registrado (es la credencial de acceso)
+    # Verificar que no exista
     conn = get_db_connection()
     cur = conn.cursor()
-    cur.execute("SELECT id FROM client_users WHERE LOWER(email) = %s", (email,))
+    cur.execute("SELECT id FROM client_users WHERE tenant = ? AND username = ?", (tenant, username))
     if cur.fetchone():
         conn.close()
-        return {'ok': False, 'message': 'Ya existe un usuario con ese email'}
+        return {'ok': False, 'message': 'El usuario ya existe para este tenant'}
     
     # Generar contraseña temporal
     temp_password = generate_temp_password()
@@ -1104,18 +804,17 @@ def create_client_user(tenant: str, username: str, email: str, full_name: str, c
     # Crear usuario
     now = int(time.time())
     cur.execute("""
-        INSERT INTO client_users
+        INSERT INTO client_users 
         (tenant, username, password_hash, email, full_name, role, active, must_change_password, created_at, created_by)
-        VALUES (%s, %s, %s, %s, %s, 'admin', TRUE, TRUE, %s, %s)
-        RETURNING id
+        VALUES (?, ?, ?, ?, ?, 'admin', 1, 1, ?, ?)
     """, (tenant, username, password_hash, email, full_name, now, created_by))
-
-    user_id = cur.fetchone()['id']
+    
+    user_id = cur.lastrowid
     conn.commit()
     conn.close()
     
     # Enviar email
-    portal_url = f"{PUBLIC_BASE_URL}/portal/login"
+    portal_url = "https://twilio-webhook-lddc.onrender.com/portal/login"
     email_sent = send_welcome_email(email, username, temp_password, portal_url)
     
     if not email_sent:
@@ -1131,11 +830,13 @@ def create_client_user(tenant: str, username: str, email: str, full_name: str, c
         'temp_password': temp_password
     }
 
+
 def get_all_client_users():
     """
     Obtiene todos los usuarios del portal.
     """
     conn = get_db_connection()
+    conn.row_factory = sqlite3.Row
     cur = conn.cursor()
     cur.execute("""
         SELECT id, tenant, username, email, full_name, role, active, 
@@ -1155,7 +856,7 @@ def toggle_client_user_active(user_id: int):
     """
     conn = get_db_connection()
     cur = conn.cursor()
-    cur.execute("UPDATE client_users SET active = NOT active WHERE id = %s", (user_id,))
+    cur.execute("UPDATE client_users SET active = 1 - active WHERE id = ?", (user_id,))
     conn.commit()
     conn.close()
 
@@ -1166,7 +867,7 @@ def delete_client_user(user_id: int):
     """
     conn = get_db_connection()
     cur = conn.cursor()
-    cur.execute("DELETE FROM client_users WHERE id = %s", (user_id,))
+    cur.execute("DELETE FROM client_users WHERE id = ?", (user_id,))
     conn.commit()
     conn.close()
 
@@ -1175,22 +876,23 @@ def delete_client_user(user_id: int):
 # Autenticación del portal
 # ========================================
 
-def authenticate_portal_user(login: str, password: str) -> dict:
+def authenticate_portal_user(username: str, password: str) -> dict:
     """
-    Autentica un usuario del portal por email (o username, retrocompat).
+    Autentica un usuario del portal.
     Returns: {'ok': True/False, 'user': dict, 'message': str}
     """
-    login = login.strip().lower()
+    username = username.strip().lower()
     
     conn = get_db_connection()
+    conn.row_factory = sqlite3.Row
     cur = conn.cursor()
     
     cur.execute("""
         SELECT id, tenant, username, password_hash, email, full_name, 
                role, active, must_change_password
         FROM client_users
-        WHERE LOWER(email) = %s OR username = %s
-    """, (login, login))
+        WHERE username = ?
+    """, (username,))
     
     user = cur.fetchone()
     conn.close()
@@ -1207,7 +909,7 @@ def authenticate_portal_user(login: str, password: str) -> dict:
     # Actualizar último login
     conn = get_db_connection()
     cur = conn.cursor()
-    cur.execute("UPDATE client_users SET last_login = %s WHERE id = %s", 
+    cur.execute("UPDATE client_users SET last_login = ? WHERE id = ?", 
                 (int(time.time()), user['id']))
     conn.commit()
     conn.close()
@@ -1218,16 +920,18 @@ def authenticate_portal_user(login: str, password: str) -> dict:
         'message': 'Login exitoso'
     }
 
+
 def get_portal_user_by_id(user_id: int):
     """
     Obtiene un usuario del portal por ID.
     """
     conn = get_db_connection()
+    conn.row_factory = sqlite3.Row
     cur = conn.cursor()
     cur.execute("""
         SELECT id, tenant, username, password_hash, email, full_name, role, active, must_change_password
         FROM client_users
-        WHERE id = %s
+        WHERE id = ?
     """, (user_id,))
     user = cur.fetchone()
     conn.close()
@@ -1244,8 +948,8 @@ def change_portal_password(user_id: int, new_password: str):
     cur = conn.cursor()
     cur.execute("""
         UPDATE client_users 
-        SET password_hash = %s, must_change_password = FALSE
-        WHERE id = %s
+        SET password_hash = ?, must_change_password = 0
+        WHERE id = ?
     """, (password_hash, user_id))
     conn.commit()
     conn.close()
@@ -1259,37 +963,11 @@ def log_portal_action(user_id: int, tenant: str, action: str, details: str = "",
     cur = conn.cursor()
     cur.execute("""
         INSERT INTO client_audit_log (user_id, tenant, action, details, ip_address, created_at)
-        VALUES (%s, %s, %s, %s, %s, %s)
+        VALUES (?, ?, ?, ?, ?, ?)
     """, (user_id, tenant, action, details, ip_address, int(time.time())))
     conn.commit()
     conn.close()
 
-
-def get_user_audit_log(user_id: int, limit: int = 100) -> list[dict]:
-    """Historial de actividad de un usuario del portal (más reciente primero)."""
-    conn = get_db_connection()
-    cur = conn.cursor()
-    cur.execute("""
-        SELECT action, details, ip_address, created_at
-        FROM client_audit_log
-        WHERE user_id = %s
-        ORDER BY created_at DESC
-        LIMIT %s
-    """, (user_id, limit))
-    rows = cur.fetchall()
-    conn.close()
-    return [dict(r) for r in rows]
-
-
-def _accion_label(action: str) -> str:
-    """Traduce el código de acción a un texto legible."""
-    return {
-        'login': '🔓 Inicio de sesión',
-        'logout': '🔒 Cierre de sesión',
-        'change_password': '🔑 Cambio de contraseña',
-        'password_reset': '🔑 Restablecimiento de contraseña',
-        'delete_certificado': '🗑 Borró un certificado',
-    }.get(action or '', action or '—')
 
 def require_portal_login():
     """
@@ -1313,10 +991,10 @@ def portal_login():
     Login del portal de clientes.
     """
     if request.method == "POST":
-        login = request.form.get("email", "").strip() or request.form.get("username", "").strip()
+        username = request.form.get("username", "").strip()
         password = request.form.get("password", "").strip()
         
-        result = authenticate_portal_user(login, password)
+        result = authenticate_portal_user(username, password)
         
         if result['ok']:
             user = result['user']
@@ -1401,8 +1079,8 @@ def portal_login():
 
     html.append("""
     <form method="post">
-      <label>Email</label>
-      <input type="email" name="email" required autofocus placeholder="tu@email.com">
+      <label>Usuario</label>
+      <input type="text" name="username" required autofocus placeholder="rrhh.empresa">
       
       <label>Contraseña</label>
       <input type="password" name="password" required placeholder="••••••••">
@@ -1426,7 +1104,6 @@ def portal_login():
 """)
     
     return Response("".join(html), mimetype="text/html")
-
 
 @app.route("/portal")
 def portal_dashboard():
@@ -1471,38 +1148,38 @@ def portal_dashboard():
         
         # KPIs actuales
         cur.execute("""
-            SELECT COUNT(DISTINCT cuil) AS total
-            FROM message_status
-            WHERE tenant = %s AND period = %s AND kind = 'template'
+            SELECT COUNT(DISTINCT cuil) 
+            FROM message_status 
+            WHERE tenant = ? AND period = ? AND kind = 'template'
         """, (tenant, selected_period))
-        enviados = cur.fetchone()['total'] or 0
-
+        enviados = cur.fetchone()[0] or 0
+        
         cur.execute("""
-            SELECT COUNT(DISTINCT cuil) AS total
+            SELECT COUNT(DISTINCT cuil)
             FROM sent_pdfs
-            WHERE tenant = %s AND period = %s
+            WHERE tenant = ? AND period = ?
         """, (tenant, selected_period))
-        vistos = cur.fetchone()['total'] or 0
-
+        vistos = cur.fetchone()[0] or 0
+        
         cur.execute("""
-            SELECT COUNT(DISTINCT cuil) AS total
+            SELECT COUNT(DISTINCT cuil)
             FROM recibo_estado
-            WHERE tenant = %s AND period = %s AND estado IN ('FIRMADO', 'OBSERVADO')
+            WHERE tenant = ? AND period = ? AND estado IN ('FIRMADO', 'OBSERVADO')
         """, (tenant, selected_period))
-        firmados = cur.fetchone()['total'] or 0
-
+        firmados = cur.fetchone()[0] or 0
+        
         # Tiempo promedio de firma
         cur.execute("""
-            SELECT AVG(re.updated_at - ms.created_at) / 86400.0 AS avg_days
+            SELECT AVG(re.updated_at - ms.created_at) / 86400.0
             FROM recibo_estado re
-            JOIN message_status ms ON ms.tenant = re.tenant
-                AND ms.cuil = re.cuil
-                AND ms.period = re.period
+            JOIN message_status ms ON ms.tenant = re.tenant 
+                AND ms.cuil = re.cuil 
+                AND ms.period = re.period 
                 AND ms.kind = 'template'
-            WHERE re.tenant = %s AND re.period = %s
+            WHERE re.tenant = ? AND re.period = ? 
                 AND re.estado IN ('FIRMADO', 'OBSERVADO')
         """, (tenant, selected_period))
-        avg_days = cur.fetchone()['avg_days']
+        avg_days = cur.fetchone()[0]
         avg_days = round(avg_days, 1) if avg_days else 0
         
         pendientes = enviados - firmados
@@ -1525,25 +1202,25 @@ def portal_dashboard():
         periods_data = []
         for p in last_6_periods:
             cur.execute("""
-                SELECT COUNT(DISTINCT cuil) AS total
-                FROM message_status
-                WHERE tenant = %s AND period = %s AND kind = 'template'
+                SELECT COUNT(DISTINCT cuil) 
+                FROM message_status 
+                WHERE tenant = ? AND period = ? AND kind = 'template'
             """, (tenant, p))
-            env = cur.fetchone()['total'] or 0
-
+            env = cur.fetchone()[0] or 0
+            
             cur.execute("""
-                SELECT COUNT(DISTINCT cuil) AS total
+                SELECT COUNT(DISTINCT cuil)
                 FROM sent_pdfs
-                WHERE tenant = %s AND period = %s
+                WHERE tenant = ? AND period = ?
             """, (tenant, p))
-            vis = cur.fetchone()['total'] or 0
-
+            vis = cur.fetchone()[0] or 0
+            
             cur.execute("""
-                SELECT COUNT(DISTINCT cuil) AS total
+                SELECT COUNT(DISTINCT cuil)
                 FROM recibo_estado
-                WHERE tenant = %s AND period = %s AND estado IN ('FIRMADO', 'OBSERVADO')
+                WHERE tenant = ? AND period = ? AND estado IN ('FIRMADO', 'OBSERVADO')
             """, (tenant, p))
-            fir = cur.fetchone()['total'] or 0
+            fir = cur.fetchone()[0] or 0
             
             periods_data.append({
                 'period': p,
@@ -1637,11 +1314,6 @@ def portal_dashboard():
         grid-template-columns: 1fr;
       }
     }
-    select{
-      background:#0f1b33; color:#eaf0ff; border:1px solid rgba(255,255,255,.2);
-      padding:10px 12px; border-radius:10px; font-size:15px; color-scheme:dark;
-    }
-    select option{ background-color:#0f1b33; color:#eaf0ff; }
   </style>
 </head>
 <body>
@@ -1658,7 +1330,6 @@ def portal_dashboard():
           <div class="subtitle">🏢 """ + esc(empresa_nombre) + """</div>
         </div>
         <div class="header-actions">
-          <a href="/portal/apariencia" class="btn">🎨 Apariencia</a>
           <a href="/portal/change_password" class="btn">🔐 Cambiar contraseña</a>
           <a href="/portal/logout" class="btn">🚪 Salir</a>
         </div>
@@ -1744,13 +1415,13 @@ def portal_dashboard():
         html.append("<div class='action-title'>Buscar empleado</div>")
         html.append("<div class='action-desc'>Por nombre, CUIL o DNI</div>")
         html.append("</a>")
-
+        
         html.append(f"<a href='/portal/pendientes?period={esc(selected_period)}' class='action-card'>")
         html.append("<div class='action-icon'>⚠️</div>")
         html.append("<div class='action-title'>Ver pendientes</div>")
         html.append(f"<div class='action-desc'>{kpis['pendientes']} sin firmar</div>")
         html.append("</a>")
-
+        
         html.append(f"<a href='/portal/reports?period={esc(selected_period)}' class='action-card'>")
         html.append("<div class='action-icon'>📊</div>")
         html.append("<div class='action-title'>Reportes</div>")
@@ -1760,20 +1431,6 @@ def portal_dashboard():
         html.append("<div class='action-icon'>📅</div>")
         html.append("<div class='action-title'>Calendario</div>")
         html.append("<div class='action-desc'>Ver todos los períodos</div>")
-        html.append("</a>")
-        html.append("<a href='/portal/certificados' class='action-card'>")
-        html.append("<div class='action-icon'>🩺</div>")
-        html.append("<div class='action-title'>Certificados médicos</div>")
-        html.append("<div class='action-desc'>Ver los certificados recibidos</div>")
-        html.append("</a>")
-        html.append("<a href='/portal/certificados-familia' class='action-card'>")
-        html.append("<div class='action-icon'>🧑\u200d🧑\u200d🧒</div>")
-        html.append("<div class='action-title'>Certificados de familia</div>")
-        html.append("<div class='action-desc'>Asignaciones familiares recibidas</div>")
-        html.append(f"<a href='/portal/recibos?period={esc(selected_period)}' class='action-card'>")
-        html.append("<div class='action-icon'>🧾</div>")
-        html.append("<div class='action-title'>Recibos</div>")
-        html.append("<div class='action-desc'>Ver y descargar los del período</div>")
         html.append("</a>")
         html.append("</div>")
         html.append("</div>")
@@ -1928,18 +1585,18 @@ def portal_calendario():
     periods_stats = []
     for period in period_labels:
         cur.execute("""
-            SELECT COUNT(DISTINCT cuil) AS total
-            FROM message_status
-            WHERE tenant = %s AND period = %s AND kind = 'template'
+            SELECT COUNT(DISTINCT cuil) 
+            FROM message_status 
+            WHERE tenant = ? AND period = ? AND kind = 'template'
         """, (tenant, period))
-        enviados = cur.fetchone()['total'] or 0
-
+        enviados = cur.fetchone()[0] or 0
+        
         cur.execute("""
-            SELECT COUNT(DISTINCT cuil) AS total
+            SELECT COUNT(DISTINCT cuil)
             FROM recibo_estado
-            WHERE tenant = %s AND period = %s AND estado IN ('FIRMADO', 'OBSERVADO')
+            WHERE tenant = ? AND period = ? AND estado IN ('FIRMADO', 'OBSERVADO')
         """, (tenant, period))
-        firmados = cur.fetchone()['total'] or 0
+        firmados = cur.fetchone()[0] or 0
         
         pct = int((firmados / enviados * 100)) if enviados > 0 else 0
         
@@ -2163,671 +1820,7 @@ def portal_calendario():
     
     return Response("".join(html), mimetype="text/html")
 
-@app.route("/portal/certificados")
-def portal_certificados():
-    """Certificados médicos recibidos (portal)."""
-    return _portal_certificados_render("medico")
 
-
-@app.route("/portal/certificados-familia")
-def portal_certificados_familia():
-    """Certificados de asignaciones familiares recibidos (portal)."""
-    return _portal_certificados_render("familia")
-
-
-def _portal_certificados_render(tipo: str = "medico"):
-    """
-    Render de la grilla de certificados de un tipo, para el portal de clientes.
-    Cada cliente ve SOLO los de su empresa (sale de la sesión).
-    """
-    # Textos según el tipo
-    if tipo == "familia":
-        titulo = "🧑\u200d🧑\u200d🧒 Certificados de familia"
-        titulo_tab = "Certificados de familia"
-    else:
-        titulo = "🩺 Certificados médicos"
-        titulo_tab = "Certificados"
-
-    # Verificar login
-    auth = require_portal_login()
-    if auth:
-        return auth
-
-    user_id = session.get('portal_user_id')
-    user = get_portal_user_by_id(user_id)
-    tenant = user['tenant']
-
-    t = get_tenant(tenant)
-    empresa_nombre = t.get('display_name', tenant) if t else tenant
-
-    certificados = get_certificados(tenant, tipo=tipo)
-    msg = request.args.get("msg", "")
-
-    # Botón "Descargar todos" (solo si hay certificados)
-    dl_btn = ""
-    if certificados:
-        dl_btn = f"<a href='/portal/certificados-zip?tipo={esc(tipo)}' class='btn primary'>⬇️ Descargar todos</a>"
-
-    html = []
-    html.append("""<!doctype html>
-<html lang="es">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Portal - """ + titulo_tab + """</title>
-  <link rel="manifest" href="/static/manifest.json">
-  <meta name="theme-color" content="#2E3B8E">
-  <meta name="apple-mobile-web-app-capable" content="yes">
-  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
-  <meta name="apple-mobile-web-app-title" content="Recibos">
-  <link rel="apple-touch-icon" href="/static/icon-192.png">
-  <link rel="stylesheet" href="/static/portal-theme.css">
-  <style>
-    .table-wrap { overflow:auto; max-height:520px; border:1px solid var(--line); border-radius:var(--radius); margin-top:16px; }
-    table { width:100%; border-collapse:separate; border-spacing:0; }
-    th, td { padding:12px 14px; border-bottom:1px solid var(--line); font-size:14px; text-align:left; }
-    thead th { position:sticky; top:0; background:var(--card); z-index:1; color:var(--text-muted); font-size:13px; }
-    tr:hover td { background:var(--card-hover); }
-    .btn-sm { padding:6px 12px; font-size:13px; border-radius:8px; }
-    th.sortable { cursor:pointer; user-select:none; }
-    th.sortable:hover { color:var(--text); }
-    th .arrow { font-size:11px; opacity:.7; }
-    .btn-del { padding:6px 12px; font-size:13px; border-radius:8px; background:#b91c1c; color:#fff; border:none; cursor:pointer; }
-    .btn-del:hover { background:#991b1b; }
-  </style>
-</head>
-<body>
-  <div class="top-logo">
-    <img src="/static/icon-192.png" alt="SIA Sueldos">
-    <span class="top-logo-text">SIA</span>
-  </div>
- 
-  <div class="container">
-    <div class="header">
-      <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:16px">
-        <div>
-          <h1>""" + titulo + """</h1>
-          <div class="subtitle">🏢 """ + esc(empresa_nombre) + """</div>
-        </div>
-        <div class="header-actions" style="display:flex; gap:10px; flex-wrap:wrap">
-          """ + dl_btn + """
-          <a href="/portal" class="btn">← Volver al inicio</a>
-        </div>
-      </div>
-    </div>
- 
-    <div class="card">
-""")
-
-    # Mensajes
-    if msg == "deleted":
-        html.append("<div class='alert alert-info'>✅ Certificado borrado.</div>")
-    elif msg == "forbidden":
-        html.append("<div class='alert alert-error'>❌ No tenés permiso sobre ese certificado.</div>")
-    elif msg == "not_found":
-        html.append("<div class='alert alert-error'>❌ No se encontró el certificado.</div>")
-
-    html.append(f"<h2>Recibidos: {len(certificados)}</h2>")
- 
-    if certificados:
-        html.append("<div class='table-wrap'>")
-        html.append("<table id='cert-table'>")
-        html.append(
-            "<thead><tr>"
-            "<th class='sortable' data-key='fecha'>Fecha <span class='arrow'></span></th>"
-            "<th class='sortable' data-key='nombre'>Nombre <span class='arrow'></span></th>"
-            "<th>CUIL</th><th>WhatsApp</th><th>Archivo</th><th>Acciones</th>"
-            "</tr></thead>"
-        )
-        html.append("<tbody>")
-        for c in certificados:
-            ver_url = f"/portal/certificado?id={c['id']}"
-            # Si el nombre quedó vacío al guardar, lo buscamos por CUIL
-            nombre_cert = c.get('nombre','') or get_nombre_for_cuil(tenant, c.get('cuil',''))
-            ts = int(c.get('created_at') or 0)
-            html.append("<tr>")
-            html.append(f"<td data-ts='{ts}'>{esc(ts_str(c.get('created_at')))}</td>")
-            html.append(f"<td>{esc(nombre_cert)}</td>")
-            html.append(f"<td>{esc(c.get('cuil',''))}</td>")
-            html.append(f"<td>{esc(c.get('to_whatsapp','') or '')}</td>")
-            html.append(f"<td><a class='btn primary btn-sm' href='{ver_url}' target='_blank'>Ver / Descargar</a></td>")
-            html.append(
-                "<td>"
-                "<form method='post' action='/portal/certificado/delete' style='margin:0' "
-                "onsubmit=\"return confirm('¿Borrar este certificado? Se quita del portal y no se puede recuperar.');\">"
-                f"<input type='hidden' name='id' value='{c['id']}'>"
-                f"<input type='hidden' name='tipo' value='{esc(tipo)}'>"
-                "<button type='submit' class='btn-del'>🗑 Borrar</button>"
-                "</form>"
-                "</td>"
-            )
-            html.append("</tr>")
-        html.append("</tbody></table></div>")
-    else:
-        html.append("<p class='subtitle'>Todavía no se recibieron certificados.</p>")
- 
-    html.append("""
-    </div>
-  </div>
-  <script>
-  (function(){
-    var table = document.getElementById('cert-table');
-    if(!table) return;
-    var tbody = table.querySelector('tbody');
-    var dir = {};
-    table.querySelectorAll('th.sortable').forEach(function(th){
-      th.addEventListener('click', function(){
-        var key = th.getAttribute('data-key');
-        var idx = Array.prototype.indexOf.call(th.parentNode.children, th);
-        dir[key] = !dir[key];
-        var asc = dir[key];
-        var rows = Array.prototype.slice.call(tbody.querySelectorAll('tr'));
-        rows.sort(function(a, b){
-          var ca = a.children[idx], cb = b.children[idx], va, vb;
-          if(key === 'fecha'){
-            va = parseInt(ca.getAttribute('data-ts') || '0', 10);
-            vb = parseInt(cb.getAttribute('data-ts') || '0', 10);
-          } else {
-            va = (ca.textContent || '').trim().toLowerCase();
-            vb = (cb.textContent || '').trim().toLowerCase();
-          }
-          if(va < vb) return asc ? -1 : 1;
-          if(va > vb) return asc ? 1 : -1;
-          return 0;
-        });
-        rows.forEach(function(r){ tbody.appendChild(r); });
-        table.querySelectorAll('th.sortable .arrow').forEach(function(a){ a.textContent = ''; });
-        var arrow = th.querySelector('.arrow');
-        if(arrow) arrow.textContent = asc ? '▲' : '▼';
-      });
-    });
-  })();
-  </script>
-</body>
-</html>
-""")
- 
-    return Response("".join(html), mimetype="text/html") 
- 
-@app.route("/portal/recibos")
-def portal_recibos():
-    """Recibos de sueldo de un período (portal). Cada cliente ve solo los de su empresa."""
-    auth = require_portal_login()
-    if auth:
-        return auth
-
-    user_id = session.get('portal_user_id')
-    user = get_portal_user_by_id(user_id)
-    tenant = (user['tenant'] or "").strip().lower()
-
-    t = get_tenant(tenant)
-    empresa_nombre = t.get('display_name', tenant) if t else tenant
-
-    # Períodos disponibles (etiquetas "MM/YYYY")
-    period_labels = [period_folder_to_label(p) for p in list_tenant_period_folders(tenant)]
-    period_labels = [p for p in period_labels if p]
-
-    selected_period = request.args.get("period", "").strip()
-    if selected_period:
-        selected_period = normalize_period_label(selected_period)
-    if not selected_period and period_labels:
-        selected_period = period_labels[0]
-
-    recibos = list_recibos_for_period(tenant, selected_period) if selected_period else []
-
-    # Selector de período
-    sel = ["<form method='get' style='margin:0'>",
-           "<select name='period' onchange='this.form.submit()' class='btn' "
-           "style='padding:8px 12px; min-width:140px'>"]
-    for p in period_labels:
-        selflag = " selected" if p == selected_period else ""
-        sel.append(f"<option value='{esc(p)}'{selflag}>{esc(p)}</option>")
-    sel.append("</select></form>")
-    sel_html = "".join(sel) if period_labels else ""
-    dl_btn = ""
-    if recibos:
-        from urllib.parse import quote
-        dl_btn = (f"<a href='/portal/recibos-zip?period={quote(selected_period)}' "
-                  f"class='btn primary'>⬇️ Descargar todos</a>")
-    html = []
-    html.append("""<!doctype html>
-<html lang="es">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Portal - Recibos</title>
-  <link rel="manifest" href="/static/manifest.json">
-  <meta name="theme-color" content="#2E3B8E">
-  <meta name="apple-mobile-web-app-capable" content="yes">
-  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
-  <meta name="apple-mobile-web-app-title" content="Recibos">
-  <link rel="apple-touch-icon" href="/static/icon-192.png">
-  <link rel="stylesheet" href="/static/portal-theme.css">
-  <style>
-    .table-wrap { overflow:auto; max-height:560px; border:1px solid var(--line); border-radius:var(--radius); margin-top:16px; }
-    table { width:100%; border-collapse:separate; border-spacing:0; }
-    th, td { padding:12px 14px; border-bottom:1px solid var(--line); font-size:14px; text-align:left; }
-    thead th { position:sticky; top:0; background:var(--card); z-index:1; color:var(--text-muted); font-size:13px; }
-    tr:hover td { background:var(--card-hover); }
-    .btn-sm { padding:6px 12px; font-size:13px; border-radius:8px; }
-    th.sortable { cursor:pointer; user-select:none; }
-    th.sortable:hover { color:var(--text); }
-    th .arrow { font-size:11px; opacity:.7; }
-    select{ color-scheme:dark; }
-    select option{ background-color:#0f1b33; color:#eaf0ff; }
-  </style>
-</head>
-<body>
-  <div class="top-logo">
-    <img src="/static/icon-192.png" alt="SIA Sueldos">
-    <span class="top-logo-text">SIA</span>
-  </div>
-
-  <div class="container">
-    <div class="header">
-      <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:16px">
-        <div>
-          <h1>🧾 Recibos</h1>
-          <div class="subtitle">🏢 """ + esc(empresa_nombre) + """</div>
-        </div>
-        <div class="header-actions" style="display:flex; gap:10px; flex-wrap:wrap; align-items:center">
-          """ + dl_btn + """
-          """ + sel_html + """
-          <a href="/portal" class="btn">← Volver al inicio</a>
-        </div>
-      </div>
-    </div>
-
-    <div class="card">
-""")
-
-    if not period_labels:
-        html.append("<p class='subtitle'>Todavía no hay períodos cargados.</p>")
-    else:
-        html.append(f"<h2>Período {esc(selected_period)} · {len(recibos)} recibos</h2>")
-        if recibos:
-            html.append("<div class='table-wrap'>")
-            html.append("<table id='rec-table'>")
-            html.append(
-                "<thead><tr>"
-                "<th class='sortable' data-key='nombre'>Nombre <span class='arrow'></span></th>"
-                "<th class='sortable' data-key='cuil'>CUIL <span class='arrow'></span></th>"
-                "<th>Recibo</th>"
-                "</tr></thead><tbody>"
-            )
-            for r in recibos:
-                qs = urlencode({
-                    "tenant": tenant,
-                    "cuil": r["cuil"],
-                    "period": selected_period,
-                    "token": make_media_token("pdf", tenant=tenant, cuil=r["cuil"], period=selected_period),
-                })
-                ver_url = f"/media/pdf?{qs}"
-                html.append("<tr>")
-                html.append(f"<td>{esc(r['nombre'] or '—')}</td>")
-                html.append(f"<td>{esc(r['cuil'])}</td>")
-                html.append(f"<td><a class='btn primary btn-sm' href='{ver_url}' target='_blank' rel='noopener'>Ver / Descargar</a></td>")
-                html.append("</tr>")
-            html.append("</tbody></table></div>")
-        else:
-            html.append("<p class='subtitle'>No hay recibos en este período.</p>")
-
-    html.append("""
-    </div>
-  </div>
-  <script>
-  (function(){
-    var table = document.getElementById('rec-table');
-    if(!table) return;
-    var tbody = table.querySelector('tbody');
-    var dir = {};
-    table.querySelectorAll('th.sortable').forEach(function(th){
-      th.addEventListener('click', function(){
-        var key = th.getAttribute('data-key');
-        var idx = Array.prototype.indexOf.call(th.parentNode.children, th);
-        dir[key] = !dir[key];
-        var asc = dir[key];
-        var rows = Array.prototype.slice.call(tbody.querySelectorAll('tr'));
-        rows.sort(function(a, b){
-          var va = (a.children[idx].textContent || '').trim().toLowerCase();
-          var vb = (b.children[idx].textContent || '').trim().toLowerCase();
-          if(va < vb) return asc ? -1 : 1;
-          if(va > vb) return asc ? 1 : -1;
-          return 0;
-        });
-        rows.forEach(function(r){ tbody.appendChild(r); });
-        table.querySelectorAll('th.sortable .arrow').forEach(function(a){ a.textContent = ''; });
-        var arrow = th.querySelector('.arrow');
-        if(arrow) arrow.textContent = asc ? '▲' : '▼';
-      });
-    });
-  })();
-  </script>
-</body>
-</html>
-""")
-
-    return Response("".join(html), mimetype="text/html")
-
-@app.get("/portal/recibos-zip")
-def portal_recibos_zip():
-    """Descarga todos los recibos de un período en un ZIP (solo del tenant del usuario)."""
-    import zipfile
-    auth = require_portal_login()
-    if auth:
-        return auth
-
-    user_id = session.get('portal_user_id')
-    user = get_portal_user_by_id(user_id)
-    tenant = (user['tenant'] or "").strip().lower()
-
-    selected_period = normalize_period_label((request.args.get("period") or "").strip())
-    if not selected_period:
-        return Response("Falta el período", status=400)
-
-    recibos = list_recibos_for_period(tenant, selected_period)
-    if not recibos:
-        return Response("No hay recibos para descargar", status=404)
-
-    service = drive_service()
-    mem = io.BytesIO()
-    usados = set()
-
-    with zipfile.ZipFile(mem, "w", zipfile.ZIP_DEFLATED) as zf:
-        for r in recibos:
-            file_id = (r.get("file_id") or "").strip()
-            if not file_id:
-                continue
-
-            # Nombre legible dentro del zip: nombre_cuil.pdf
-            base = f"{r.get('nombre') or 'sin_nombre'}_{r.get('cuil', '')}".strip('_')
-            base = re.sub(r'[^\w\-. ]', '_', base)
-            arcname = f"{base}.pdf"
-
-            # Evitar nombres repetidos dentro del zip
-            final, n = arcname, 1
-            while final.lower() in usados:
-                final = f"{base}_{n}.pdf"
-                n += 1
-            usados.add(final.lower())
-
-            try:
-                req = service.files().get_media(fileId=file_id, supportsAllDrives=True)
-                fh = io.BytesIO()
-                downloader = MediaIoBaseDownload(fh, req, chunksize=5 * 1024 * 1024)
-                done = False
-                while not done:
-                    _, done = downloader.next_chunk()
-                fh.seek(0)
-                zf.writestr(final, fh.read())
-            except Exception as e:
-                log.exception(f"Error agregando recibo {r.get('cuil')} al zip: {e}")
-                continue
-
-    mem.seek(0)
-    data = mem.read()
-
-    empresa = (t['display_name'] if (t := get_tenant(tenant)) else tenant) or tenant
-    empresa_slug = re.sub(r'[^\w\-]', '_', empresa)
-    period_slug = selected_period.replace('/', '-')
-    zip_name = f"recibos_{period_slug}_{empresa_slug}.zip"
-
-    resp = Response(data, mimetype="application/zip")
-    resp.headers["Content-Disposition"] = f'attachment; filename="{zip_name}"'
-    resp.headers["Content-Length"] = str(len(data))
-    return resp
-
-@app.get("/portal/certificados-zip")
-def portal_certificados_zip():
-    """Descarga todos los certificados de un tipo en un ZIP (solo del tenant del usuario)."""
-    import zipfile
-    auth = require_portal_login()
-    if auth:
-        return auth
-
-    user_id = session.get('portal_user_id')
-    user = get_portal_user_by_id(user_id)
-    tenant = user['tenant']
-
-    tipo = (request.args.get("tipo") or "medico").strip().lower()
-    if tipo not in ("medico", "familia"):
-        tipo = "medico"
-
-    certificados = get_certificados(tenant, tipo=tipo)
-    if not certificados:
-        return Response("No hay certificados para descargar", status=404)
-
-    service = drive_service()
-    mem = io.BytesIO()
-    usados = set()
-
-    with zipfile.ZipFile(mem, "w", zipfile.ZIP_DEFLATED) as zf:
-        for c in certificados:
-            file_id = (c.get("file_id") or "").strip()
-            if not file_id:
-                continue
-
-            # Nombre original (para conservar la extensión)
-            try:
-                meta = service.files().get(fileId=file_id, fields='name', supportsAllDrives=True).execute()
-                drive_name = meta.get('name') or c.get('file_name') or f"certificado_{c['id']}"
-            except Exception as e:
-                log.warning(f"No se pudo leer meta del cert {c.get('id')}: {e}")
-                drive_name = c.get('file_name') or f"certificado_{c['id']}"
-
-            ext = ('.' + drive_name.rsplit('.', 1)[1]) if '.' in drive_name else ''
-
-            # Nombre legible dentro del zip: fecha_nombre_cuil.ext
-            nombre_cert = c.get('nombre', '') or get_nombre_for_cuil(tenant, c.get('cuil', ''))
-            fecha = ts_str(c.get('created_at')).replace('/', '-').replace(':', '.').replace(' ', '_')
-            base = f"{fecha}_{nombre_cert or 'sin_nombre'}_{c.get('cuil', '')}".strip('_')
-            base = re.sub(r'[^\w\-. ]', '_', base)
-            arcname = f"{base}{ext}"
-
-            # Evitar nombres repetidos dentro del zip
-            final, n = arcname, 1
-            while final.lower() in usados:
-                final = f"{base}_{n}{ext}"
-                n += 1
-            usados.add(final.lower())
-
-            try:
-                req = service.files().get_media(fileId=file_id, supportsAllDrives=True)
-                fh = io.BytesIO()
-                downloader = MediaIoBaseDownload(fh, req, chunksize=5 * 1024 * 1024)
-                done = False
-                while not done:
-                    _, done = downloader.next_chunk()
-                fh.seek(0)
-                zf.writestr(final, fh.read())
-            except Exception as e:
-                log.exception(f"Error agregando cert {c.get('id')} al zip: {e}")
-                continue
-
-    mem.seek(0)
-    data = mem.read()
-
-    empresa = (t['display_name'] if (t := get_tenant(tenant)) else tenant) or tenant
-    empresa_slug = re.sub(r'[^\w\-]', '_', empresa)
-    tipo_label = "familia" if tipo == "familia" else "medicos"
-    zip_name = f"certificados_{tipo_label}_{empresa_slug}.zip"
-
-    resp = Response(data, mimetype="application/zip")
-    resp.headers["Content-Disposition"] = f'attachment; filename="{zip_name}"'
-    resp.headers["Content-Length"] = str(len(data))
-    return resp
-
-@app.post("/portal/certificado/delete")
-def portal_certificado_delete():
-    """Borra un certificado del portal (solo si pertenece al tenant del usuario)."""
-    auth = require_portal_login()
-    if auth:
-        return auth
-
-    user_id = session.get('portal_user_id')
-    user = get_portal_user_by_id(user_id)
-    tenant = user['tenant']
-
-    try:
-        cert_id = int(request.form.get("id") or "0")
-    except ValueError:
-        cert_id = 0
-
-    tipo = (request.form.get("tipo") or "medico").strip().lower()
-    if tipo not in ("medico", "familia"):
-        tipo = "medico"
-    dest = "/portal/certificados-familia" if tipo == "familia" else "/portal/certificados"
-
-    if not cert_id:
-        return redirect(f"{dest}?msg=not_found")
-
-    # Buscar y validar que sea del tenant del usuario
-    conn = get_db_connection()
-    cur = conn.cursor()
-    cur.execute("SELECT id, tenant, file_id FROM certificados WHERE id = %s", (cert_id,))
-    row = cur.fetchone()
-
-    if not row:
-        conn.close()
-        return redirect(f"{dest}?msg=not_found")
-
-    cert = dict(row)
-    if (cert.get("tenant") or "") != tenant:
-        conn.close()
-        return redirect(f"{dest}?msg=forbidden")
-
-    # Borrar el registro de la BD
-    cur.execute("DELETE FROM certificados WHERE id = %s", (cert_id,))
-    conn.commit()
-    conn.close()
-
-    # Mandar el archivo de Drive a la papelera (recuperable)
-    file_id = (cert.get("file_id") or "").strip()
-    if file_id:
-        try:
-            service = drive_service()
-            service.files().update(fileId=file_id, body={'trashed': True}, supportsAllDrives=True).execute()
-        except Exception as e:
-            log.warning(f"No se pudo enviar a papelera el archivo {file_id}: {e}")
-
-    # Auditoría
-    try:
-        ip = request.headers.get('X-Forwarded-For', request.remote_addr)
-        log_portal_action(user_id, tenant, 'delete_certificado', f"id={cert_id} tipo={tipo}", ip)
-    except Exception:
-        pass
-
-    return redirect(f"{dest}?msg=deleted")
-
-
-def _accion_label(action: str) -> str:
-    """Traduce el código de acción a un texto legible."""
-    return {
-        'login': '🔓 Inicio de sesión',
-        'logout': '🔒 Cierre de sesión',
-        'change_password': '🔑 Cambio de contraseña',
-        'password_reset': '🔑 Restablecimiento de contraseña',
-        'delete_certificado': '🗑 Borró un certificado',
-    }.get(action or '', action or '—')
-
-
-def get_admin_audit_log(tenant: str = "", action: str = "", limit: int = 300) -> list[dict]:
-    """Historial de actividad de TODOS los usuarios del portal (vista admin)."""
-    conn = get_db_connection()
-    cur = conn.cursor()
-    sql = """
-        SELECT a.created_at, a.action, a.details, a.ip_address, a.tenant, a.user_id,
-               u.username, u.email, u.full_name
-        FROM client_audit_log a
-        LEFT JOIN client_users u ON u.id = a.user_id
-        WHERE 1=1
-    """
-    params = []
-    if tenant:
-        sql += " AND a.tenant = %s"
-        params.append(tenant)
-    if action:
-        sql += " AND a.action = %s"
-        params.append(action)
-    sql += " ORDER BY a.created_at DESC LIMIT %s"
-    params.append(limit)
-    cur.execute(sql, tuple(params))
-    rows = cur.fetchall()
-    conn.close()
-    return [dict(r) for r in rows]
-
-
-# ╔══════════════════════════════════════════════════════════════════════╗
-# ║ PIEZA B — DESCARGA /portal/certificado                                 ║
-# ║ Sirve el archivo desde Drive. Protegido por login del portal.          ║
-# ║ SEGURIDAD: valida que el certificado sea del tenant del usuario.       ║
-# ╚══════════════════════════════════════════════════════════════════════╝
- 
-@app.get("/portal/certificado")
-def portal_certificado():
-    """Sirve un certificado desde Drive (solo si pertenece al tenant del usuario)."""
-    auth = require_portal_login()
-    if auth:
-        return auth
- 
-    user_id = session.get('portal_user_id')
-    user = get_portal_user_by_id(user_id)
-    tenant = user['tenant']
- 
-    try:
-        cert_id = int(request.args.get("id") or "0")
-    except ValueError:
-        cert_id = 0
-    if not cert_id:
-        return Response("Falta id", status=400)
- 
-    # Buscar el certificado y VALIDAR que sea del tenant del usuario
-    conn = get_db_connection()
-    cur = conn.cursor()
-    cur.execute("""
-        SELECT id, tenant, file_id, file_name
-        FROM certificados
-        WHERE id = %s
-    """, (cert_id,))
-    row = cur.fetchone()
-    conn.close()
- 
-    if not row:
-        return Response("No encontrado", status=404)
- 
-    cert = dict(row)
-    # 🔒 Seguridad: que el cliente no pueda ver certificados de otra empresa
-    if (cert.get("tenant") or "") != tenant:
-        return Response("Unauthorized", status=403)
- 
-    file_id = (cert.get("file_id") or "").strip()
-    if not file_id:
-        return Response("Sin archivo", status=404)
- 
-    try:
-        service = drive_service()
-        meta = service.files().get(fileId=file_id, fields='name,mimeType', supportsAllDrives=True).execute()
-        file_name = meta.get('name', cert.get('file_name', 'certificado'))
-        mime = meta.get('mimeType', 'application/octet-stream')
- 
-        req = service.files().get_media(fileId=file_id, supportsAllDrives=True)
-        fh = io.BytesIO()
-        downloader = MediaIoBaseDownload(fh, req, chunksize=5*1024*1024)
-        done = False
-        while not done:
-            _, done = downloader.next_chunk()
-        fh.seek(0)
-        data = fh.read()
- 
-        resp = Response(data, mimetype=mime)
-        resp.headers["Content-Disposition"] = f'inline; filename="{file_name}"'
-        resp.headers["Content-Length"] = str(len(data))
-        resp.headers["Cache-Control"] = "private, max-age=60"
-        return resp
-    except Exception as e:
-        log.exception(f"❌ Error descargando certificado (portal): {e}")
-        return Response("Error descargando certificado", status=500)
- 
 @app.route("/portal/search")
 def portal_search():
     """
@@ -2842,23 +1835,8 @@ def portal_search():
     user = get_portal_user_by_id(user_id)
     tenant = user['tenant']
     
-    period = (request.args.get("period", "") or "").strip()
+    period = request.args.get("period", "")
     query = request.args.get("q", "").strip()
-
-    # Si venimos sin período (link viejo, marcador, "volver" de antes),
-    # usamos el último disponible: buscar con período vacío daba 0 resultados.
-    if not period:
-        try:
-            for _pf in list_tenant_period_folders(tenant):
-                _lbl = period_folder_to_label(_pf)
-                if _lbl:
-                    period = _lbl
-                    break
-        except Exception:
-            log.exception("search: no pude resolver el período por defecto")
-
-    # Querystring para que 'Ver historial' sepa volver a ESTA búsqueda.
-    hist_qs = esc(urlencode({"period": period, "q": query}))
     
     # Obtener info del tenant
     t = get_tenant(tenant)
@@ -2873,9 +1851,9 @@ def portal_search():
         # Primero obtener los CUILs que tienen template enviado en este período
         cur.execute("""
             SELECT DISTINCT cuil FROM message_status
-            WHERE tenant = %s AND period = %s AND kind = 'template'
+            WHERE tenant = ? AND period = ? AND kind = 'template'
         """, (tenant, period))
-        cuils_enviados = [r['cuil'] for r in cur.fetchall()]
+        cuils_enviados = [r[0] for r in cur.fetchall()]
         
         # Cargar envíos
         envios = load_envios_rows(tenant)
@@ -2899,7 +1877,7 @@ def portal_search():
                 # Ver si tiene template enviado
                 cur.execute("""
                     SELECT created_at FROM message_status
-                    WHERE tenant = %s AND cuil = %s AND period = %s AND kind = 'template'
+                    WHERE tenant = ? AND cuil = ? AND period = ? AND kind = 'template'
                     ORDER BY created_at DESC LIMIT 1
                 """, (tenant, cuil, period))
                 template_row = cur.fetchone()
@@ -2907,7 +1885,7 @@ def portal_search():
                 # Ver si vio el recibo (pidió PDF)
                 cur.execute("""
                     SELECT created_at FROM sent_pdfs
-                    WHERE tenant = %s AND cuil = %s AND period = %s
+                    WHERE tenant = ? AND cuil = ? AND period = ?
                     ORDER BY created_at DESC LIMIT 1
                 """, (tenant, cuil, period))
                 pdf_row = cur.fetchone()
@@ -2915,28 +1893,28 @@ def portal_search():
                 # Ver si firmó
                 cur.execute("""
                     SELECT estado FROM recibo_estado
-                    WHERE tenant = %s AND cuil = %s AND period = %s
+                    WHERE tenant = ? AND cuil = ? AND period = ?
                     LIMIT 1
                 """, (tenant, cuil, period))
                 estado_row = cur.fetchone()
                 
                 # Determinar estado
-                if estado_row and estado_row['estado'] in ('FIRMADO', 'OBSERVADO'):
+                if estado_row and estado_row[0] in ('FIRMADO', 'OBSERVADO'):
                     status = 'firmado'
                     status_emoji = '✅'
-                    status_text = 'Firmado' if estado_row['estado'] == 'FIRMADO' else 'Observado'
+                    status_text = 'Firmado' if estado_row[0] == 'FIRMADO' else 'Observado'
                 elif pdf_row:
                     status = 'visto'
                     status_emoji = '👁️'
                     status_text = 'Visto, no firmado'
-                    days_ago = int((time.time() - pdf_row['created_at']) / 86400) if pdf_row['created_at'] else 0
+                    days_ago = int((time.time() - pdf_row[0]) / 86400) if pdf_row[0] else 0
                     if days_ago > 0:
                         status_text += f' (hace {days_ago}d)'
                 elif template_row:
                     status = 'enviado'
                     status_emoji = '⚠️'
                     status_text = 'No visto'
-                    days_ago = int((time.time() - template_row['created_at']) / 86400) if template_row['created_at'] else 0
+                    days_ago = int((time.time() - template_row[0]) / 86400) if template_row[0] else 0
                     if days_ago > 0:
                         status_text += f' (hace {days_ago}d)'
                 else:
@@ -3061,7 +2039,7 @@ def portal_search():
             html.append("<div class='result-details'>")
             html.append(f"CUIL: {esc(r['cuil'])} · DNI: {esc(r['dni'])} · WhatsApp: {esc(r['whatsapp'])}")
             html.append("</div>")
-            html.append(f"<div style='margin-top:12px'><a href='/portal/historial/{esc(r['cuil'])}?{hist_qs}' class='btn' style='font-size:13px; padding:8px 16px'>📜 Ver historial</a></div>")
+            html.append(f"<div style='margin-top:12px'><a href='/portal/historial/{esc(r['cuil'])}' class='btn' style='font-size:13px; padding:8px 16px'>📜 Ver historial</a></div>")
             html.append("</div>")
     
     html.append("</div>")
@@ -3085,18 +2063,6 @@ def portal_historial(cuil):
     tenant = user['tenant']
     
     cuil = norm_cuil(cuil)
-
-    # Para volver a la búsqueda exactamente como estaba (mismo período y
-    # mismo texto). Antes 'Volver' caía en /portal/search pelado: búsqueda
-    # vacía y período en blanco, que encima hacía que buscar de nuevo dé 0.
-    back_params = {}
-    _bp = (request.args.get("period") or "").strip()
-    _bq = (request.args.get("q") or "").strip()
-    if _bp:
-        back_params["period"] = _bp
-    if _bq:
-        back_params["q"] = _bq
-    back_url = "/portal/search" + (("?" + urlencode(back_params)) if back_params else "")
     
     # Obtener info del tenant
     t = get_tenant(tenant)
@@ -3107,7 +2073,7 @@ def portal_historial(cuil):
     person = find_person_by_cuil(envios, cuil)
     
     if not person:
-        return redirect(back_url)
+        return redirect('/portal/search')
     
     nombre = person.get('nombre', '')
     whatsapp = person.get('whatsapp', '')
@@ -3120,17 +2086,17 @@ def portal_historial(cuil):
     # Obtener todos los períodos donde tuvo envío
     cur.execute("""
         SELECT DISTINCT period FROM message_status
-        WHERE tenant = %s AND cuil = %s AND kind = 'template'
+        WHERE tenant = ? AND cuil = ? AND kind = 'template'
         ORDER BY period DESC
     """, (tenant, cuil))
-    periods = [r['period'] for r in cur.fetchall()]
+    periods = [r[0] for r in cur.fetchall()]
     
     historial = []
     for period in periods:
         # Template enviado
         cur.execute("""
             SELECT created_at FROM message_status
-            WHERE tenant = %s AND cuil = %s AND period = %s AND kind = 'template'
+            WHERE tenant = ? AND cuil = ? AND period = ? AND kind = 'template'
             ORDER BY created_at DESC LIMIT 1
         """, (tenant, cuil, period))
         template_row = cur.fetchone()
@@ -3138,7 +2104,7 @@ def portal_historial(cuil):
         # PDF enviado
         cur.execute("""
             SELECT created_at FROM sent_pdfs
-            WHERE tenant = %s AND cuil = %s AND period = %s
+            WHERE tenant = ? AND cuil = ? AND period = ?
             ORDER BY created_at DESC LIMIT 1
         """, (tenant, cuil, period))
         pdf_row = cur.fetchone()
@@ -3146,32 +2112,32 @@ def portal_historial(cuil):
         # Firmado
         cur.execute("""
             SELECT estado, updated_at FROM recibo_estado
-            WHERE tenant = %s AND cuil = %s AND period = %s
+            WHERE tenant = ? AND cuil = ? AND period = ?
             LIMIT 1
         """, (tenant, cuil, period))
         estado_row = cur.fetchone()
         
         # Calcular tiempos
-        enviado_ts = template_row['created_at'] if template_row else None
-        visto_ts = pdf_row['created_at'] if pdf_row else None
-        firmado_ts = estado_row['updated_at'] if estado_row else None
-
+        enviado_ts = template_row[0] if template_row else None
+        visto_ts = pdf_row[0] if pdf_row else None
+        firmado_ts = estado_row[1] if estado_row else None
+        
         tiempo_ver = None
         tiempo_firmar = None
-
+        
         if enviado_ts and visto_ts:
             tiempo_ver = int((visto_ts - enviado_ts) / 3600)  # horas
-
+        
         if visto_ts and firmado_ts:
             tiempo_firmar = int((firmado_ts - visto_ts) / 3600)  # horas
         elif enviado_ts and firmado_ts:
             tiempo_firmar = int((firmado_ts - enviado_ts) / 3600)  # horas
-
+        
         # Determinar estado
-        if estado_row and estado_row['estado'] in ('FIRMADO', 'OBSERVADO'):
+        if estado_row and estado_row[0] in ('FIRMADO', 'OBSERVADO'):
             status = 'firmado'
             status_emoji = '✅'
-            status_text = 'Firmado' if estado_row['estado'] == 'FIRMADO' else 'Observado'
+            status_text = 'Firmado' if estado_row[0] == 'FIRMADO' else 'Observado'
             status_class = 'success'
         elif pdf_row:
             status = 'visto'
@@ -3324,7 +2290,7 @@ def portal_historial(cuil):
   
   <div class="container">
     <div class="header">
-      <a href='""" + esc(back_url) + """' class="btn">← Volver a búsqueda</a>
+      <a href="/portal/search" class="btn">← Volver a búsqueda</a>
     </div>
     
     <div class="employee-header">
@@ -3467,10 +2433,10 @@ def portal_reports():
             # Obtener solo los CUILs que tienen template enviado
             cur.execute("""
                 SELECT DISTINCT cuil FROM message_status
-                WHERE tenant = %s AND period = %s AND kind = 'template'
+                WHERE tenant = ? AND period = ? AND kind = 'template'
                 ORDER BY cuil
             """, (tenant, period))
-            cuils = [r['cuil'] for r in cur.fetchall()]
+            cuils = [r[0] for r in cur.fetchall()]
             
         elif action == "export_pending_views":
             ws.title = "No vieron"
@@ -3504,28 +2470,28 @@ def portal_reports():
                 # Ver estado completo
                 cur.execute("""
                     SELECT created_at FROM message_status
-                    WHERE tenant = %s AND cuil = %s AND period = %s AND kind = 'template'
+                    WHERE tenant = ? AND cuil = ? AND period = ? AND kind = 'template'
                     LIMIT 1
                 """, (tenant, cuil, period))
                 template_row = cur.fetchone()
                 
                 cur.execute("""
                     SELECT created_at FROM sent_pdfs
-                    WHERE tenant = %s AND cuil = %s AND period = %s
+                    WHERE tenant = ? AND cuil = ? AND period = ?
                     LIMIT 1
                 """, (tenant, cuil, period))
                 pdf_row = cur.fetchone()
                 
                 cur.execute("""
                     SELECT estado, updated_at FROM recibo_estado
-                    WHERE tenant = %s AND cuil = %s AND period = %s
+                    WHERE tenant = ? AND cuil = ? AND period = ?
                     LIMIT 1
                 """, (tenant, cuil, period))
                 estado_row = cur.fetchone()
                 
-                if estado_row and estado_row['estado'] in ('FIRMADO', 'OBSERVADO'):
-                    status = estado_row['estado']
-                    firmado_fecha = ts_str(estado_row['updated_at']) if estado_row['updated_at'] else ""
+                if estado_row and estado_row[0] in ('FIRMADO', 'OBSERVADO'):
+                    status = estado_row[0]
+                    firmado_fecha = ts_str(estado_row[1]) if estado_row[1] else ""
                 elif pdf_row:
                     status = "VISTO"
                     firmado_fecha = ""
@@ -3535,9 +2501,9 @@ def portal_reports():
                 else:
                     status = "NO_ENVIADO"
                     firmado_fecha = ""
-
-                enviado_fecha = ts_str(template_row['created_at']) if template_row else ""
-                visto_fecha = ts_str(pdf_row['created_at']) if pdf_row else ""
+                
+                enviado_fecha = ts_str(template_row[0]) if template_row else ""
+                visto_fecha = ts_str(pdf_row[0]) if pdf_row else ""
                 
                 ws.append([nombre, cuil, whatsapp, status, enviado_fecha, visto_fecha, firmado_fecha])
             
@@ -3545,27 +2511,27 @@ def portal_reports():
                 # Solo los que no vieron
                 cur.execute("""
                     SELECT created_at FROM message_status
-                    WHERE tenant = %s AND cuil = %s AND period = %s AND kind = 'template'
+                    WHERE tenant = ? AND cuil = ? AND period = ? AND kind = 'template'
                     LIMIT 1
                 """, (tenant, cuil, period))
                 template_row = cur.fetchone()
                 
-                enviado_fecha = ts_str(template_row['created_at']) if template_row else ""
-                days_ago = int((time.time() - template_row['created_at']) / 86400) if template_row else 0
-
+                enviado_fecha = ts_str(template_row[0]) if template_row else ""
+                days_ago = int((time.time() - template_row[0]) / 86400) if template_row else 0
+                
                 ws.append([nombre, cuil, whatsapp, enviado_fecha, days_ago])
-
+            
             elif action == "export_pending_sigs":
                 # Solo los que no firmaron
                 cur.execute("""
                     SELECT created_at FROM sent_pdfs
-                    WHERE tenant = %s AND cuil = %s AND period = %s
+                    WHERE tenant = ? AND cuil = ? AND period = ?
                     LIMIT 1
                 """, (tenant, cuil, period))
                 pdf_row = cur.fetchone()
-
-                pdf_fecha = ts_str(pdf_row['created_at']) if pdf_row else ""
-                days_ago = int((time.time() - pdf_row['created_at']) / 86400) if pdf_row else 0
+                
+                pdf_fecha = ts_str(pdf_row[0]) if pdf_row else ""
+                days_ago = int((time.time() - pdf_row[0]) / 86400) if pdf_row else 0
                 
                 ws.append([nombre, cuil, whatsapp, pdf_fecha, days_ago])
         
@@ -3597,35 +2563,35 @@ def portal_reports():
         cur = conn.cursor()
         
         cur.execute("""
-            SELECT COUNT(DISTINCT cuil) AS total FROM message_status
-            WHERE tenant = %s AND period = %s AND kind = 'template'
+            SELECT COUNT(DISTINCT cuil) FROM message_status 
+            WHERE tenant = ? AND period = ? AND kind = 'template'
         """, (tenant, period))
-        enviados = cur.fetchone()['total'] or 0
-
+        enviados = cur.fetchone()[0] or 0
+        
         cur.execute("""
-            SELECT COUNT(DISTINCT cuil) AS total FROM sent_pdfs
-            WHERE tenant = %s AND period = %s
+            SELECT COUNT(DISTINCT cuil) FROM sent_pdfs
+            WHERE tenant = ? AND period = ?
         """, (tenant, period))
-        vistos = cur.fetchone()['total'] or 0
-
+        vistos = cur.fetchone()[0] or 0
+        
         cur.execute("""
-            SELECT COUNT(DISTINCT cuil) AS total FROM recibo_estado
-            WHERE tenant = %s AND period = %s AND estado IN ('FIRMADO', 'OBSERVADO')
+            SELECT COUNT(DISTINCT cuil) FROM recibo_estado
+            WHERE tenant = ? AND period = ? AND estado IN ('FIRMADO', 'OBSERVADO')
         """, (tenant, period))
-        firmados = cur.fetchone()['total'] or 0
-
+        firmados = cur.fetchone()[0] or 0
+        
         # Tiempo promedio de firma
         cur.execute("""
-            SELECT AVG(re.updated_at - ms.created_at) / 86400.0 AS avg_days
+            SELECT AVG(re.updated_at - ms.created_at) / 86400.0
             FROM recibo_estado re
-            JOIN message_status ms ON ms.tenant = re.tenant
-                AND ms.cuil = re.cuil
-                AND ms.period = re.period
+            JOIN message_status ms ON ms.tenant = re.tenant 
+                AND ms.cuil = re.cuil 
+                AND ms.period = re.period 
                 AND ms.kind = 'template'
-            WHERE re.tenant = %s AND re.period = %s
+            WHERE re.tenant = ? AND re.period = ? 
                 AND re.estado IN ('FIRMADO', 'OBSERVADO')
         """, (tenant, period))
-        avg_days = cur.fetchone()['avg_days']
+        avg_days = cur.fetchone()[0]
         avg_days = round(avg_days, 1) if avg_days else 0
         
         conn.close()
@@ -3750,14 +2716,6 @@ def portal_reports():
         html.append("<p>Todos los empleados con su estado</p>")
         html.append("</div>")
         html.append(f"<a href='/portal/reports?period={esc(period)}&action=export_all' class='btn primary'>Descargar Excel</a>")
-        html.append("</div>")
-
-        html.append("<div class='download-card'>")
-        html.append("<div class='download-info'>")
-        html.append("<h3>📝 Constancias de firma (ZIP)</h3>")
-        html.append("<p>Un PDF por empleado firmado/observado, con código de verificación</p>")
-        html.append("</div>")
-        html.append(f"<a href='/portal/constancias-firma.zip?period={esc(period)}' class='btn primary'>Descargar ZIP</a>")
         html.append("</div>")
         
         html.append("<div class='download-card'>")
@@ -4097,7 +3055,7 @@ def create_password_reset_token(user_id: int) -> str:
     cur = conn.cursor()
     cur.execute("""
         INSERT INTO password_reset_tokens (user_id, token, expires_at, created_at)
-        VALUES (%s, %s, %s, %s)
+        VALUES (?, ?, ?, ?)
     """, (user_id, token, expires_at, int(time.time())))
     conn.commit()
     conn.close()
@@ -4111,12 +3069,13 @@ def get_password_reset_token(token: str):
     Returns: user_id si es válido, None si no.
     """
     conn = get_db_connection()
+    conn.row_factory = sqlite3.Row
     cur = conn.cursor()
     
     cur.execute("""
         SELECT user_id, expires_at, used
         FROM password_reset_tokens
-        WHERE token = %s
+        WHERE token = ?
     """, (token,))
     
     row = cur.fetchone()
@@ -4140,7 +3099,7 @@ def mark_reset_token_used(token: str):
     """
     conn = get_db_connection()
     cur = conn.cursor()
-    cur.execute("UPDATE password_reset_tokens SET used = TRUE WHERE token = %s", (token,))
+    cur.execute("UPDATE password_reset_tokens SET used = 1 WHERE token = ?", (token,))
     conn.commit()
     conn.close()
 
@@ -4150,11 +3109,12 @@ def get_client_user_by_email(email: str):
     Busca un usuario del portal por email.
     """
     conn = get_db_connection()
+    conn.row_factory = sqlite3.Row
     cur = conn.cursor()
     cur.execute("""
         SELECT id, tenant, username, email, full_name, active
         FROM client_users
-        WHERE LOWER(email) = LOWER(%s)
+        WHERE LOWER(email) = LOWER(?)
     """, (email.strip(),))
     user = cur.fetchone()
     conn.close()
@@ -4175,7 +3135,7 @@ def portal_forgot_password():
             token = create_password_reset_token(user['id'])
             
             # Enviar email
-            reset_url = PUBLIC_BASE_URL + f"/portal/reset/{token}"
+            reset_url = f"https://twilio-webhook-lddc.onrender.com/portal/reset/{token}"
             send_password_reset_email(user['email'], user['username'], reset_url)
         
         # Siempre mostrar el mismo mensaje (seguridad)
@@ -4463,12 +3423,12 @@ def _set_status_on_table(table: str, sid: str, status: str, error_code=None, err
     cur = conn.cursor()
 
     if status == "delivered":
-        cur.execute(f"UPDATE {table} SET delivered_at=%s WHERE message_sid=%s;", (now, sid))
+        cur.execute(f"UPDATE {table} SET delivered_at=? WHERE message_sid=?;", (now, sid))
     elif status == "read":
-        cur.execute(f"UPDATE {table} SET read_at=%s WHERE message_sid=%s;", (now, sid))
+        cur.execute(f"UPDATE {table} SET read_at=? WHERE message_sid=?;", (now, sid))
     elif status in ("failed", "undelivered"):
         cur.execute(
-            f"UPDATE {table} SET failed_at=%s, error_code=%s, error_message=%s WHERE message_sid=%s;",
+            f"UPDATE {table} SET failed_at=?, error_code=?, error_message=? WHERE message_sid=?;",
             (now, str(error_code or ""), str(error_message or ""), sid),
         )
 
@@ -4478,7 +3438,7 @@ def _set_status_on_table(table: str, sid: str, status: str, error_code=None, err
 def is_pdf_sid(message_sid: str) -> bool:
     conn = get_db_connection()
     cur = conn.cursor()
-    cur.execute("SELECT 1 FROM sent_pdfs WHERE message_sid = %s LIMIT 1", (message_sid,))
+    cur.execute("SELECT 1 FROM sent_pdfs WHERE message_sid = ? LIMIT 1", (message_sid,))
     ok = cur.fetchone() is not None
     conn.close()
     return ok
@@ -4486,10 +3446,6 @@ def is_pdf_sid(message_sid: str) -> bool:
 
 @app.post("/twilio/status")
 def twilio_status():
-    if not _twilio_signature_ok():
-        log.warning("⚠️ /twilio/status: firma Twilio inválida, request rechazado")
-        return Response("Forbidden", status=403)
-
     sid = (request.form.get("MessageSid") or "").strip()
     status = (request.form.get("MessageStatus") or "").strip().lower()
     error_code = (request.form.get("ErrorCode") or "").strip()
@@ -4505,10 +3461,10 @@ def twilio_status():
     # 1) intentar update (si existe fila)
     cur.execute("""
         UPDATE message_status
-        SET last_status = %s, last_status_at = %s,
-            error_code = CASE WHEN %s != '' THEN %s ELSE error_code END,
-            error_message = CASE WHEN %s != '' THEN %s ELSE error_message END
-        WHERE message_sid = %s
+        SET last_status = ?, last_status_at = ?,
+            error_code = CASE WHEN ? != '' THEN ? ELSE error_code END,
+            error_message = CASE WHEN ? != '' THEN ? ELSE error_message END
+        WHERE message_sid = ?
     """, (status, now, error_code, error_code, error_message, error_message, sid))
 
     # 2) ✅ si no existía, crearla desde sent_pdfs (caso PDF/media)
@@ -4516,31 +3472,27 @@ def twilio_status():
         cur.execute("""
             SELECT tenant, cuil, period, to_whatsapp
             FROM sent_pdfs
-            WHERE message_sid = %s
+            WHERE message_sid = ?
             LIMIT 1
         """, (sid,))
         r = cur.fetchone()
 
         if r:
-            tenant = r['tenant']
-            cuil = r['cuil']
-            period = r['period']
-            to_whatsapp = r['to_whatsapp']
+            tenant, cuil, period, to_whatsapp = r
             # creamos fila mínima en message_status para que el callback pueda registrar delivered/read
             cur.execute("""
-                INSERT INTO message_status
+                INSERT OR IGNORE INTO message_status
                 (message_sid, to_whatsapp, tenant, cuil, period, nombre, kind, created_at, last_status, last_status_at)
-                VALUES (%s, %s, %s, %s, %s, '', 'media', %s, %s, %s)
-                ON CONFLICT (message_sid) DO NOTHING
+                VALUES (?, ?, ?, ?, ?, '', 'media', ?, ?, ?)
             """, (sid, to_whatsapp, tenant, cuil, period, now, status, now))
 
             # volver a aplicar update (por si insertó recién)
             cur.execute("""
                 UPDATE message_status
-                SET last_status = %s, last_status_at = %s,
-                    error_code = CASE WHEN %s != '' THEN %s ELSE error_code END,
-                    error_message = CASE WHEN %s != '' THEN %s ELSE error_message END
-                WHERE message_sid = %s
+                SET last_status = ?, last_status_at = ?,
+                    error_code = CASE WHEN ? != '' THEN ? ELSE error_code END,
+                    error_message = CASE WHEN ? != '' THEN ? ELSE error_message END
+                WHERE message_sid = ?
             """, (status, now, error_code, error_code, error_message, error_message, sid))
 
     # 3) timestamps por estado
@@ -4548,71 +3500,66 @@ def twilio_status():
     if status == "delivered":
         cur.execute("""
             UPDATE message_status
-            SET delivered_at = COALESCE(delivered_at, %s)
-            WHERE message_sid = %s
+            SET delivered_at = COALESCE(delivered_at, ?)
+            WHERE message_sid = ?
         """, (now, sid))
         
         # ✅ TAMBIÉN actualizar sent_pdfs
         cur.execute("""
             UPDATE sent_pdfs
-            SET delivered_at = COALESCE(delivered_at, %s),
+            SET delivered_at = COALESCE(delivered_at, ?),
                 status = 'delivered'
-            WHERE message_sid = %s
+            WHERE message_sid = ?
         """, (now, sid))
 
     # 3) timestamps por estado
     if status == "delivered":
         cur.execute("""
             UPDATE message_status
-            SET delivered_at = COALESCE(delivered_at, %s)
-            WHERE message_sid = %s
+            SET delivered_at = COALESCE(delivered_at, ?)
+            WHERE message_sid = ?
         """, (now, sid))
         
         # ✅ TAMBIÉN actualizar sent_pdfs
         cur.execute("""
             UPDATE sent_pdfs
-            SET delivered_at = COALESCE(delivered_at, %s),
+            SET delivered_at = COALESCE(delivered_at, ?),
                 status = 'delivered'
-            WHERE message_sid = %s
+            WHERE message_sid = ?
         """, (now, sid))
 
     if status == "failed":
         cur.execute("""
             UPDATE message_status
-            SET failed_at = COALESCE(failed_at, %s),
-                error_code = COALESCE(NULLIF(%s, ''), error_code),
-                error_message = COALESCE(NULLIF(%s, ''), error_message)
-            WHERE message_sid = %s
+            SET failed_at = COALESCE(failed_at, ?),
+                error_code = COALESCE(NULLIF(?, ''), error_code),
+                error_message = COALESCE(NULLIF(?, ''), error_message)
+            WHERE message_sid = ?
         """, (now, error_code, error_message, sid))
-
+        
         # ✅ TAMBIÉN actualizar sent_pdfs
         cur.execute("""
             UPDATE sent_pdfs
-            SET failed_at = COALESCE(failed_at, %s),
-                error_code = COALESCE(NULLIF(%s, ''), error_code),
-                error_message = COALESCE(NULLIF(%s, ''), error_message),
+            SET failed_at = COALESCE(failed_at, ?),
+                error_code = COALESCE(NULLIF(?, ''), error_code),
+                error_message = COALESCE(NULLIF(?, ''), error_message),
                 status = 'failed'
-            WHERE message_sid = %s
+            WHERE message_sid = ?
         """, (now, error_code, error_message, sid))
 
     # 4) SIGN después de delivered (solo INITIAL)
         # 4) SIGN después de delivered (solo INITIAL) + estado A_FINALIZAR
     if status == "delivered":
         cur.execute("""
-            SELECT tenant, cuil, period, to_whatsapp, sign_sent_at, COALESCE(origin, 'INITIAL') AS origin
+            SELECT tenant, cuil, period, to_whatsapp, sign_sent_at, COALESCE(origin, 'INITIAL')
             FROM sent_pdfs
-            WHERE message_sid = %s
+            WHERE message_sid = ?
             LIMIT 1
         """, (sid,))
         row = cur.fetchone()
 
         if row:
-            tenant = row['tenant']
-            cuil = row['cuil']
-            period = row['period']
-            to_whatsapp = row['to_whatsapp']
-            sign_sent_at = row['sign_sent_at']
-            origin = row['origin']
+            tenant, cuil, period, to_whatsapp, sign_sent_at, origin = row
             tenant = (tenant or "").strip().lower()
             cuil = norm_cuil(cuil)
             period = norm_period_label(period)
@@ -4621,7 +3568,7 @@ def twilio_status():
             # ✅ Marcar A_FINALIZAR al entregar (pero NO pisar si ya está FIRMADO/OBSERVADO)
             cur.execute("""
                 INSERT INTO recibo_estado (tenant, cuil, period, estado, updated_at)
-                VALUES (%s, %s, %s, 'A_FINALIZAR', %s)
+                VALUES (?, ?, ?, 'A_FINALIZAR', ?)
                 ON CONFLICT(tenant, cuil, period) DO UPDATE SET
                   estado='A_FINALIZAR',
                   updated_at=excluded.updated_at
@@ -4631,18 +3578,17 @@ def twilio_status():
             # 🔒 Si ya está cerrado, no mandes firma
             cur.execute("""
                 SELECT estado FROM recibo_estado
-                WHERE tenant=%s AND cuil=%s AND period=%s
+                WHERE tenant=? AND cuil=? AND period=?
                 LIMIT 1
             """, (tenant, cuil, period))
-            _est_row = cur.fetchone()
-            est = _est_row['estado'] if _est_row else None
+            est = (cur.fetchone() or [None])[0]
 
             # Si es reenvío, NO firmar nunca
             if origin != "INITIAL":
-                log.info("%s %s %s %s", "SKIP SIGN AFTER PDF (origin=", origin, "):", sid)
+                print("SKIP SIGN AFTER PDF (origin=", origin, "):", sid)
 
             elif est in ("FIRMADO", "OBSERVADO"):
-                log.info("%s %s %s %s %s", "SKIP SIGN (already closed):", tenant, cuil, period, est)
+                print("SKIP SIGN (already closed):", tenant, cuil, period, est)
 
             else:
                 if not sign_sent_at and TWILIO_SIGN_TEMPLATE_SID:
@@ -4654,16 +3600,15 @@ def twilio_status():
                         )
 
                         cur.execute("""
-                            INSERT INTO message_status
+                            INSERT OR IGNORE INTO message_status
                             (message_sid, to_whatsapp, tenant, cuil, period, kind, created_at, last_status, last_status_at)
-                            VALUES (%s, %s, %s, %s, %s, 'sign', %s, 'sent', %s)
-                            ON CONFLICT (message_sid) DO NOTHING
+                            VALUES (?, ?, ?, ?, ?, 'sign', ?, 'sent', ?)
                         """, (sid_sign, to_whatsapp, tenant, cuil, period, now, now))
 
-                        cur.execute("UPDATE sent_pdfs SET sign_sent_at = %s WHERE message_sid = %s", (now, sid))
-                        log.info("%s %s", "SENT SIGN AFTER PDF DELIVERED:", sid_sign)
+                        cur.execute("UPDATE sent_pdfs SET sign_sent_at = ? WHERE message_sid = ?", (now, sid))
+                        print("SENT SIGN AFTER PDF DELIVERED:", sid_sign)
                     except Exception as e:
-                        log.warning("%s %s", "WARN: could not send SIGN:", e)
+                        print("WARN: could not send SIGN:", e)
 
 
     conn.commit()
@@ -4673,16 +3618,18 @@ def twilio_status():
 
 def is_template_sid(message_sid: str) -> bool:
     conn = get_db_connection()
+    conn.row_factory = sqlite3.Row
     cur = conn.cursor()
-    cur.execute("SELECT 1 FROM sent_templates WHERE message_sid=%s LIMIT 1;", (message_sid,))
+    cur.execute("SELECT 1 FROM sent_templates WHERE message_sid=? LIMIT 1;", (message_sid,))
     row = cur.fetchone()
     conn.close()
     return bool(row)
 
 def get_sent_pdf_by_sid(message_sid: str) -> dict | None:
     conn = get_db_connection()
+    conn.row_factory = sqlite3.Row
     cur = conn.cursor()
-    cur.execute("SELECT tenant,cuil,period,to_whatsapp,sign_sent_at FROM sent_pdfs WHERE message_sid=%s LIMIT 1;", (message_sid,))
+    cur.execute("SELECT tenant,cuil,period,to_whatsapp,sign_sent_at FROM sent_pdfs WHERE message_sid=? LIMIT 1;", (message_sid,))
     row = cur.fetchone()
     conn.close()
     return dict(row) if row else None
@@ -4691,49 +3638,23 @@ def mark_sign_sent(pdf_sid: str):
     now = int(time.time())
     conn = get_db_connection()
     cur = conn.cursor()
-    cur.execute("UPDATE sent_pdfs SET sign_sent_at=%s WHERE message_sid=%s;", (now, pdf_sid))
+    cur.execute("UPDATE sent_pdfs SET sign_sent_at=? WHERE message_sid=?;", (now, pdf_sid))
     conn.commit()
     conn.close()
 
 
-import psycopg2
-from psycopg2.extras import RealDictCursor
+
 
 # =========================
 # DB: pending view + estado firma
 # =========================
 DB_PATH = os.environ.get("DB_PATH", "/data/app.db")
 
+
 def get_db_connection():
-    DATABASE_URL = os.environ.get("DATABASE_URL")
-    if not DATABASE_URL:
-        raise RuntimeError("Falta DATABASE_URL en ENV (la app requiere PostgreSQL)")
-    conn = psycopg2.connect(DATABASE_URL)
-    conn.cursor_factory = RealDictCursor
-    # Red de seguridad contra fugas: registramos la conexión para cerrarla al final
-    # del request si algún handler la dejó abierta (p. ej. por una excepción).
-    if has_app_context():
-        if not hasattr(g, "_db_conns"):
-            g._db_conns = []
-        g._db_conns.append(conn)
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
     return conn
-
-
-@app.teardown_appcontext
-def _close_leaked_db_connections(exc):
-    conns = getattr(g, "_db_conns", None) or []
-    for conn in conns:
-        try:
-            if getattr(conn, "closed", 1) == 0:
-                try:
-                    conn.rollback()
-                except Exception:
-                    pass
-                conn.close()
-        except Exception:
-            pass
-    g._db_conns = []
-
 
 def get_latest_context_for_whatsapp(to_whatsapp: str) -> dict | None:
     """
@@ -4741,11 +3662,12 @@ def get_latest_context_for_whatsapp(to_whatsapp: str) -> dict | None:
     mirando message_status (template/pdf).
     """
     conn = get_db_connection()
+    conn.row_factory = sqlite3.Row
     cur = conn.cursor()
     cur.execute("""
         SELECT tenant, cuil, period
         FROM message_status
-        WHERE to_whatsapp = %s
+        WHERE to_whatsapp = ?
           AND COALESCE(tenant,'') != ''
           AND COALESCE(cuil,'') != ''
         ORDER BY COALESCE(created_at,0) DESC, id DESC
@@ -4793,12 +3715,12 @@ def get_receipt_request_count(tenant: str, cuil: str, period: str, to_whatsapp: 
     cur.execute("""
         SELECT request_count
         FROM receipt_requests
-        WHERE tenant=%s AND cuil=%s AND period=%s AND to_whatsapp=%s
+        WHERE tenant=? AND cuil=? AND period=? AND to_whatsapp=?
         LIMIT 1
     """, (tenant, cuil, period, to_whatsapp))
     row = cur.fetchone()
     conn.close()
-    return int(row['request_count']) if row and row['request_count'] is not None else 0
+    return int(row[0]) if row and row[0] is not None else 0
 
 
 def inc_receipt_request_count(tenant: str, cuil: str, period: str, to_whatsapp: str) -> int:
@@ -4810,27 +3732,25 @@ def inc_receipt_request_count(tenant: str, cuil: str, period: str, to_whatsapp: 
     cur.execute("""
         SELECT id, request_count, first_requested_at
         FROM receipt_requests
-        WHERE tenant=%s AND cuil=%s AND period=%s AND to_whatsapp=%s
+        WHERE tenant=? AND cuil=? AND period=? AND to_whatsapp=?
         LIMIT 1
     """, (tenant, cuil, period, to_whatsapp))
     row = cur.fetchone()
 
     if row:
-        rid = row['id']
-        cnt = row['request_count']
-        first_ts = row['first_requested_at']
+        rid, cnt, first_ts = row
         cnt = int(cnt or 0) + 1
         cur.execute("""
             UPDATE receipt_requests
-            SET request_count=%s, last_requested_at=%s
-            WHERE id=%s
+            SET request_count=?, last_requested_at=?
+            WHERE id=?
         """, (cnt, now, rid))
     else:
         cnt = 1
         cur.execute("""
             INSERT INTO receipt_requests
             (tenant,cuil,period,to_whatsapp,request_count,first_requested_at,last_requested_at)
-            VALUES (%s,%s,%s,%s,%s,%s,%s)
+            VALUES (?,?,?,?,?,?,?)
         """, (tenant, cuil, period, to_whatsapp, cnt, now, now))
 
     conn.commit()
@@ -4840,18 +3760,15 @@ def inc_receipt_request_count(tenant: str, cuil: str, period: str, to_whatsapp: 
 
 
 def get_origin_by_message_sid(message_sid: str) -> str | None:
-    conn = get_db_connection()
-    try:
+    with sqlite3.connect(DB_PATH) as conn:
         cur = conn.cursor()
         cur.execute("""
             SELECT origin FROM receipt_request_events
-            WHERE message_sid = %s
+            WHERE message_sid = ?
             ORDER BY id DESC LIMIT 1
         """, (message_sid,))
         row = cur.fetchone()
-    finally:
-        conn.close()
-    return row['origin'] if row and row['origin'] else None
+    return row[0] if row and row[0] else None
 
 
 def _log_receipt_request_event(
@@ -4867,17 +3784,12 @@ def _log_receipt_request_event(
     ts = int(time.time())
     origin = origin or source
 
-    conn = get_db_connection()
+    conn = sqlite3.connect(DB_PATH)
     try:
         cur = conn.cursor()
 
         # 2) Ver columnas actuales
-        cur.execute("""
-            SELECT column_name AS name
-            FROM information_schema.columns
-            WHERE table_name = 'receipt_request_events'
-        """)
-        cols = {r['name'] for r in cur.fetchall()}
+        cols = {r[1] for r in cur.execute("PRAGMA table_info(receipt_request_events)").fetchall()}
 
         def _add_col(colname: str, coltype: str):
             nonlocal cols
@@ -4923,14 +3835,14 @@ def _log_receipt_request_event(
             data["whatsapp"] = to_whatsapp
 
         insert_cols = [k for k in data.keys() if k in cols]
-        placeholders = ",".join(["%s"] * len(insert_cols))
+        placeholders = ",".join(["?"] * len(insert_cols))
         sql = f"INSERT INTO receipt_request_events ({','.join(insert_cols)}) VALUES ({placeholders})"
 
         cur.execute(sql, tuple(data[k] for k in insert_cols))
         conn.commit()
 
     except Exception as e:
-        log.warning("%s %s", "WARN: _log_receipt_request_event failed:", e)
+        print("WARN: _log_receipt_request_event failed:", e)
         try:
             conn.rollback()
         except Exception:
@@ -4943,21 +3855,21 @@ def _log_receipt_request_event(
 def get_receipt_event_origin_by_sid(message_sid: str) -> str | None:
     if not message_sid:
         return None
-    conn = get_db_connection()
+    conn = sqlite3.connect(DB_PATH)
     try:
         cur = conn.cursor()
         # origin puede ser NULL en filas viejas
         cur.execute("""
             SELECT origin, source
             FROM receipt_request_events
-            WHERE message_sid = %s
+            WHERE message_sid = ?
             ORDER BY id DESC
             LIMIT 1
         """, (message_sid,))
         row = cur.fetchone()
         if not row:
             return None
-        return row['origin'] or row['source']  # origin si existe, si no source
+        return row[0] or row[1]  # origin si existe, si no source
     finally:
         conn.close()
 
@@ -4973,110 +3885,14 @@ def _try_alter(cur, sql: str):
 
 def init_db():
     conn = get_db_connection()
-    # ⚠️ Autocommit: en Postgres, si UNA sentencia falla, la transacción entera
-    # queda "abortada" y todo lo que sigue se descarta en silencio (los
-    # _try_alter de abajo fallan a propósito cuando la columna ya existe).
-    # Con autocommit cada sentencia se aplica por separado: un ALTER fallido
-    # ya no arrastra a los CREATE que vienen después.
-    conn.autocommit = True
     cur = conn.cursor()
-    
-    DATABASE_URL = os.environ.get("DATABASE_URL")
-    
-    if not DATABASE_URL:
-        # SQLite only
-        cur.execute("PRAGMA journal_mode=WAL;")
-        cur.execute("PRAGMA foreign_keys=ON;")
 
-    if DATABASE_URL:
-        # PostgreSQL - tablas ya creadas, solo agregar columnas faltantes
-        _try_alter(cur, "ALTER TABLE pending_views ADD COLUMN IF NOT EXISTS step TEXT;")
-        _try_alter(cur, "ALTER TABLE pending_views ADD COLUMN IF NOT EXISTS dni_attempts INTEGER;")
-        _try_alter(cur, "ALTER TABLE pending_views ADD COLUMN IF NOT EXISTS origin TEXT;")
-        _try_alter(cur, "ALTER TABLE pending_views ADD COLUMN IF NOT EXISTS period_offset INTEGER DEFAULT 0;")
-        _try_alter(cur, "ALTER TABLE message_status ADD COLUMN IF NOT EXISTS to_whatsapp TEXT;")
-        _try_alter(cur, "ALTER TABLE message_status ADD COLUMN IF NOT EXISTS tenant TEXT;")
-        _try_alter(cur, "ALTER TABLE message_status ADD COLUMN IF NOT EXISTS cuil TEXT;")
-        _try_alter(cur, "ALTER TABLE message_status ADD COLUMN IF NOT EXISTS period TEXT;")
-        _try_alter(cur, "ALTER TABLE message_status ADD COLUMN IF NOT EXISTS nombre TEXT;")
-        _try_alter(cur, "ALTER TABLE message_status ADD COLUMN IF NOT EXISTS kind TEXT;")
-        _try_alter(cur, "ALTER TABLE message_status ADD COLUMN IF NOT EXISTS created_at BIGINT;")
-        _try_alter(cur, "ALTER TABLE message_status ADD COLUMN IF NOT EXISTS last_status TEXT;")
-        _try_alter(cur, "ALTER TABLE message_status ADD COLUMN IF NOT EXISTS last_status_at BIGINT;")
-        _try_alter(cur, "ALTER TABLE message_status ADD COLUMN IF NOT EXISTS delivered_at BIGINT;")
-        _try_alter(cur, "ALTER TABLE message_status ADD COLUMN IF NOT EXISTS read_at BIGINT;")
-        _try_alter(cur, "ALTER TABLE message_status ADD COLUMN IF NOT EXISTS failed_at BIGINT;")
-        _try_alter(cur, "ALTER TABLE message_status ADD COLUMN IF NOT EXISTS error_code TEXT;")
-        _try_alter(cur, "ALTER TABLE message_status ADD COLUMN IF NOT EXISTS error_message TEXT;")
-        _try_alter(cur, "ALTER TABLE sent_pdfs ADD COLUMN IF NOT EXISTS sign_sent_at BIGINT;")
-        _try_alter(cur, "ALTER TABLE sent_pdfs ADD COLUMN IF NOT EXISTS origin TEXT;")
-        _try_alter(cur, "ALTER TABLE sent_pdfs ADD COLUMN IF NOT EXISTS delivered_at BIGINT;")
-        _try_alter(cur, "ALTER TABLE sent_pdfs ADD COLUMN IF NOT EXISTS read_at BIGINT;")
-        _try_alter(cur, "ALTER TABLE sent_pdfs ADD COLUMN IF NOT EXISTS failed_at BIGINT;")
-        _try_alter(cur, "ALTER TABLE sent_pdfs ADD COLUMN IF NOT EXISTS error_code TEXT;")
-        _try_alter(cur, "ALTER TABLE sent_pdfs ADD COLUMN IF NOT EXISTS error_message TEXT;")
-        _try_alter(cur, "ALTER TABLE sent_pdfs ADD COLUMN IF NOT EXISTS status TEXT;")
-        _try_alter(cur, "ALTER TABLE recibo_estado ADD COLUMN IF NOT EXISTS to_whatsapp TEXT;")
-        _try_alter(cur, "ALTER TABLE recibo_estado ADD COLUMN IF NOT EXISTS observaciones TEXT;")
-        _try_alter(cur, "ALTER TABLE recibo_estado ADD COLUMN IF NOT EXISTS created_at BIGINT;")
-        _try_alter(cur, "ALTER TABLE receipt_request_events ADD COLUMN IF NOT EXISTS requested_at BIGINT;")
-        _try_alter(cur, "ALTER TABLE receipt_request_events ADD COLUMN IF NOT EXISTS created_at BIGINT;")
-        _try_alter(cur, "ALTER TABLE receipt_request_events ADD COLUMN IF NOT EXISTS whatsapp TEXT;")
-        _try_alter(cur, "ALTER TABLE verifications ADD COLUMN IF NOT EXISTS nombre TEXT;")
-        _try_alter(cur, "ALTER TABLE verifications ADD COLUMN IF NOT EXISTS dni_hash TEXT;")
-        _try_alter(cur, "ALTER TABLE verifications ADD COLUMN IF NOT EXISTS dni_last4 TEXT;")
+    cur.execute("PRAGMA journal_mode=WAL;")
+    cur.execute("PRAGMA synchronous=NORMAL;")
 
-        # ✅ NUEVO: certificados médicos recibidos (PostgreSQL)
-        cur.execute('''
-            CREATE TABLE IF NOT EXISTS certificados (
-                id SERIAL PRIMARY KEY,
-                tenant TEXT NOT NULL,
-                cuil TEXT NOT NULL,
-                nombre TEXT,
-                to_whatsapp TEXT,
-                file_id TEXT NOT NULL,
-                file_name TEXT,
-                mime_type TEXT,
-                created_at BIGINT NOT NULL
-            )
-        ''')
-        _try_alter(cur, "ALTER TABLE certificados ADD COLUMN IF NOT EXISTS tipo TEXT DEFAULT 'medico';")
-        _try_alter(cur, "CREATE INDEX IF NOT EXISTS idx_cert_tenant ON certificados(tenant, created_at);")
-        _try_alter(cur, "CREATE INDEX IF NOT EXISTS idx_cert_tenant_tipo ON certificados(tenant, tipo, created_at);")
-
-        # Branding del portal por empresa (logo + color de acento)
-        cur.execute("""
-          CREATE TABLE IF NOT EXISTS tenant_branding (
-            tenant TEXT PRIMARY KEY,
-            accent TEXT DEFAULT '',
-            logo BYTEA,
-            logo_mime TEXT DEFAULT '',
-            updated_at BIGINT
-          );
-        """)
-
-        # Preferencias de apariencia por usuario del portal (nivel 2)
-        cur.execute("""
-          CREATE TABLE IF NOT EXISTS portal_user_prefs (
-            user_id BIGINT PRIMARY KEY,
-            theme TEXT DEFAULT '',
-            font TEXT DEFAULT '',
-            font_size TEXT DEFAULT '',
-            density TEXT DEFAULT '',
-            motion TEXT DEFAULT '',
-            avatar BYTEA,
-            avatar_mime TEXT DEFAULT '',
-            updated_at BIGINT
-          );
-        """)
-        _try_alter(cur, "ALTER TABLE portal_user_prefs ADD COLUMN IF NOT EXISTS density TEXT DEFAULT '';")
-        _try_alter(cur, "ALTER TABLE portal_user_prefs ADD COLUMN IF NOT EXISTS motion TEXT DEFAULT '';")
-
-        conn.commit()
-        conn.close()
-        return
-
-    # SQLite only - crear tablas
+    # =========
+    # pending_views
+    # =========
     cur.execute("""
     CREATE TABLE IF NOT EXISTS pending_views (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -5094,8 +3910,9 @@ def init_db():
     _try_alter(cur, "ALTER TABLE pending_views ADD COLUMN step TEXT;")
     _try_alter(cur, "ALTER TABLE pending_views ADD COLUMN dni_attempts INTEGER;")
     _try_alter(cur, "ALTER TABLE pending_views ADD COLUMN origin TEXT;")
-    _try_alter(cur, "ALTER TABLE pending_views ADD COLUMN period_offset INTEGER DEFAULT 0;")
+    _try_alter(cur, "ALTER TABLE pending_views ADD COLUMN period_offset INTEGER DEFAULT 0;")  # ← NUEVO
 
+    # (opcional pero recomendado) limpiar duplicados por to_whatsapp antes del índice único
     _try_alter(cur, """
     DELETE FROM pending_views
     WHERE id NOT IN (
@@ -5115,6 +3932,9 @@ def init_db():
     ON pending_views(to_whatsapp);
     """)
 
+    # =========
+    # recibo_estado
+    # =========
     cur.execute("""
       CREATE TABLE IF NOT EXISTS recibo_estado (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -5127,6 +3947,9 @@ def init_db():
       );
     """)
 
+    # =========
+    # message_status
+    # =========
     cur.execute("""
       CREATE TABLE IF NOT EXISTS message_status (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -5147,7 +3970,18 @@ def init_db():
         error_message TEXT
       );
     """)
+    for col, typ in [
+        ("to_whatsapp","TEXT"),("tenant","TEXT"),("cuil","TEXT"),("period","TEXT"),
+        ("nombre","TEXT"),("kind","TEXT"),("created_at","INTEGER"),
+        ("last_status","TEXT"),("last_status_at","INTEGER"),
+        ("delivered_at","INTEGER"),("read_at","INTEGER"),("failed_at","INTEGER"),
+        ("error_code","TEXT"),("error_message","TEXT"),
+    ]:
+        _try_alter(cur, f"ALTER TABLE message_status ADD COLUMN {col} {typ};")
 
+    # =========
+    # template_send_queue (cola de envíos de templates)
+    # =========
     cur.execute("""
     CREATE TABLE IF NOT EXISTS template_send_queue (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -5156,8 +3990,8 @@ def init_db():
         to_whatsapp TEXT NOT NULL,
         cuil TEXT NOT NULL,
         nombre TEXT,
-        require_pdf BOOLEAN DEFAULT TRUE,
-        status TEXT DEFAULT 'PENDING',
+        require_pdf INTEGER DEFAULT 1,
+        status TEXT DEFAULT 'PENDING',     -- PENDING | SENT | SKIPPED | FAILED
         error TEXT,
         created_at INTEGER NOT NULL,
         updated_at INTEGER,
@@ -5166,7 +4000,21 @@ def init_db():
         UNIQUE(tenant, period, to_whatsapp, cuil)
     );
     """)
+    _try_alter(cur, "ALTER TABLE template_send_queue ADD COLUMN nombre TEXT;")
+    _try_alter(cur, "ALTER TABLE template_send_queue ADD COLUMN require_pdf INTEGER;")
+    _try_alter(cur, "ALTER TABLE template_send_queue ADD COLUMN status TEXT;")
+    _try_alter(cur, "ALTER TABLE template_send_queue ADD COLUMN error TEXT;")
+    _try_alter(cur, "ALTER TABLE template_send_queue ADD COLUMN created_at INTEGER;")
+    _try_alter(cur, "ALTER TABLE template_send_queue ADD COLUMN updated_at INTEGER;")
+    _try_alter(cur, "ALTER TABLE template_send_queue ADD COLUMN sent_sid TEXT;")
+    _try_alter(cur, "ALTER TABLE template_send_queue ADD COLUMN sent_at INTEGER;")
 
+    _try_alter(cur, "CREATE INDEX IF NOT EXISTS idx_ts_queue_pending ON template_send_queue(status, tenant, period, created_at);")
+
+    
+    # =========
+    # sent_pdfs
+    # =========
     cur.execute("""
       CREATE TABLE IF NOT EXISTS sent_pdfs (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -5180,7 +4028,11 @@ def init_db():
         origin TEXT
       );
     """)
-
+    _try_alter(cur, "ALTER TABLE sent_pdfs ADD COLUMN sign_sent_at INTEGER;")
+    _try_alter(cur, "ALTER TABLE sent_pdfs ADD COLUMN origin TEXT;")
+    # =========
+    # verifications (ya la usás)
+    # =========
     cur.execute("""
       CREATE TABLE IF NOT EXISTS verifications (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -5195,7 +4047,15 @@ def init_db():
         UNIQUE(tenant, cuil, to_whatsapp)
       );
     """)
+    _try_alter(cur, "ALTER TABLE verifications ADD COLUMN nombre TEXT;")
+    _try_alter(cur, "ALTER TABLE verifications ADD COLUMN dni_hash TEXT;")
+    _try_alter(cur, "ALTER TABLE verifications ADD COLUMN dni_last4 TEXT;")
+    _try_alter(cur, "ALTER TABLE verifications ADD COLUMN verified_at INTEGER;")
+    _try_alter(cur, "ALTER TABLE verifications ADD COLUMN updated_at INTEGER;")
 
+    # =========
+    # ✅ NUEVO: receipt_requests (contador por período)
+    # =========
     cur.execute("""
       CREATE TABLE IF NOT EXISTS receipt_requests (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -5210,41 +4070,31 @@ def init_db():
       );
     """)
 
+    #    # =========
+    # ✅ NUEVO: receipt_request_events (log evento por evento)
+    # =========
     cur.execute("""
     CREATE TABLE IF NOT EXISTS receipt_request_events (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        tenant TEXT,
-        cuil TEXT,
-        period TEXT,
-        to_whatsapp TEXT,
-        source TEXT,
-        result TEXT,
-        message_sid TEXT,
-        created_at INTEGER,
-        origin TEXT
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    tenant TEXT,
+    cuil TEXT,
+    period TEXT,
+    to_whatsapp TEXT,
+    source TEXT,        -- VIEW_NOW, RESEND_LAST, DNI_OK, CHOOSE_PREVIOUS, USER_TEXT...
+    result TEXT,        -- SENT, ERROR, ASK_DNI, NO_CONTEXT, NO_PDF, BLOCKED_LIMIT...
+    message_sid TEXT,
+    created_at INTEGER, -- timestamp evento
+    origin TEXT         -- INITIAL / RESEND_LAST / CHOOSE_PREVIOUS (o el mismo source)
     )
     """)
+    
+    _try_alter(cur, "ALTER TABLE receipt_request_events ADD COLUMN created_at INTEGER;")
+    _try_alter(cur, "CREATE INDEX IF NOT EXISTS idx_rre_key ON receipt_request_events(tenant,cuil,period,to_whatsapp,created_at);")
 
-    cur.execute("""
-      CREATE TABLE IF NOT EXISTS terms_accepted (
-        whatsapp TEXT PRIMARY KEY,
-        accepted_at INTEGER NOT NULL,
-        ip_address TEXT,
-        user_agent TEXT
-      );
-    """)
 
-    cur.execute("""
-      CREATE TABLE IF NOT EXISTS pending_terms (
-        whatsapp TEXT PRIMARY KEY,
-        tenant TEXT,
-        cuil TEXT,
-        period TEXT,
-        origin TEXT DEFAULT 'INITIAL',
-        created_at INTEGER
-      );
-    """)
-
+    # =========
+    # ✅ NUEVO: inbound_dedup (para evitar doble procesamiento)
+    # =========
     cur.execute("""
       CREATE TABLE IF NOT EXISTS inbound_dedup (
         message_sid TEXT PRIMARY KEY,
@@ -5252,6 +4102,9 @@ def init_db():
       );
     """)
 
+    # ========================================
+    # Tabla para selección multi-tenant
+    # ========================================
     cur.execute("""
         CREATE TABLE IF NOT EXISTS multi_tenant_selection (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -5261,7 +4114,30 @@ def init_db():
             expires_at INTEGER NOT NULL
         )
     """)
+    
+    _try_alter(cur, """
+        CREATE INDEX IF NOT EXISTS idx_multi_tenant_expires 
+        ON multi_tenant_selection(expires_at)
+    """)
 
+
+
+    # índices útiles
+    _try_alter(cur, "CREATE INDEX IF NOT EXISTS idx_pending_to_created ON pending_views(to_whatsapp, created_at);")
+    _try_alter(cur, "CREATE INDEX IF NOT EXISTS idx_estado_key ON recibo_estado(tenant, cuil, period);")
+    _try_alter(cur, "CREATE INDEX IF NOT EXISTS idx_msg_key ON message_status(tenant, cuil, period, kind);")
+    _try_alter(cur, "CREATE INDEX IF NOT EXISTS idx_msg_sid ON message_status(message_sid);")
+    _try_alter(cur, "CREATE INDEX IF NOT EXISTS idx_sentpdfs_sid ON sent_pdfs(message_sid);")
+    _try_alter(cur, "CREATE INDEX IF NOT EXISTS idx_verif_tenant_cuil ON verifications(tenant, cuil);")
+    _try_alter(cur, "CREATE INDEX IF NOT EXISTS idx_verif_tenant_wa ON verifications(tenant, to_whatsapp);")
+    _try_alter(cur, "CREATE INDEX IF NOT EXISTS idx_rr_key ON receipt_requests(tenant, cuil, period, to_whatsapp);")
+    _try_alter(cur, "CREATE INDEX IF NOT EXISTS idx_rre_key ON receipt_request_events(tenant, cuil, period, to_whatsapp, created_at);")
+
+    # ========================================
+    # Tablas para portal de clientes
+    # ========================================
+    
+    # Usuarios del portal (uno por empresa)
     cur.execute("""
         CREATE TABLE IF NOT EXISTS client_users (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -5271,28 +4147,30 @@ def init_db():
             full_name TEXT,
             email TEXT,
             role TEXT DEFAULT 'admin',
-            active BOOLEAN DEFAULT TRUE,
-            must_change_password BOOLEAN DEFAULT TRUE,
+            active INTEGER DEFAULT 1,
+            must_change_password INTEGER DEFAULT 1,
             created_at INTEGER NOT NULL,
             last_login INTEGER,
             created_by TEXT,
             UNIQUE(tenant, username)
         )
     """)
-
+    
+    # Tokens para reset de contraseña
     cur.execute("""
         CREATE TABLE IF NOT EXISTS password_reset_tokens (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             user_id INTEGER NOT NULL,
             token TEXT NOT NULL,
             expires_at INTEGER NOT NULL,
-            used BOOLEAN DEFAULT FALSE,
+            used INTEGER DEFAULT 0,
             created_at INTEGER NOT NULL,
             UNIQUE(token),
             FOREIGN KEY(user_id) REFERENCES client_users(id)
         )
     """)
 
+    # Log de auditoría del portal
     cur.execute("""
         CREATE TABLE IF NOT EXISTS client_audit_log (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -5304,51 +4182,10 @@ def init_db():
             created_at INTEGER NOT NULL
         )
     """)
-
-    # ✅ NUEVO: certificados médicos recibidos (SQLite)
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS certificados (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            tenant TEXT NOT NULL,
-            cuil TEXT NOT NULL,
-            nombre TEXT,
-            to_whatsapp TEXT,
-            file_id TEXT NOT NULL,
-            file_name TEXT,
-            mime_type TEXT,
-            created_at INTEGER NOT NULL
-        )
-    """)
-    # Candado para avisar 1 sola vez por tanda de envío INITIAL (facturación)
-    cur.execute('''
-        CREATE TABLE IF NOT EXISTS template_batch_notice (
-            tenant TEXT NOT NULL,
-            period TEXT NOT NULL,
-            enviados INTEGER,
-            notified_at BIGINT NOT NULL,
-            PRIMARY KEY (tenant, period)
-        )
-    ''')
-
-    _try_alter(cur, "ALTER TABLE certificados ADD COLUMN tipo TEXT DEFAULT 'medico';")
-    _try_alter(cur, "CREATE INDEX IF NOT EXISTS idx_cert_tenant ON certificados(tenant, created_at);")
-    _try_alter(cur, "CREATE INDEX IF NOT EXISTS idx_cert_tenant_tipo ON certificados(tenant, tipo, created_at);")
-    _try_alter(cur, "CREATE INDEX IF NOT EXISTS idx_pending_to_created ON pending_views(to_whatsapp, created_at);")
-    _try_alter(cur, "CREATE INDEX IF NOT EXISTS idx_estado_key ON recibo_estado(tenant, cuil, period);")
-    _try_alter(cur, "CREATE INDEX IF NOT EXISTS idx_msg_key ON message_status(tenant, cuil, period, kind);")
-    _try_alter(cur, "CREATE INDEX IF NOT EXISTS idx_msg_sid ON message_status(message_sid);")
-    _try_alter(cur, "CREATE INDEX IF NOT EXISTS idx_sentpdfs_sid ON sent_pdfs(message_sid);")
-    _try_alter(cur, "CREATE INDEX IF NOT EXISTS idx_verif_tenant_cuil ON verifications(tenant, cuil);")
-    _try_alter(cur, "CREATE INDEX IF NOT EXISTS idx_verif_tenant_wa ON verifications(tenant, to_whatsapp);")
-    _try_alter(cur, "CREATE INDEX IF NOT EXISTS idx_rr_key ON receipt_requests(tenant, cuil, period, to_whatsapp);")
-    _try_alter(cur, "CREATE INDEX IF NOT EXISTS idx_rre_key ON receipt_request_events(tenant, cuil, period, to_whatsapp, created_at);")
-    _try_alter(cur, "CREATE INDEX IF NOT EXISTS idx_multi_tenant_expires ON multi_tenant_selection(expires_at);")
-    _try_alter(cur, "CREATE INDEX IF NOT EXISTS idx_ts_queue_pending ON template_send_queue(status, tenant, period, created_at);")
-
     conn.commit()
     conn.close()
 
-    
+
 init_db()
 
 def inbound_seen(message_sid: str) -> bool:
@@ -5357,9 +4194,8 @@ def inbound_seen(message_sid: str) -> bool:
     now = int(time.time())
     conn = get_db_connection()
     cur = conn.cursor()
-    cur.execute("INSERT INTO inbound_dedup(message_sid, created_at) VALUES (%s, %s) ON CONFLICT (message_sid) DO NOTHING", (message_sid, now))
+    cur.execute("INSERT OR IGNORE INTO inbound_dedup(message_sid, created_at) VALUES (?, ?)", (message_sid, now))
     conn.commit()
-    
     inserted = (cur.rowcount == 1)
     conn.close()
     return (not inserted)  # True si ya existía
@@ -5377,27 +4213,18 @@ def save_pdf_sid(tenant: str, cuil: str, period: str, to_whatsapp: str, message_
 
     # 1) histórico de PDFs
     cur.execute("""
-        INSERT INTO sent_pdfs
+        INSERT OR REPLACE INTO sent_pdfs
         (tenant, cuil, period, to_whatsapp, message_sid, created_at, sign_sent_at, origin)
-        VALUES (%s, %s, %s, %s, %s, COALESCE((SELECT created_at FROM sent_pdfs WHERE message_sid = %s), %s),
-                COALESCE((SELECT sign_sent_at FROM sent_pdfs WHERE message_sid = %s), NULL),
-                %s)
-        ON CONFLICT (message_sid) DO UPDATE SET
-            tenant = EXCLUDED.tenant,
-            cuil = EXCLUDED.cuil,
-            period = EXCLUDED.period,
-            to_whatsapp = EXCLUDED.to_whatsapp,
-            created_at = EXCLUDED.created_at,
-            sign_sent_at = EXCLUDED.sign_sent_at,
-            origin = EXCLUDED.origin
+        VALUES (?, ?, ?, ?, ?, COALESCE((SELECT created_at FROM sent_pdfs WHERE message_sid = ?), ?),
+                COALESCE((SELECT sign_sent_at FROM sent_pdfs WHERE message_sid = ?), NULL),
+                ?)
     """, (tenant, cuil, period, to_whatsapp, message_sid, message_sid, now, message_sid, origin))
 
     # 2) ✅ tracking para reportes + callbacks
     cur.execute("""
-        INSERT INTO message_status
+        INSERT OR IGNORE INTO message_status
         (message_sid, to_whatsapp, tenant, cuil, period, nombre, kind, created_at, last_status, last_status_at)
-        VALUES (%s, %s, %s, %s, %s, '', 'media', %s, 'sent', %s)
-        ON CONFLICT (message_sid) DO NOTHING
+        VALUES (?, ?, ?, ?, ?, '', 'media', ?, 'sent', ?)
     """, (message_sid, to_whatsapp, tenant, cuil, period, now, now))
 
     conn.commit()
@@ -5418,12 +4245,10 @@ def cuil_to_dni(cuil: str) -> str | None:
 
 import hashlib
 
-def _hash_dni(dni: str, tenant: str = "") -> tuple[str, str]:
-    """Hash de DNI + últimos 4 dígitos. Delega en _dni_hash() (salt por tenant)
-    para que toda la tabla verifications use un único esquema de hash."""
+def _hash_dni(dni: str) -> tuple[str, str]:
     dni_digits = "".join(ch for ch in (dni or "") if ch.isdigit())
     last4 = dni_digits[-4:] if len(dni_digits) >= 4 else dni_digits
-    h = _dni_hash(dni_digits, tenant) if dni_digits else ""
+    h = hashlib.sha256(dni_digits.encode("utf-8")).hexdigest() if dni_digits else ""
     return h, last4
 
 def is_verified(tenant: str, cuil: str, to_whatsapp: str) -> bool:
@@ -5435,14 +4260,14 @@ def is_verified(tenant: str, cuil: str, to_whatsapp: str) -> bool:
 
 def upsert_verification(tenant: str, cuil: str, to_whatsapp: str, dni: str | None = None):
     now = int(time.time())
-    dni_hash, dni_last4 = _hash_dni(dni or "", tenant)
+    dni_hash, dni_last4 = _hash_dni(dni or "")
     conn = get_db_connection()
     cur = conn.cursor()
 
     # Upsert “manual” compatible sin depender de UNIQUE en DB vieja
     cur.execute("""
       SELECT id FROM verifications
-      WHERE tenant=%s AND cuil=%s AND to_whatsapp=%s
+      WHERE tenant=? AND cuil=? AND to_whatsapp=?
       LIMIT 1
     """, (tenant, cuil, to_whatsapp))
     row = cur.fetchone()
@@ -5450,13 +4275,13 @@ def upsert_verification(tenant: str, cuil: str, to_whatsapp: str, dni: str | Non
     if row:
         cur.execute("""
           UPDATE verifications
-          SET dni_hash=%s, dni_last4=%s, updated_at=%s
-          WHERE id=%s
-        """, (dni_hash or None, dni_last4 or None, now, row['id']))
+          SET dni_hash=?, dni_last4=?, updated_at=?
+          WHERE id=?
+        """, (dni_hash or None, dni_last4 or None, now, row[0]))
     else:
         cur.execute("""
           INSERT INTO verifications (tenant, cuil, to_whatsapp, dni_hash, dni_last4, verified_at, updated_at)
-          VALUES (%s, %s, %s, %s, %s, %s, %s)
+          VALUES (?, ?, ?, ?, ?, ?, ?)
         """, (tenant, cuil, to_whatsapp, dni_hash or None, dni_last4 or None, now, now))
 
     conn.commit()
@@ -5467,7 +4292,7 @@ def delete_verification(tenant: str, cuil: str, to_whatsapp: str):
     cur = conn.cursor()
     cur.execute("""
       DELETE FROM verifications
-      WHERE tenant=%s AND cuil=%s AND to_whatsapp=%s
+      WHERE tenant=? AND cuil=? AND to_whatsapp=?
     """, (tenant, cuil, to_whatsapp))
     conn.commit()
     conn.close()
@@ -5484,7 +4309,7 @@ def get_verifications_rows(tenant: str):
             verified_at,
             updated_at
         FROM verifications
-        WHERE tenant=%s
+        WHERE tenant=?
         ORDER BY updated_at DESC, verified_at DESC
         LIMIT 1000
     """, (tenant,))
@@ -5496,7 +4321,6 @@ def get_verifications_rows(tenant: str):
 def norm_cuil_digits(x: str) -> str:
     return "".join(ch for ch in (x or "") if ch.isdigit())
 
-
 def is_verified_contact(tenant: str, cuil: str, to_whatsapp: str) -> bool:
     cuil_d = norm_cuil_digits(cuil)
     w = normalize_whatsapp(to_whatsapp)
@@ -5506,16 +4330,16 @@ def is_verified_contact(tenant: str, cuil: str, to_whatsapp: str) -> bool:
     cur.execute("""
       SELECT 1
       FROM verifications
-      WHERE tenant = %s
+      WHERE tenant = ?
         AND (
           -- match por cuil normalizado (saca guiones, espacios, etc.)
-          replace(replace(cuil, '-', ''), ' ', '') = %s
+          replace(replace(cuil, '-', ''), ' ', '') = ?
         )
         AND (
           -- match por whatsapp normalizado
-          to_whatsapp = %s
+          to_whatsapp = ?
           OR replace(replace(replace(to_whatsapp,'whatsapp:',''),'+',''),' ','') =
-             replace(replace(replace(%s,'whatsapp:',''),'+',''),' ','')
+             replace(replace(replace(?,'whatsapp:',''),'+',''),' ','')
         )
       LIMIT 1
     """, (tenant, cuil_d, w, w))
@@ -5527,8 +4351,7 @@ def is_verified_contact(tenant: str, cuil: str, to_whatsapp: str) -> bool:
 import hashlib
 
 def _dni_hash(dni: str, tenant: str) -> str:
-    # Hash canónico de DNI (salt por tenant). _hash_dni() delega acá:
-    # antes había dos esquemas distintos escribiendo en verifications.dni_hash.
+    # Salt simple por tenant (podés cambiar por SECRET_KEY si tenés)
     raw = f"{tenant}|{dni}".encode("utf-8")
     return hashlib.sha256(raw).hexdigest()
 
@@ -5544,7 +4367,7 @@ def set_verified_contact(tenant: str, cuil: str, to_whatsapp: str, dni: str, nom
 
     cur.execute("""
         INSERT INTO verifications (tenant, cuil, to_whatsapp, nombre, dni_hash, dni_last4, verified_at, updated_at)
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(tenant, cuil, to_whatsapp)
         DO UPDATE SET
             nombre = CASE
@@ -5580,7 +4403,7 @@ def admin_reset_reenvios():
             cur.execute(sql, params)
             return cur.rowcount
         except Exception as e:
-            log.warning("%s %s", "WARN reset_reenvios:", e)
+            print("WARN reset_reenvios:", e)
             return 0
 
     deleted = {}
@@ -5590,7 +4413,7 @@ def admin_reset_reenvios():
     if whatsapp:
         deleted["receipt_request_events"] = _safe("""
             DELETE FROM receipt_request_events
-            WHERE tenant=%s AND cuil=%s AND (whatsapp=%s OR to_whatsapp=%s)
+            WHERE tenant=? AND cuil=? AND (whatsapp=? OR to_whatsapp=?)
               AND (
                 origin='RESEND_LAST' OR source='RESEND_LAST'
               )
@@ -5598,7 +4421,7 @@ def admin_reset_reenvios():
     else:
         deleted["receipt_request_events"] = _safe("""
             DELETE FROM receipt_request_events
-            WHERE tenant=%s AND cuil=%s
+            WHERE tenant=? AND cuil=?
               AND (
                 origin='RESEND_LAST' OR source='RESEND_LAST'
               )
@@ -5618,10 +4441,9 @@ def admin_reset_reenvios():
 
 @app.get("/admin/send_template_preview")
 def admin_send_template_preview():
-    # Endpoint de acción por URL (dispara envíos): solo ADMIN_TOKEN, sin sesión.
-    # Mismo criterio que /admin/reset_reenvios — inmune a CSRF por link.
-    if not admin_token_valid():
-        return Response("Unauthorized (requiere token=ADMIN_TOKEN)", status=401)
+    auth = require_admin()
+    if auth:
+        return auth
 
     tenant = (request.args.get("tenant") or "").strip().lower()
     period_label = (request.args.get("period") or "").strip()  # "01/2026"
@@ -5748,7 +4570,7 @@ def precache_pdfs_for_period(tenant, period):
         # ✅ USAR LA FUNCIÓN CORRECTA
         folder_id = get_tenant_period_folder_id(tenant, period)
         if not folder_id:
-            log.warning(f"⚠️ No se encontró carpeta para {tenant}/{period}")
+            print(f"⚠️ No se encontró carpeta para {tenant}/{period}")
             return {}
         
         service = drive_service()
@@ -5768,27 +4590,26 @@ def precache_pdfs_for_period(tenant, period):
             if cuil:
                 cache[cuil] = f['id']
         
-        log.info(f"✅ Pre-cached {len(cache)} PDFs for {tenant}/{period}")
+        print(f"✅ Pre-cached {len(cache)} PDFs for {tenant}/{period}")
         return cache
         
     except Exception as e:
-        log.exception(f"❌ Error pre-caching PDFs: {e}")
+        print(f"❌ Error pre-caching PDFs: {e}")
         return {}
 
 def set_pending_step(pending_id: int, step: str):
     conn = get_db_connection()
     cur = conn.cursor()
-    cur.execute("UPDATE pending_views SET step=%s WHERE id=%s", (step, pending_id))
+    cur.execute("UPDATE pending_views SET step=? WHERE id=?", (step, pending_id))
     conn.commit()
     conn.close()
 
 def inc_pending_dni_attempts(pending_id: int) -> int:
     conn = get_db_connection()
     cur = conn.cursor()
-    cur.execute("UPDATE pending_views SET dni_attempts = COALESCE(dni_attempts,0) + 1 WHERE id=%s", (pending_id,))
-    cur.execute("SELECT dni_attempts FROM pending_views WHERE id=%s", (pending_id,))
-    _row = cur.fetchone()
-    n = _row['dni_attempts'] if _row and _row['dni_attempts'] is not None else 0
+    cur.execute("UPDATE pending_views SET dni_attempts = COALESCE(dni_attempts,0) + 1 WHERE id=?", (pending_id,))
+    cur.execute("SELECT dni_attempts FROM pending_views WHERE id=?", (pending_id,))
+    n = (cur.fetchone() or [0])[0]
     conn.commit()
     conn.close()
     return int(n)
@@ -5816,13 +4637,14 @@ def get_nombre_for_cuil(tenant: str, cuil: str) -> str:
         if not c_nombre or not c_arch:
             return ""
 
+        # normalizar cuil en df y comparar
         def norm(x):
             s = str(x or "").strip().replace(".pdf","")
             try:
                 s = strip_pdf(s)
             except Exception:
                 pass
-            return _digits(s)   # 👈 deja SOLO números: "20-44143190-3" → "20441431903"
+            return s
 
         target = norm(cuil)
         df["_cuil_norm"] = df[c_arch].apply(norm)
@@ -5836,6 +4658,7 @@ def get_nombre_for_cuil(tenant: str, cuil: str) -> str:
 
 def _db_fetchall_dict(sql, params=()):
     conn = get_db_connection()
+    conn.row_factory = sqlite3.Row
     cur = conn.cursor()
     cur.execute(sql, params)
     rows = [dict(r) for r in cur.fetchall()]
@@ -5845,17 +4668,17 @@ def _db_fetchall_dict(sql, params=()):
 def get_recibo_estado_rows(tenant: str, period_label: str = ""):
     if period_label:
         return _db_fetchall_dict(
-            "SELECT tenant,cuil,period,estado,updated_at FROM recibo_estado WHERE tenant=%s AND period=%s",
+            "SELECT tenant,cuil,period,estado,updated_at FROM recibo_estado WHERE tenant=? AND period=?",
             (tenant, period_label)
         )
     return _db_fetchall_dict(
-        "SELECT tenant,cuil,period,estado,updated_at FROM recibo_estado WHERE tenant=%s",
+        "SELECT tenant,cuil,period,estado,updated_at FROM recibo_estado WHERE tenant=?",
         (tenant,)
     )
 
 def get_verifications_rows_for_report(tenant: str):
     return _db_fetchall_dict(
-        "SELECT tenant,cuil,to_whatsapp,nombre,verified_at FROM verifications WHERE tenant=%s",
+        "SELECT tenant,cuil,to_whatsapp,nombre,verified_at FROM verifications WHERE tenant=?",
         (tenant,)
     )
 
@@ -5866,7 +4689,7 @@ def get_message_status_rows(tenant: str, period_label: str = ""):
             SELECT tenant,cuil,period,to_whatsapp,nombre,kind,created_at,last_status,last_status_at,
                    delivered_at,read_at,failed_at,error_code,error_message
             FROM message_status
-            WHERE tenant=%s AND period=%s
+            WHERE tenant=? AND period=?
             """,
             (tenant, period_label)
         )
@@ -5875,7 +4698,7 @@ def get_message_status_rows(tenant: str, period_label: str = ""):
         SELECT tenant,cuil,period,to_whatsapp,nombre,kind,created_at,last_status,last_status_at,
                delivered_at,read_at,failed_at,error_code,error_message
         FROM message_status
-        WHERE tenant=%s
+        WHERE tenant=?
         """,
         (tenant,)
     )
@@ -5950,7 +4773,7 @@ def norm_period_label(p: str) -> str:
     return f"{mm}/{yyyy}"
 
 from io import BytesIO
-
+import sqlite3
 import time
 import os
 from reportlab.platypus import Image
@@ -5992,7 +4815,7 @@ def generate_pdf_report_v2(tenant: str, period_filter: str = ""):
     """
     from io import BytesIO
     import time
-    
+    import sqlite3
 
     from reportlab.lib.pagesizes import A4, landscape
     from reportlab.lib.units import cm
@@ -6015,6 +4838,7 @@ def generate_pdf_report_v2(tenant: str, period_filter: str = ""):
 
     # ========= DB =========
     conn = get_db_connection()
+    conn.row_factory = sqlite3.Row
     cur = conn.cursor()
 
     cur.execute("""
@@ -6023,21 +4847,21 @@ def generate_pdf_report_v2(tenant: str, period_filter: str = ""):
             created_at, delivered_at, read_at, failed_at,
             last_status, last_status_at
         FROM message_status
-        WHERE tenant = %s
+        WHERE tenant = ?
     """, (tenant,))
     msg_rows = cur.fetchall()
 
     cur.execute("""
         SELECT tenant, cuil, period, estado, updated_at
         FROM recibo_estado
-        WHERE tenant = %s
+        WHERE tenant = ?
     """, (tenant,))
     estado_rows = cur.fetchall()
 
     cur.execute("""
         SELECT tenant,cuil,period,to_whatsapp,request_count,last_requested_at
         FROM receipt_requests
-        WHERE tenant = %s
+        WHERE tenant = ?
     """, (tenant,))
     rr_rows = cur.fetchall()
 
@@ -6481,7 +5305,6 @@ def generate_pdf_report_v2(tenant: str, period_filter: str = ""):
 
 
 @app.get("/admin/report_recibos.pdf")
-@admin_required
 def admin_report_recibos_pdf():
     token = _get_admin_token_from_request()
     tenant = (request.args.get("tenant") or "").strip().lower()
@@ -6502,7 +5325,6 @@ def admin_report_recibos_pdf():
 
 
 @app.get("/admin/report_recibos.xlsx")
-@admin_required
 def admin_report_recibos_xlsx():
     token = _get_admin_token_from_request()
     tenant = (request.args.get("tenant") or "").strip().lower()
@@ -6532,16 +5354,16 @@ def list_verifications(tenant: str, q: str = ""):
     sql = """
       SELECT id, tenant, cuil, to_whatsapp, nombre, dni_last4, verified_at, updated_at
       FROM verifications
-      WHERE tenant = %s
+      WHERE tenant = ?
     """
 
     if q:
         sql += """
           AND (
-            lower(cuil) LIKE %s
-            OR lower(to_whatsapp) LIKE %s
-            OR lower(COALESCE(nombre,'')) LIKE %s
-            OR lower(COALESCE(dni_last4,'')) LIKE %s
+            lower(cuil) LIKE ?
+            OR lower(to_whatsapp) LIKE ?
+            OR lower(ifnull(nombre,'')) LIKE ?
+            OR lower(ifnull(dni_last4,'')) LIKE ?
           )
         """
         like = f"%{q}%"
@@ -6550,7 +5372,7 @@ def list_verifications(tenant: str, q: str = ""):
     sql += " ORDER BY updated_at DESC, verified_at DESC LIMIT 200"
 
     cur.execute(sql, params)
-    rows = [dict(r) for r in cur.fetchall()]
+    rows = [dict(zip([c[0] for c in cur.description], r)) for r in cur.fetchall()]
     conn.close()
     return rows
 
@@ -6558,8 +5380,9 @@ def list_verifications(tenant: str, q: str = ""):
 
 def get_pdf_by_sid(sid):
     conn = get_db_connection()
+    conn.row_factory = sqlite3.Row
     cur = conn.cursor()
-    cur.execute("SELECT * FROM sent_pdfs WHERE message_sid = %s", (sid,))
+    cur.execute("SELECT * FROM sent_pdfs WHERE message_sid = ?", (sid,))
     row = cur.fetchone()
     conn.close()
     return dict(row) if row else None
@@ -6568,11 +5391,20 @@ def get_pdf_by_sid(sid):
 from functools import wraps
 from flask import request, Response
 
-# (_get_admin_token_from_request y admin_required están definidos arriba,
-#  junto a los demás helpers de auth: los decoradores se evalúan al importar
-#  y acá quedaban DESPUÉS de su primer uso.)
+def _get_admin_token_from_request() -> str:
+    return (request.args.get("token") or request.form.get("token") or "").strip()
+
+def admin_required(fn):
+    @wraps(fn)
+    def wrapper(*args, **kwargs):
+        tok = _get_admin_token_from_request()
+        if not ADMIN_TOKEN or tok != ADMIN_TOKEN:
+            return Response("Unauthorized", status=401)
+        return fn(*args, **kwargs)
+    return wrapper
 
 
+import sqlite3, time
 
 def add_pending_view(to_whatsapp: str, tenant: str, cuil: str, period: str, origin: str = "INITIAL"):
     now = int(time.time())
@@ -6582,7 +5414,7 @@ def add_pending_view(to_whatsapp: str, tenant: str, cuil: str, period: str, orig
     cur.execute("""
       INSERT INTO pending_views
         (to_whatsapp, tenant, cuil, period, created_at, step, dni_attempts, origin)
-      VALUES (%s, %s, %s, %s, %s, 'READY', 0, %s)
+      VALUES (?, ?, ?, ?, ?, 'READY', 0, ?)
       ON CONFLICT(to_whatsapp) DO UPDATE SET
         tenant=excluded.tenant,
         cuil=excluded.cuil,
@@ -6614,7 +5446,7 @@ def get_latest_pending_view(to_whatsapp: str):
         COALESCE(origin, 'INITIAL') AS origin,
         COALESCE(period_offset, 0) AS period_offset
       FROM pending_views
-      WHERE to_whatsapp=%s
+      WHERE to_whatsapp=?
       ORDER BY created_at DESC
       LIMIT 1
     """, (to_whatsapp,))
@@ -6633,7 +5465,7 @@ def get_latest_pending_view(to_whatsapp: str):
 def consume_pending_view(pending_id: int):
     conn = get_db_connection()
     cur = conn.cursor()
-    cur.execute("DELETE FROM pending_views WHERE id=%s;", (pending_id,))
+    cur.execute("DELETE FROM pending_views WHERE id=?;", (pending_id,))
     conn.commit()
     conn.close()
 
@@ -6649,16 +5481,16 @@ def set_recibo_estado(tenant: str, cuil: str, period: str, estado: str):
 
     cur.execute("""
         SELECT estado FROM recibo_estado
-        WHERE tenant=%s AND cuil=%s AND period=%s
+        WHERE tenant=? AND cuil=? AND period=?
     """, (tenant, cuil, period))
     row = cur.fetchone()
-    if row and (row['estado'] or "").strip().upper() == "FIRMADO":
+    if row and (row[0] or "").strip().upper() == "FIRMADO":
         conn.close()
         return
 
     cur.execute("""
       INSERT INTO recibo_estado (tenant, cuil, period, estado, updated_at)
-      VALUES (%s, %s, %s, %s, %s)
+      VALUES (?, ?, ?, ?, ?)
       ON CONFLICT(tenant, cuil, period) DO UPDATE SET
         estado=excluded.estado,
         updated_at=excluded.updated_at;
@@ -6667,329 +5499,17 @@ def set_recibo_estado(tenant: str, cuil: str, period: str, estado: str):
     conn.close()
 
 
-def generate_signature_certificate_pdf(tenant: str, cuil: str, period: str) -> bytes | None:
-    """
-    Genera una constancia de firma de recibo en PDF (bytes).
-    Devuelve None si el recibo todavía NO está FIRMADO ni OBSERVADO.
-    """
-    from io import BytesIO
-    import datetime as _dt
-    from reportlab.lib.pagesizes import A4
-    from reportlab.lib.units import cm
-    from reportlab.lib import colors
-    from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
-    from reportlab.platypus import (
-        SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer,
-    )
-
-    tenant = (tenant or "").strip().lower()
-    cuil = norm_cuil(cuil)
-    period = norm_period_label(period)
-
-    try:
-        from zoneinfo import ZoneInfo
-        _AR_TZ = ZoneInfo("America/Argentina/Buenos_Aires")
-    except Exception:
-        _AR_TZ = _dt.timezone(_dt.timedelta(hours=-3))
-
-    def _fmt_ar(ts):
-        if not ts:
-            return "—"
-        # ts es epoch UTC (int(time.time())); lo mostramos en hora de Argentina.
-        return _dt.datetime.fromtimestamp(int(ts), _AR_TZ).strftime("%d/%m/%Y %H:%M:%S") + " hs (ART)"
-
-    # --- 1) Estado de firma (obligatorio) ---
-    conn = get_db_connection()
-    cur = conn.cursor()
-    cur.execute("""
-        SELECT estado, updated_at
-        FROM recibo_estado
-        WHERE tenant=%s AND cuil=%s AND period=%s
-    """, (tenant, cuil, period))
-    est_row = cur.fetchone()
-
-    estado = (est_row["estado"].strip().upper() if est_row and est_row["estado"] else "")
-    if estado not in ("FIRMADO", "OBSERVADO"):
-        conn.close()
-        log.info("Constancia: recibo no firmado (%s/%s/%s estado=%s)",
-                 tenant, cuil, period, estado or "NINGUNO")
-        return None
-    firma_ts = est_row["updated_at"]
-
-    # --- 2) Identidad verificada (la más reciente) ---
-    # --- 2) Identidad verificada (la más reciente). Normalizamos el CUIL en SQL
-    #         porque verifications puede guardarlo con guiones. ---
-    cur.execute("""
-        SELECT nombre, dni_last4, dni_hash, to_whatsapp, verified_at
-        FROM verifications
-        WHERE tenant=%s
-          AND regexp_replace(COALESCE(cuil,''), '\\D', '', 'g') = %s
-        ORDER BY verified_at DESC NULLS LAST
-        LIMIT 1
-    """, (tenant, cuil))
-    ver = cur.fetchone() or {}
-
-    # --- 3) Trazabilidad del envío del PDF (entregado / leído) ---
-    # --- 3) Trazabilidad del envío del PDF (entregado / leído).
-    #         El PDF se registra con kind='media' (a veces 'pdf') y el CUIL/período
-    #         pueden venir con guiones, así que normalizamos ambos lados en SQL. ---
-    cur.execute("""
-        SELECT delivered_at, read_at, to_whatsapp
-        FROM message_status
-        WHERE tenant=%s
-          AND regexp_replace(COALESCE(cuil,''), '\\D', '', 'g') = %s
-          AND replace(COALESCE(period,''), '-', '/') = %s
-          AND lower(COALESCE(kind,'')) IN ('media', 'pdf')
-        ORDER BY COALESCE(delivered_at, read_at, created_at, 0) DESC
-        LIMIT 1
-    """, (tenant, cuil, period))
-    msg = cur.fetchone() or {}
-    conn.close()
-
-    empresa = (get_tenant(tenant) or {}).get("display_name") or tenant
-    nombre = (ver.get("nombre") or get_nombre_for_cuil(tenant, cuil) or "—").strip()
-    whatsapp = (ver.get("to_whatsapp") or msg.get("to_whatsapp") or "").replace("whatsapp:", "").strip() or "—"
-    cuil_fmt = format_cuil_with_dashes(cuil)
-    dni_last4 = (ver.get("dni_last4") or "").strip()
-    dni_hash = (ver.get("dni_hash") or "").strip()
-    estado_txt = "FIRMADO" if estado == "FIRMADO" else "OBSERVADO"
-    emitido_ts = int(time.time())
-
-    base = f"sigcert|{tenant}|{cuil}|{period}|{estado}|{firma_ts}"
-    codigo = hmac.new(MEDIA_SECRET.encode("utf-8"), base.encode("utf-8"),
-                      hashlib.sha256).hexdigest()[:16].upper()
-    codigo_fmt = "-".join(codigo[i:i + 4] for i in range(0, len(codigo), 4))
-
-    AZUL = colors.HexColor("#1f2766")
-    ORO = colors.HexColor("#F4C430")
-    GRIS = colors.HexColor("#5b6478")
-    LINEA = colors.HexColor("#d7dbe6")
-
-    ss = getSampleStyleSheet()
-    st_title = ParagraphStyle("ct_title", parent=ss["Title"], fontName="Helvetica-Bold",
-                              fontSize=18, textColor=AZUL, spaceAfter=2, leading=22)
-    st_sub = ParagraphStyle("ct_sub", parent=ss["Normal"], fontName="Helvetica",
-                            fontSize=10, textColor=GRIS, spaceAfter=2)
-    st_section = ParagraphStyle("ct_section", parent=ss["Normal"], fontName="Helvetica-Bold",
-                                fontSize=11, textColor=AZUL, spaceBefore=14, spaceAfter=6)
-    st_body = ParagraphStyle("ct_body", parent=ss["Normal"], fontName="Helvetica",
-                             fontSize=10, textColor=colors.black, leading=15)
-    st_label = ParagraphStyle("ct_label", parent=ss["Normal"], fontName="Helvetica",
-                              fontSize=9.5, textColor=GRIS)
-    st_value = ParagraphStyle("ct_value", parent=ss["Normal"], fontName="Helvetica-Bold",
-                              fontSize=10.5, textColor=colors.black)
-    st_small = ParagraphStyle("ct_small", parent=ss["Normal"], fontName="Helvetica",
-                              fontSize=8, textColor=GRIS, leading=11)
-    st_code = ParagraphStyle("ct_code", parent=ss["Normal"], fontName="Courier-Bold",
-                             fontSize=13, textColor=AZUL)
-
-    def kv_table(rows):
-        data = [[Paragraph(k, st_label), Paragraph(v, st_value)] for k, v in rows]
-        t = Table(data, colWidths=[5.5 * cm, 11.0 * cm])
-        t.setStyle(TableStyle([
-            ("VALIGN", (0, 0), (-1, -1), "TOP"),
-            ("TOPPADDING", (0, 0), (-1, -1), 5),
-            ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
-            ("LEFTPADDING", (0, 0), (-1, -1), 0),
-            ("LINEBELOW", (0, 0), (-1, -2), 0.4, LINEA),
-        ]))
-        return t
-
-    story = []
-    try:
-        icon = _load_icon_flowable()
-    except Exception:
-        icon = None
-    title_block = [Paragraph("Constancia de firma de recibo de sueldo", st_title),
-                   Paragraph(f"{empresa}", st_sub)]
-    if icon is not None:
-        header = Table([[icon, title_block]], colWidths=[2.2 * cm, 14.3 * cm])
-        header.setStyle(TableStyle([
-            ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
-            ("LEFTPADDING", (0, 0), (-1, -1), 0),
-        ]))
-        story.append(header)
-    else:
-        story.extend(title_block)
-
-    story.append(Spacer(1, 6))
-    story.append(Table([[""]], colWidths=[16.5 * cm],
-                       style=TableStyle([("LINEABOVE", (0, 0), (-1, -1), 2, ORO)])))
-    story.append(Spacer(1, 10))
-
-    verbo = "firmó de conformidad" if estado == "FIRMADO" else "registró con observaciones"
-    story.append(Paragraph(
-        f"Se deja constancia de que el/la empleado/a identificado/a a continuación "
-        f"{verbo} el recibo de sueldo correspondiente al período <b>{period}</b>, "
-        f"a través del canal oficial de WhatsApp de la empresa, "
-        f"previa verificación de identidad.", st_body))
-
-    story.append(Paragraph("Datos del recibo", st_section))
-    story.append(kv_table([
-        ("Empresa", empresa),
-        ("Empleado/a", nombre),
-        ("CUIL", cuil_fmt),
-        ("Período", period),
-        ("Estado", estado_txt),
-    ]))
-
-    story.append(Paragraph("Trazabilidad de la operación", st_section))
-    story.append(kv_table([
-        ("PDF entregado", _fmt_ar(msg.get("delivered_at"))),
-        ("Fecha y hora de firma", _fmt_ar(firma_ts)),
-        ("WhatsApp del firmante", whatsapp),
-    ]))
-
-    story.append(Paragraph("Verificación de identidad", st_section))
-    id_rows = [("Identidad verificada", _fmt_ar(ver.get("verified_at")) if ver.get("verified_at") else "—")]
-    if dni_last4:
-        id_rows.append(("DNI (últimos 4 dígitos)", f"•••••{dni_last4}"))
-    if dni_hash:
-        id_rows.append(("Huella del DNI (SHA-256)", dni_hash[:32] + "…"))
-    story.append(kv_table(id_rows))
-
-    story.append(Spacer(1, 16))
-    code_block = Table(
-        [[Paragraph("Código de verificación", st_label)],
-         [Paragraph(codigo_fmt, st_code)]],
-        colWidths=[16.5 * cm])
-    code_block.setStyle(TableStyle([
-        ("BACKGROUND", (0, 0), (-1, -1), colors.HexColor("#f3f5fb")),
-        ("BOX", (0, 0), (-1, -1), 0.6, LINEA),
-        ("TOPPADDING", (0, 0), (-1, -1), 8),
-        ("BOTTOMPADDING", (0, 0), (-1, -1), 8),
-        ("LEFTPADDING", (0, 0), (-1, -1), 12),
-    ]))
-    story.append(code_block)
-
-    story.append(Spacer(1, 10))
-    story.append(Paragraph(
-        f"Documento generado electrónicamente el {_fmt_ar(emitido_ts)}. "
-        f"El código de verificación es único e inalterable: cualquier modificación "
-        f"de los datos de esta constancia invalida dicho código. "
-        f"Este comprobante refleja los registros del sistema de distribución de "
-        f"recibos al momento de su emisión.", st_small))
-
-    def _on_page(canvas, doc_obj):
-        canvas.saveState()
-        canvas.setFont("Helvetica", 7.5)
-        canvas.setFillColor(GRIS)
-        canvas.drawString(2 * cm, 1.2 * cm, f"Constancia {codigo_fmt}")
-        canvas.drawRightString(A4[0] - 2 * cm, 1.2 * cm, "Página %d" % doc_obj.page)
-        canvas.restoreState()
-
-    buf = BytesIO()
-    doc = SimpleDocTemplate(
-        buf, pagesize=A4,
-        leftMargin=2 * cm, rightMargin=2 * cm,
-        topMargin=1.8 * cm, bottomMargin=1.8 * cm,
-        title=f"Constancia de firma {cuil_fmt} {period}",
-        author=empresa,
-    )
-    doc.build(story, onFirstPage=_on_page, onLaterPages=_on_page)
-    return buf.getvalue()
-
-
-@app.get("/portal/constancias-firma.zip")
-def portal_constancias_firma_zip():
-    """Descarga en un ZIP la constancia de firma de TODOS los empleados
-    firmados/observados del período (scoped al tenant del usuario logueado)."""
-    import zipfile
-
-    auth = require_portal_login()
-    if auth:
-        return auth
-
-    user_id = session.get("portal_user_id")
-    user = get_portal_user_by_id(user_id)
-    tenant = user["tenant"]  # tenant fijado por la sesión, NO por la URL
-
-    period = norm_period_label((request.args.get("period") or "").strip())
-
-    filtro = (request.args.get("estado") or "todos").strip().lower()
-    if filtro == "firmado":
-        estados_ok = {"FIRMADO"}
-    elif filtro == "observado":
-        estados_ok = {"OBSERVADO"}
-    else:
-        estados_ok = {"FIRMADO", "OBSERVADO"}
-
-    if not period:
-        return Response("Falta el período (?period=MM/AAAA)", status=400)
-
-    rows = get_recibo_estado_rows(tenant, period) or []
-    rows = [r for r in rows if (r.get("estado") or "").strip().upper() in estados_ok]
-    if not rows:
-        return Response("No hay recibos firmados/observados para ese período.", status=404)
-
-    mem = io.BytesIO()
-    usados = set()
-    generadas = 0
-    omitidas = []
-
-    with zipfile.ZipFile(mem, "w", zipfile.ZIP_DEFLATED) as zf:
-        for r in rows:
-            cuil = (r.get("cuil") or "").strip()
-            if not cuil:
-                continue
-            try:
-                pdf = generate_signature_certificate_pdf(tenant, cuil, period)
-            except Exception as e:
-                log.exception("Portal constancias ZIP: error cuil=%s: %s", cuil, e)
-                pdf = None
-
-            if not pdf:
-                omitidas.append(cuil)
-                continue
-
-            nombre = get_nombre_for_cuil(tenant, cuil) or "sin_nombre"
-            cuil_d = norm_cuil(cuil)
-            base = re.sub(r"[^\w\-. ]", "_", f"constancia_{nombre}_{cuil_d}").strip("_")
-
-            arcname, n = f"{base}.pdf", 1
-            while arcname.lower() in usados:
-                arcname = f"{base}_{n}.pdf"
-                n += 1
-            usados.add(arcname.lower())
-
-            zf.writestr(arcname, pdf)
-            generadas += 1
-
-    if generadas == 0:
-        return Response("No se pudo generar ninguna constancia.", status=404)
-
-    mem.seek(0)
-    data = mem.read()
-
-    try:
-        log_portal_action(
-            user_id, tenant, "descarga_constancias_firma",
-            details=f"period={period} estado={filtro} generadas={generadas} omitidas={len(omitidas)}",
-            ip_address=request.remote_addr or "",
-        )
-    except Exception:
-        pass
-
-    empresa = (get_tenant(tenant) or {}).get("display_name") or tenant
-    empresa_slug = re.sub(r"[^\w\-]", "_", empresa)
-    zip_name = f"constancias_firma_{empresa_slug}_{period.replace('/', '-')}.zip"
-
-    resp = Response(data, mimetype="application/zip")
-    resp.headers["Content-Disposition"] = f'attachment; filename="{zip_name}"'
-    resp.headers["Content-Length"] = str(len(data))
-    return resp
-
-
 def get_recibo_estado(tenant: str, cuil: str, period: str):
     tenant = (tenant or "").strip().lower()
     cuil = norm_cuil(cuil)
     period = norm_period_label(period)
 
     conn = get_db_connection()
+    conn.row_factory = sqlite3.Row
     cur = conn.cursor()
     cur.execute("""
       SELECT estado FROM recibo_estado
-      WHERE tenant=%s AND cuil=%s AND period=%s
+      WHERE tenant=? AND cuil=? AND period=?
       LIMIT 1;
     """, (tenant, cuil, period))
     row = cur.fetchone()
@@ -7003,994 +5523,13 @@ def pdf_exists_for_tenant_period_cuil(tenant, cuil, period):
     if not url.startswith("http"):
         # fallback: no podemos verificar
         return True
-    t_q = str(tenant or "").strip().lower()
-    c_q = str(cuil or "").strip()
-    p_q = str(period or "").strip()
     r = requests.get(url, params={
-        "tenant": t_q,
-        "cuil": c_q,
-        "period": p_q,
-        "token": make_media_token("pdf", tenant=t_q, cuil=c_q, period=p_q)
+        "tenant": tenant,
+        "cuil": cuil,
+        "period": period,
+        "token": ADMIN_TOKEN
     }, timeout=12)
     return r.status_code == 200
-
-
-# =========================
-# Branding por empresa (portal de clientes) — nivel 1
-# =========================
-# Personalización visual del portal por tenant: logo + color de acento.
-# - Se configura desde /admin/branding (requiere sesión de admin).
-# - Se aplica a TODAS las páginas del portal sin tocarlas una por una:
-#   un hook after_request inyecta un <style> con el override de --accent
-#   y reemplaza el logo/texto de la barra superior por los de la empresa.
-# - El logo se guarda en Postgres (BYTEA, máx. 400 KB) y se sirve desde
-#   /branding/logo con cache de 1 día; la URL lleva ?v=updated_at para
-#   que el cambio se vea al instante cuando se actualiza.
-
-BRANDING_MAX_LOGO_BYTES = 400 * 1024
-BRANDING_ALLOWED_MIMES = {"image/png", "image/jpeg", "image/webp"}
-BRANDING_PRESETS = [
-    ("dorado",  "Dorado (SIA)", "#F4C430"),
-    ("azul",    "Azul",         "#5aa7ff"),
-    ("verde",   "Verde",        "#34d399"),
-    ("violeta", "Violeta",      "#a78bfa"),
-    ("coral",   "Coral",        "#fb7185"),
-    ("celeste", "Celeste",      "#22d3ee"),
-]
-
-_BRANDING_CACHE: Dict[str, Dict] = {}  # tenant -> {"ts": float, "data": dict|None}
-
-def _branding_hex_ok(c: str) -> bool:
-    return bool(re.fullmatch(r"#[0-9a-fA-F]{6}", (c or "").strip()))
-
-def _branding_hex_rgb(c: str):
-    c = (c or "").lstrip("#")
-    return int(c[0:2], 16), int(c[2:4], 16), int(c[4:6], 16)
-
-def _branding_darker(c: str, factor: float = 0.8) -> str:
-    """Version mas oscura del color (para --accent-dark del theme)."""
-    r, g, b = _branding_hex_rgb(c)
-    return "#%02x%02x%02x" % (int(r * factor), int(g * factor), int(b * factor))
-
-def get_tenant_branding(tenant: str, force: bool = False) -> Optional[Dict]:
-    """Config de branding del tenant (sin el binario del logo) o None si no hay."""
-    t = (tenant or "").strip().lower()
-    if not t:
-        return None
-    now = time.time()
-    hit = _BRANDING_CACHE.get(t)
-    if hit and not force and (now - hit["ts"] < CACHE_TTL):
-        return hit["data"]
-    data = None
-    try:
-        conn = get_db_connection()
-        cur = conn.cursor()
-        cur.execute(
-            "SELECT accent, logo_mime, (logo IS NOT NULL) AS has_logo, updated_at "
-            "FROM tenant_branding WHERE tenant = %s",
-            (t,),
-        )
-        row = cur.fetchone()
-        conn.close()
-        if row:
-            data = {
-                "accent": (row.get("accent") or "").strip(),
-                "logo_mime": (row.get("logo_mime") or "").strip(),
-                "has_logo": bool(row.get("has_logo")),
-                "updated_at": int(row.get("updated_at") or 0),
-            }
-    except Exception as e:
-        log.exception("branding: error leyendo config de %s: %s", t, e)
-    _BRANDING_CACHE[t] = {"ts": now, "data": data}
-    return data
-
-def save_tenant_branding(tenant: str, accent: str, logo: bytes | None = None,
-                         logo_mime: str = "", clear_logo: bool = False) -> None:
-    """Upsert de branding. logo=None deja el logo actual; clear_logo=True lo borra."""
-    t = (tenant or "").strip().lower()
-    now = int(time.time())
-    conn = get_db_connection()
-    cur = conn.cursor()
-    if clear_logo:
-        cur.execute(
-            "INSERT INTO tenant_branding (tenant, accent, logo, logo_mime, updated_at) "
-            "VALUES (%s, %s, NULL, '', %s) "
-            "ON CONFLICT (tenant) DO UPDATE SET accent = EXCLUDED.accent, "
-            "logo = NULL, logo_mime = '', updated_at = EXCLUDED.updated_at",
-            (t, accent, now),
-        )
-    elif logo is not None:
-        cur.execute(
-            "INSERT INTO tenant_branding (tenant, accent, logo, logo_mime, updated_at) "
-            "VALUES (%s, %s, %s, %s, %s) "
-            "ON CONFLICT (tenant) DO UPDATE SET accent = EXCLUDED.accent, "
-            "logo = EXCLUDED.logo, logo_mime = EXCLUDED.logo_mime, "
-            "updated_at = EXCLUDED.updated_at",
-            (t, accent, psycopg2.Binary(logo), logo_mime, now),
-        )
-    else:
-        cur.execute(
-            "INSERT INTO tenant_branding (tenant, accent, updated_at) "
-            "VALUES (%s, %s, %s) "
-            "ON CONFLICT (tenant) DO UPDATE SET accent = EXCLUDED.accent, "
-            "updated_at = EXCLUDED.updated_at",
-            (t, accent, now),
-        )
-    conn.commit()
-    conn.close()
-    _BRANDING_CACHE.pop(t, None)
-
-@app.get("/branding/logo")
-def branding_logo():
-    """Sirve el logo del tenant (público: un logo no es información sensible)."""
-    t = (request.args.get("t") or "").strip().lower()
-    if not t:
-        return Response("Not found", status=404)
-    try:
-        conn = get_db_connection()
-        cur = conn.cursor()
-        cur.execute("SELECT logo, logo_mime FROM tenant_branding WHERE tenant = %s", (t,))
-        row = cur.fetchone()
-        conn.close()
-    except Exception as e:
-        log.exception("branding: error sirviendo logo de %s: %s", t, e)
-        return Response("Error", status=500)
-    if not row or row.get("logo") is None:
-        return Response("Not found", status=404)
-    data = bytes(row["logo"])
-    resp = Response(data, mimetype=(row.get("logo_mime") or "image/png"))
-    resp.headers["Content-Length"] = str(len(data))
-    # Cache fuerte: la URL cambia con ?v= cuando se actualiza el logo.
-    resp.headers["Cache-Control"] = "public, max-age=86400"
-    return resp
-
-@app.after_request
-def inject_portal_branding(resp):
-    """Aplica el branding del tenant a todas las páginas HTML del portal."""
-    try:
-        if not request.path.startswith("/portal"):
-            return resp
-        if resp.status_code != 200 or resp.direct_passthrough:
-            return resp
-        if "text/html" not in (resp.headers.get("Content-Type") or ""):
-            return resp
-        tenant = (session.get("portal_tenant") or "").strip().lower()
-        if not tenant:
-            return resp
-        b = get_tenant_branding(tenant)
-        if not b:
-            return resp
-
-        html = resp.get_data(as_text=True)
-        changed = False
-
-        # 1) Color de acento: pisa la variable del theme + el glow dorado hardcodeado.
-        accent = b.get("accent") or ""
-        if _branding_hex_ok(accent) and "</head>" in html:
-            r_, g_, b_ = _branding_hex_rgb(accent)
-            dark = _branding_darker(accent)
-            # Pisa la variable del theme + su version oscura (gradientes de
-            # botones) + las sombras doradas hardcodeadas en portal-theme.css.
-            style = (
-                '<style id="tenant-branding">'
-                ':root{--accent:%s;--accent-dark:%s;}'
-                '.action-card:hover{box-shadow:0 8px 24px rgba(%d,%d,%d,.18);}'
-                '.btn.primary{box-shadow:0 4px 12px rgba(%d,%d,%d,.3);}'
-                '.btn.primary:hover{box-shadow:0 6px 20px rgba(%d,%d,%d,.4);}'
-                '.stat:hover{box-shadow:0 4px 16px rgba(%d,%d,%d,.15);}'
-                'input:focus,select:focus,textarea:focus{box-shadow:0 0 0 3px rgba(%d,%d,%d,.1);}'
-                '</style>' % (accent, dark, r_, g_, b_, r_, g_, b_, r_, g_, b_, r_, g_, b_, r_, g_, b_)
-            )
-            html = html.replace("</head>", style + "</head>", 1)
-            changed = True
-
-        # 2) Logo: reemplaza el bloque .top-logo (idéntico en todas las páginas).
-        if b.get("has_logo"):
-            old_img = '<img src="/static/icon-192.png" alt="SIA Sueldos">'
-            if old_img in html:
-                v = int(b.get("updated_at") or 0)
-                new_img = ('<img src="/branding/logo?t=%s&v=%d" alt="Logo" '
-                           'style="object-fit:contain">' % (quote(tenant), v))
-                html = html.replace(old_img, new_img)
-                try:
-                    t_info = get_tenant(tenant) or {}
-                except Exception:
-                    t_info = {}
-                disp = esc(t_info.get("display_name") or "")
-                if disp:
-                    html = html.replace(
-                        '<span class="top-logo-text">SIA</span>',
-                        '<span class="top-logo-text">%s</span>' % disp,
-                    )
-                changed = True
-
-        # 3) Preferencias personales del usuario (fondo, tipografia, letra, foto)
-        uid = session.get("portal_user_id")
-        if uid and "</head>" in html:
-            p = get_user_prefs(uid)
-            if p:
-                css_prefs = _user_prefs_css(p)
-                if css_prefs:
-                    html = html.replace("</head>", '<style id="user-prefs">' + css_prefs + "</style></head>", 1)
-                    changed = True
-
-        if changed:
-            resp.set_data(html)
-    except Exception as e:
-        log.exception("branding: error inyectando branding en %s: %s", request.path, e)
-    return resp
-
-@app.route("/admin/branding", methods=["GET", "POST"])
-def admin_branding():
-    """Pantalla de personalización del portal por empresa (logo + color)."""
-    auth = require_admin()
-    if auth:
-        return auth
-
-    tenant = (request.values.get("tenant") or "").strip().lower()
-
-    if request.method == "POST":
-        t_info = get_tenant(tenant)
-        if not t_info:
-            return redirect("/admin/branding?msg=err_tenant")
-
-        # Color: preset o personalizado
-        preset = (request.form.get("preset") or "").strip()
-        accent = ""
-        if preset == "custom":
-            accent = (request.form.get("accent_custom") or "").strip()
-            if not _branding_hex_ok(accent):
-                return redirect(f"/admin/branding?tenant={quote(tenant)}&msg=err_color")
-        else:
-            for key, _label, hexv in BRANDING_PRESETS:
-                if key == preset:
-                    accent = hexv
-                    break
-            if not accent:
-                return redirect(f"/admin/branding?tenant={quote(tenant)}&msg=err_color")
-
-        clear_logo = request.form.get("clear_logo") == "1"
-        logo_bytes = None
-        logo_mime = ""
-        f = request.files.get("logo")
-        if f and f.filename and not clear_logo:
-            mime = (f.mimetype or "").lower()
-            if mime not in BRANDING_ALLOWED_MIMES:
-                return redirect(f"/admin/branding?tenant={quote(tenant)}&msg=err_tipo")
-            data = f.read()
-            if not data:
-                return redirect(f"/admin/branding?tenant={quote(tenant)}&msg=err_tipo")
-            if len(data) > BRANDING_MAX_LOGO_BYTES:
-                return redirect(f"/admin/branding?tenant={quote(tenant)}&msg=err_peso")
-            logo_bytes, logo_mime = data, mime
-
-        try:
-            save_tenant_branding(tenant, accent, logo=logo_bytes,
-                                 logo_mime=logo_mime, clear_logo=clear_logo)
-        except Exception as e:
-            log.exception("branding: error guardando %s: %s", tenant, e)
-            return redirect(f"/admin/branding?tenant={quote(tenant)}&msg=err_db")
-        return redirect(f"/admin/branding?tenant={quote(tenant)}&msg=ok")
-
-    # ---- GET ----
-    msg = (request.args.get("msg") or "").strip()
-    tenants = get_all_tenants()
-    b = get_tenant_branding(tenant, force=True) if tenant else None
-    cur_accent = (b or {}).get("accent") or ""
-
-    preset_checked = ""
-    if cur_accent:
-        for key, _label, hexv in BRANDING_PRESETS:
-            if hexv.lower() == cur_accent.lower():
-                preset_checked = key
-                break
-        if not preset_checked:
-            preset_checked = "custom"
-    else:
-        preset_checked = BRANDING_PRESETS[0][0]
-    custom_value = cur_accent if (preset_checked == "custom" and _branding_hex_ok(cur_accent)) else "#F4C430"
-
-    MSGS = {
-        "ok": ("success", "✅ Guardado. Los usuarios del portal ya lo ven (con varios workers puede demorar hasta 2 minutos por cache)."),
-        "err_tenant": ("error", "❌ Empresa inválida."),
-        "err_color": ("error", "❌ Color inválido: elegí un preset o un hex tipo #AABBCC."),
-        "err_tipo": ("error", "❌ Formato de logo no soportado: subí PNG, JPG o WebP."),
-        "err_peso": ("error", "❌ El logo es muy pesado: máximo 400 KB."),
-        "err_db": ("error", "❌ Error guardando en la base. Mirá los logs."),
-    }
-
-    html = []
-    html.append("""<!doctype html>
-<html lang="es">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Personalización del portal</title>
-  <style>
-    :root{
-      --bg:#0b1220; --card:#0f1b33; --muted:#9fb2d0; --text:#eaf0ff;
-      --line:rgba(255,255,255,.08); --radius:14px;
-    }
-    *{box-sizing:border-box}
-    body{
-      margin:0; font-family:system-ui; color:var(--text); padding:20px;
-      background: radial-gradient(1200px 700px at 20% -20%, rgba(90,167,255,.25), transparent 60%), var(--bg);
-    }
-    .wrap{max-width:760px;margin:0 auto}
-    .card{
-      border:1px solid var(--line); background:rgba(255,255,255,.03);
-      border-radius:var(--radius); padding:20px; margin:16px 0;
-    }
-    h2{margin:0 0 6px 0} h3{margin:0 0 10px 0}
-    .muted{color:var(--muted);font-size:13px}
-    label{font-size:13px;color:var(--muted);font-weight:600}
-    input, select{
-      background:rgba(0,0,0,.25); border:1px solid var(--line);
-      color:var(--text); padding:10px; border-radius:8px; margin:6px 0;
-      color-scheme:dark;
-    }
-    select option{ background-color:#0f1b33; color:var(--text); }
-    input[type=file]{padding:8px}
-    input[type=color]{ padding:0; width:42px; height:28px; border:1px solid var(--line); border-radius:6px; cursor:pointer; background:none; }
-    .btn{
-      display:inline-block; padding:10px 16px; border-radius:8px; border:1px solid var(--line);
-      background:rgba(255,255,255,.06); cursor:pointer; font-weight:600;
-      text-decoration:none; color:var(--text);
-    }
-    .btn:hover{background:rgba(255,255,255,.1)}
-    .presets{display:flex; flex-wrap:wrap; gap:10px; margin:10px 0}
-    .preset{
-      display:inline-flex; align-items:center; gap:8px; border:1px solid var(--line);
-      border-radius:999px; padding:8px 14px; cursor:pointer; font-size:13px; color:var(--text);
-    }
-    .preset:hover{background:rgba(255,255,255,.05)}
-    .sw{width:16px;height:16px;border-radius:50%;display:inline-block;border:1px solid rgba(255,255,255,.25)}
-    .sep{height:1px;background:var(--line);margin:14px 0}
-    .hint{font-size:12px;color:var(--muted);margin-top:6px}
-    .logo-prev{
-      height:48px; max-width:220px; object-fit:contain; vertical-align:middle;
-      background:rgba(255,255,255,.06); border:1px solid var(--line); border-radius:8px; padding:6px;
-    }
-    .success{background:rgba(52,211,153,.1); border:1px solid rgba(52,211,153,.3); padding:12px; border-radius:8px; margin:10px 0}
-    .error{background:rgba(251,113,133,.1); border:1px solid rgba(251,113,133,.3); padding:12px; border-radius:8px; margin:10px 0}
-  </style>
-</head>
-<body>
-<div class="wrap">
-""")
-
-    if tenant:
-        html.append(f"<a href='/admin/panel?tenant={quote(tenant)}' class='btn'>← Volver al panel</a>")
-    else:
-        html.append("<a href='/admin' class='btn'>← Volver al admin</a>")
-
-    html.append("<div class='card'>")
-    html.append("<h2>🎨 Personalización del portal</h2>")
-    html.append("<div class='muted'>Logo y color de acento que ven los usuarios del portal de cada empresa.</div>")
-    html.append("<form method='get' style='margin-top:12px'>")
-    html.append("<label>Empresa</label><br>")
-    html.append("<select name='tenant' onchange='this.form.submit()' style='min-width:280px'>")
-    html.append("<option value=''>-- Seleccionar empresa --</option>")
-    for t_ in tenants:
-        s = " selected" if (t_.get("slug") == tenant) else ""
-        html.append(f"<option value='{esc(t_.get('slug',''))}'{s}>{esc(t_.get('display_name',''))}</option>")
-    html.append("</select>")
-    html.append("</form>")
-    html.append("</div>")
-
-    if tenant:
-        t_info = get_tenant(tenant)
-        if not t_info:
-            html.append("<div class='error'>❌ Empresa inválida.</div>")
-        else:
-            if msg in MSGS:
-                css, texto = MSGS[msg]
-                html.append(f"<div class='{css}'>{texto}</div>")
-
-            html.append("<form method='post' enctype='multipart/form-data' class='card'>")
-            html.append(f"<input type='hidden' name='tenant' value='{esc(tenant)}'>")
-            html.append(f"<h3>{esc(t_info.get('display_name',''))}</h3>")
-
-            html.append("<label>Color de acento</label>")
-            html.append("<div class='presets'>")
-            for key, label, hexv in BRANDING_PRESETS:
-                ck = " checked" if preset_checked == key else ""
-                html.append(
-                    f"<label class='preset'><input type='radio' name='preset' value='{key}'{ck}>"
-                    f"<span class='sw' style='background:{hexv}'></span>{esc(label)}</label>"
-                )
-            ck = " checked" if preset_checked == "custom" else ""
-            html.append(
-                f"""<label class='preset'><input type='radio' name='preset' value='custom'{ck}>"""
-                f"""<input type='color' name='accent_custom' value='{esc(custom_value)}' """
-                f"""onclick="this.parentNode.querySelector('input[type=radio]').checked=true">"""
-                """Personalizado</label>"""
-            )
-            html.append("</div>")
-            html.append("<div class='hint'>El acento se usa en resaltados y hovers del portal. El fondo es oscuro: evitá colores muy oscuros o quedan invisibles.</div>")
-
-            html.append("<div class='sep'></div>")
-            html.append("<label>Logo de la empresa</label><br>")
-            if (b or {}).get("has_logo"):
-                v = int((b or {}).get("updated_at") or 0)
-                html.append(f"<img class='logo-prev' src='/branding/logo?t={quote(tenant)}&v={v}' alt='Logo actual'>")
-                html.append("<label style='display:inline-flex;align-items:center;gap:6px;margin-left:12px;cursor:pointer'>"
-                            "<input type='checkbox' name='clear_logo' value='1'> Quitar logo</label><br>")
-            html.append("<input type='file' name='logo' accept='.png,.jpg,.jpeg,.webp'>")
-            html.append("<div class='hint'>PNG, JPG o WebP · máximo 400 KB · ideal apaisado y con fondo transparente.</div>")
-
-            html.append("<button class='btn' type='submit' style='margin-top:14px'>💾 Guardar</button>")
-            html.append("</form>")
-
-    html.append("</div></body></html>")
-    return Response("".join(html), mimetype="text/html")
-
-
-# =========================
-# Apariencia por usuario (portal de clientes) — nivel 2
-# =========================
-# Cada usuario del portal elige SU apariencia: fondo (paleta de temas,
-# incluido modo claro), tipografía (Google Fonts, como la Montserrat del
-# theme), tamaño de letra, densidad, animaciones y su foto (avatar).
-# Son opciones curadas y probadas contra portal-theme.css, así nadie puede
-# dejarse el portal ilegible. Convive con el branding por empresa: la
-# empresa define la identidad (logo + acento), el usuario su comodidad.
-# - Se configura en /portal/apariencia (link en el dashboard), con
-#   PREVISUALIZACIÓN EN VIVO: al tocar una opción, la misma página se
-#   redibuja al instante con el mismo CSS que después inyecta el servidor.
-# - Se aplica en todas las páginas vía el hook after_request.
-# - El avatar se guarda en Postgres (BYTEA, máx. 300 KB) y se sirve SOLO
-#   al propio usuario logueado desde /portal/avatar.
-
-AVATAR_MAX_BYTES = 300 * 1024
-
-# Paleta de fondos. "pd" es --primary-dark (la otra punta del gradiente del
-# body en portal-theme.css). El tema "claro" además pisa texto/línea y trae
-# overrides extra para los fondos rgba oscuros hardcodeados del theme.
-PORTAL_THEMES = [
-    {"key": "nocturno",   "label": "Nocturno (original)", "bg": "",        "card": "",        "hover": "",        "pd": "",        "mode": "dark"},
-    {"key": "medianoche", "label": "Medianoche",          "bg": "#070b14", "card": "#10182b", "hover": "#16203a", "pd": "#0d1326", "mode": "dark"},
-    {"key": "grafito",    "label": "Grafito",             "bg": "#0c0d10", "card": "#16181d", "hover": "#1c1f26", "pd": "#131417", "mode": "dark"},
-    {"key": "acero",      "label": "Acero",               "bg": "#0d1117", "card": "#161b22", "hover": "#1c232e", "pd": "#10151d", "mode": "dark"},
-    {"key": "oceano",     "label": "Océano",              "bg": "#071722", "card": "#0d2434", "hover": "#123049", "pd": "#0a2536", "mode": "dark"},
-    {"key": "petroleo",   "label": "Petróleo",            "bg": "#06171a", "card": "#0c2529", "hover": "#113238", "pd": "#0a2a2c", "mode": "dark"},
-    {"key": "bosque",     "label": "Bosque",              "bg": "#08150f", "card": "#0e241a", "hover": "#133024", "pd": "#0c2418", "mode": "dark"},
-    {"key": "vino",       "label": "Vino",                "bg": "#170a12", "card": "#26101d", "hover": "#331628", "pd": "#240f1c", "mode": "dark"},
-    {"key": "purpura",    "label": "Púrpura",             "bg": "#100a1c", "card": "#1c1232", "hover": "#251944", "pd": "#1a0f33", "mode": "dark"},
-    {"key": "cacao",      "label": "Cacao",               "bg": "#140e08", "card": "#241a10", "hover": "#302316", "pd": "#201509", "mode": "dark"},
-    {"key": "claro",      "label": "Claro",               "bg": "#eef1f7", "card": "#ffffff", "hover": "#f4f6fb", "pd": "#dfe5f2", "mode": "light",
-     "text": "#182035", "muted": "#5c6b8a", "line": "rgba(20,30,60,.12)"},
-]
-
-# Tipografías: mismas Google Fonts que ya usa el theme (Montserrat).
-PORTAL_FONTS = [
-    {"key": "sistema",    "label": "Montserrat (original)", "stack": "", "gf": ""},
-    {"key": "moderna",    "label": "Moderna",    "stack": "'Inter', system-ui, sans-serif",                                  "gf": "Inter:wght@400;600;700"},
-    {"key": "redondeada", "label": "Redondeada", "stack": "'Nunito', system-ui, sans-serif",                                 "gf": "Nunito:wght@400;600;700"},
-    {"key": "clasica",    "label": "Clásica",    "stack": "'Lora', Georgia, serif",                                          "gf": "Lora:wght@400;600;700"},
-    {"key": "maquina",    "label": "Máquina",    "stack": "'JetBrains Mono', ui-monospace, Menlo, Consolas, monospace",      "gf": "JetBrains+Mono:wght@400;600;700"},
-]
-
-PORTAL_FONT_SIZES = [
-    {"key": "normal", "label": "Normal", "zoom": ""},
-    {"key": "grande", "label": "Grande", "zoom": "1.15"},
-    {"key": "xl",     "label": "Extra grande", "zoom": "1.3"},
-]
-
-PORTAL_DENSITIES = [
-    {"key": "comoda",   "label": "Cómoda (original)"},
-    {"key": "compacta", "label": "Compacta"},
-]
-
-PORTAL_MOTION = [
-    {"key": "si", "label": "Con animaciones (original)"},
-    {"key": "no", "label": "Sin animaciones"},
-]
-
-# Overrides extra del modo claro: pisa los fondos rgba() oscuros que
-# portal-theme.css tiene hardcodeados (inputs, botones, th, stats).
-PORTAL_LIGHT_EXTRA_CSS = (
-    "input,select,textarea{background:rgba(0,0,0,.05)!important;}"
-    "input:focus,select:focus,textarea:focus{background:rgba(0,0,0,.07)!important;}"
-    ".btn{background:rgba(0,0,0,.05)!important;}"
-    ".btn:hover{background:rgba(0,0,0,.09)!important;}"
-    ".btn.secondary{color:#fff!important;}"
-    "th{background:rgba(0,0,0,.05)!important;}"
-    ".stat{background:rgba(0,0,0,.04)!important;}"
-    "tr:hover{background:rgba(0,0,0,.03)!important;}"
-    ".stat-value{background:linear-gradient(135deg,var(--accent-dark,#b8860b),#182035)!important;"
-    "-webkit-background-clip:text!important;background-clip:text!important;}"
-    ".top-logo img{box-shadow:0 4px 12px rgba(0,0,0,.18);}"
-)
-
-PORTAL_COMPACT_CSS = (
-    ".card,.header{padding:16px!important;}"
-    ".card{margin-bottom:14px!important;}"
-    "th,td{padding:9px 12px!important;}"
-    ".btn{padding:9px 16px!important;font-size:13px!important;}"
-    ".stat{padding:16px!important;}"
-    ".stat-value{font-size:30px!important;}"
-    "h1{font-size:24px!important;}"
-    "body:not(.login-page) .container{padding-top:72px!important;}"
-)
-
-# Ojo: .top-logo se centra con transform:translateX(-50%); en el hover hay
-# que RESTAURAR ese transform, no anularlo, o el logo se corre al pasar el mouse.
-PORTAL_NOMOTION_CSS = (
-    "*,*::before,*::after{animation:none!important;transition:none!important;}"
-    ".card:hover,.btn:hover,.btn.primary:hover,.stat:hover,.action-card:hover{transform:none!important;}"
-    ".top-logo:hover{transform:translateX(-50%)!important;}"
-)
-
-_PREFS_CACHE: Dict[int, Dict] = {}  # user_id -> {"ts": float, "data": dict|None}
-
-def get_user_prefs(user_id: int, force: bool = False) -> Optional[Dict]:
-    """Preferencias de apariencia del usuario (sin el binario del avatar)."""
-    try:
-        uid = int(user_id)
-    except (TypeError, ValueError):
-        return None
-    now = time.time()
-    hit = _PREFS_CACHE.get(uid)
-    if hit and not force and (now - hit["ts"] < CACHE_TTL):
-        return hit["data"]
-    data = None
-    try:
-        conn = get_db_connection()
-        cur = conn.cursor()
-        cur.execute(
-            "SELECT theme, font, font_size, density, motion, "
-            "(avatar IS NOT NULL) AS has_avatar, updated_at "
-            "FROM portal_user_prefs WHERE user_id = %s",
-            (uid,),
-        )
-        row = cur.fetchone()
-        conn.close()
-        if row:
-            data = {
-                "theme": (row.get("theme") or "").strip(),
-                "font": (row.get("font") or "").strip(),
-                "font_size": (row.get("font_size") or "").strip(),
-                "density": (row.get("density") or "").strip(),
-                "motion": (row.get("motion") or "").strip(),
-                "has_avatar": bool(row.get("has_avatar")),
-                "updated_at": int(row.get("updated_at") or 0),
-            }
-    except Exception as e:
-        log.exception("prefs: error leyendo preferencias de user %s: %s", uid, e)
-    _PREFS_CACHE[uid] = {"ts": now, "data": data}
-    return data
-
-def save_user_prefs(user_id: int, theme: str, font: str, font_size: str,
-                    density: str, motion: str,
-                    avatar: bytes | None = None, avatar_mime: str = "",
-                    clear_avatar: bool = False) -> None:
-    """Upsert de preferencias. avatar=None deja el actual; clear_avatar lo borra."""
-    uid = int(user_id)
-    now = int(time.time())
-    conn = get_db_connection()
-    cur = conn.cursor()
-    if clear_avatar:
-        cur.execute(
-            "INSERT INTO portal_user_prefs (user_id, theme, font, font_size, density, motion, avatar, avatar_mime, updated_at) "
-            "VALUES (%s, %s, %s, %s, %s, %s, NULL, '', %s) "
-            "ON CONFLICT (user_id) DO UPDATE SET theme = EXCLUDED.theme, font = EXCLUDED.font, "
-            "font_size = EXCLUDED.font_size, density = EXCLUDED.density, motion = EXCLUDED.motion, "
-            "avatar = NULL, avatar_mime = '', updated_at = EXCLUDED.updated_at",
-            (uid, theme, font, font_size, density, motion, now),
-        )
-    elif avatar is not None:
-        cur.execute(
-            "INSERT INTO portal_user_prefs (user_id, theme, font, font_size, density, motion, avatar, avatar_mime, updated_at) "
-            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s) "
-            "ON CONFLICT (user_id) DO UPDATE SET theme = EXCLUDED.theme, font = EXCLUDED.font, "
-            "font_size = EXCLUDED.font_size, density = EXCLUDED.density, motion = EXCLUDED.motion, "
-            "avatar = EXCLUDED.avatar, avatar_mime = EXCLUDED.avatar_mime, updated_at = EXCLUDED.updated_at",
-            (uid, theme, font, font_size, density, motion, psycopg2.Binary(avatar), avatar_mime, now),
-        )
-    else:
-        cur.execute(
-            "INSERT INTO portal_user_prefs (user_id, theme, font, font_size, density, motion, updated_at) "
-            "VALUES (%s, %s, %s, %s, %s, %s, %s) "
-            "ON CONFLICT (user_id) DO UPDATE SET theme = EXCLUDED.theme, font = EXCLUDED.font, "
-            "font_size = EXCLUDED.font_size, density = EXCLUDED.density, motion = EXCLUDED.motion, "
-            "updated_at = EXCLUDED.updated_at",
-            (uid, theme, font, font_size, density, motion, now),
-        )
-    conn.commit()
-    conn.close()
-    _PREFS_CACHE.pop(uid, None)
-
-def _user_prefs_css(p: Dict) -> str:
-    """Arma el CSS a inyectar según las preferencias guardadas.
-    IMPORTANTE: el JS de vista previa en /portal/apariencia replica estas
-    mismas reglas; si tocás algo acá, tocá también el script de esa página."""
-    imports = []
-    parts = []
-
-    theme = next((t for t in PORTAL_THEMES if t["key"] == (p.get("theme") or "")), None)
-    if theme and theme["bg"]:
-        root = "--bg:%s;--card:%s;--card-hover:%s;--primary-dark:%s;" % (
-            theme["bg"], theme["card"], theme["hover"], theme["pd"])
-        if theme.get("text"):
-            root += "--text:%s;--text-muted:%s;--line:%s;" % (
-                theme["text"], theme["muted"], theme["line"])
-        parts.append(":root{%s}" % root)
-        if theme.get("mode") == "light":
-            parts.append(PORTAL_LIGHT_EXTRA_CSS)
-
-    font = next((f for f in PORTAL_FONTS if f["key"] == (p.get("font") or "")), None)
-    if font and font["stack"]:
-        if font["gf"]:
-            imports.append("@import url('https://fonts.googleapis.com/css2?family=%s&display=swap');" % font["gf"])
-        parts.append("body,input,select,textarea,button,.btn{font-family:%s !important;}" % font["stack"])
-
-    size = next((s for s in PORTAL_FONT_SIZES if s["key"] == (p.get("font_size") or "")), None)
-    if size and size["zoom"]:
-        parts.append("body{zoom:%s;}" % size["zoom"])
-
-    if (p.get("density") or "") == "compacta":
-        parts.append(PORTAL_COMPACT_CSS)
-
-    if (p.get("motion") or "") == "no":
-        parts.append(PORTAL_NOMOTION_CSS)
-
-    if p.get("has_avatar"):
-        v = int(p.get("updated_at") or 0)
-        # .top-logo es position:fixed → sirve de contenedor del ::after.
-        # left:calc(100% + 10px) lo pone AL LADO del logo, no encima.
-        parts.append(
-            ".top-logo::after{content:'';position:absolute;left:calc(100% + 10px);top:50%;"
-            "transform:translateY(-50%);width:40px;height:40px;border-radius:50%;"
-            "border:2px solid var(--line);box-shadow:0 4px 12px rgba(0,0,0,.25);"
-            "background:url('/portal/avatar?v=" + str(v) + "') center/cover;}"
-        )
-
-    return "".join(imports) + "".join(parts)
-
-@app.get("/portal/avatar")
-def portal_avatar():
-    """Sirve el avatar del usuario logueado (solo el propio, nunca el de otro)."""
-    uid = session.get("portal_user_id")
-    if not uid:
-        return Response("Unauthorized", status=401)
-    try:
-        conn = get_db_connection()
-        cur = conn.cursor()
-        cur.execute("SELECT avatar, avatar_mime FROM portal_user_prefs WHERE user_id = %s", (int(uid),))
-        row = cur.fetchone()
-        conn.close()
-    except Exception as e:
-        log.exception("prefs: error sirviendo avatar de %s: %s", uid, e)
-        return Response("Error", status=500)
-    if not row or row.get("avatar") is None:
-        return Response("Not found", status=404)
-    data = bytes(row["avatar"])
-    resp = Response(data, mimetype=(row.get("avatar_mime") or "image/png"))
-    resp.headers["Content-Length"] = str(len(data))
-    resp.headers["Cache-Control"] = "private, max-age=86400"
-    return resp
-
-# Script de vista previa en vivo. Replica _user_prefs_css en el navegador:
-# al tocar una opción, arma el mismo CSS y lo mete en un <style> al vuelo.
-_APARIENCIA_PREVIEW_JS = """
-<script>
-(function(){
-  var THEMES = __THEMES__;
-  var FONTS = __FONTS__;
-  var SIZES = __SIZES__;
-  var LIGHT_EXTRA = __LIGHT__;
-  var COMPACT = __COMPACT__;
-  var NOMOTION = __NOMOTION__;
-
-  var styleEl = document.createElement('style');
-  styleEl.id = 'preview-style';
-  document.head.appendChild(styleEl);
-  var fontsLoaded = {};
-
-  function ensureFont(gf){
-    if (!gf || fontsLoaded[gf]) return;
-    fontsLoaded[gf] = 1;
-    var l = document.createElement('link');
-    l.rel = 'stylesheet';
-    l.href = 'https://fonts.googleapis.com/css2?family=' + gf + '&display=swap';
-    document.head.appendChild(l);
-  }
-  function val(name){
-    var e = document.querySelector('input[name="' + name + '"]:checked');
-    return e ? e.value : '';
-  }
-  function build(){
-    var css = '';
-    var t = THEMES[val('theme')] || {};
-    if (t.bg) {
-      css += ':root{--bg:' + t.bg + ';--card:' + t.card + ';--card-hover:' + t.hover + ';--primary-dark:' + t.pd + ';';
-      if (t.text) css += '--text:' + t.text + ';--text-muted:' + t.muted + ';--line:' + t.line + ';';
-      css += '}';
-      if (t.mode === 'light') css += LIGHT_EXTRA;
-    }
-    var f = FONTS[val('font')] || {};
-    if (f.stack) {
-      ensureFont(f.gf);
-      css += 'body,input,select,textarea,button,.btn{font-family:' + f.stack + ' !important;}';
-    }
-    var z = SIZES[val('font_size')];
-    if (z) css += 'body{zoom:' + z + ';}';
-    if (val('density') === 'compacta') css += COMPACT;
-    if (val('motion') === 'no') css += NOMOTION;
-    styleEl.textContent = css;
-  }
-  var radios = document.querySelectorAll('.opciones input[type=radio]');
-  for (var i = 0; i < radios.length; i++) radios[i].addEventListener('change', build);
-
-  // Vista previa de la foto elegida (antes de subirla)
-  var file = document.getElementById('avatar-file');
-  var clear = document.getElementById('clear-avatar');
-  if (file) {
-    file.addEventListener('change', function(){
-      var f = this.files && this.files[0];
-      if (!f) return;
-      if (clear) clear.checked = false;
-      var rd = new FileReader();
-      rd.onload = function(){
-        var prev = document.getElementById('avatar-prev');
-        if (!prev) {
-          prev = document.createElement('img');
-          prev.id = 'avatar-prev';
-          prev.className = 'avatar-prev';
-          file.parentNode.insertBefore(prev, file);
-        }
-        prev.src = rd.result;
-      };
-      rd.readAsDataURL(f);
-    });
-  }
-  build();
-})();
-</script>
-"""
-
-@app.route("/portal/apariencia", methods=["GET", "POST"])
-def portal_apariencia():
-    """Preferencias de apariencia del usuario, con vista previa en vivo."""
-    auth = require_portal_login()
-    if auth:
-        return auth
-    uid = int(session.get("portal_user_id"))
-
-    if request.method == "POST":
-        theme = (request.form.get("theme") or "").strip()
-        if theme not in {t["key"] for t in PORTAL_THEMES}:
-            theme = ""
-        font = (request.form.get("font") or "").strip()
-        if font not in {f["key"] for f in PORTAL_FONTS}:
-            font = ""
-        font_size = (request.form.get("font_size") or "").strip()
-        if font_size not in {s["key"] for s in PORTAL_FONT_SIZES}:
-            font_size = ""
-        density = (request.form.get("density") or "").strip()
-        if density not in {d["key"] for d in PORTAL_DENSITIES}:
-            density = ""
-        motion = (request.form.get("motion") or "").strip()
-        if motion not in {m["key"] for m in PORTAL_MOTION}:
-            motion = ""
-
-        clear_avatar = request.form.get("clear_avatar") == "1"
-        avatar_bytes = None
-        avatar_mime = ""
-        f = request.files.get("avatar")
-        if f and f.filename and not clear_avatar:
-            mime = (f.mimetype or "").lower()
-            if mime not in BRANDING_ALLOWED_MIMES:
-                return redirect("/portal/apariencia?msg=err_tipo")
-            data = f.read()
-            if not data:
-                return redirect("/portal/apariencia?msg=err_tipo")
-            if len(data) > AVATAR_MAX_BYTES:
-                return redirect("/portal/apariencia?msg=err_peso")
-            avatar_bytes, avatar_mime = data, mime
-
-        try:
-            save_user_prefs(uid, theme, font, font_size, density, motion,
-                            avatar=avatar_bytes, avatar_mime=avatar_mime,
-                            clear_avatar=clear_avatar)
-        except Exception as e:
-            log.exception("prefs: error guardando user %s: %s", uid, e)
-            return redirect("/portal/apariencia?msg=err_db")
-        return redirect("/portal/apariencia?msg=ok")
-
-    # ---- GET ----
-    msg = (request.args.get("msg") or "").strip()
-    p = get_user_prefs(uid, force=True) or {}
-    cur_theme = p.get("theme") or "nocturno"
-    cur_font = p.get("font") or "sistema"
-    cur_size = p.get("font_size") or "normal"
-    cur_density = p.get("density") or "comoda"
-    cur_motion = p.get("motion") or "si"
-
-    MSGS = {
-        "ok": ("alert-success", "✅ Guardado. Tu portal ya quedó así en todas las páginas."),
-        "err_tipo": ("alert-error", "❌ Formato de foto no soportado: subí PNG, JPG o WebP."),
-        "err_peso": ("alert-error", "❌ La foto es muy pesada: máximo 300 KB."),
-        "err_db": ("alert-error", "❌ No se pudo guardar. Probá de nuevo en un rato."),
-    }
-
-    # Cargamos TODAS las fuentes opcionales solo en esta página, para que los
-    # chips y la vista previa se rendericen al instante.
-    gf_families = "&family=".join(f["gf"] for f in PORTAL_FONTS if f["gf"])
-    fonts_preview_link = (
-        f"<link rel='stylesheet' href='https://fonts.googleapis.com/css2?family={gf_families}&display=swap'>"
-        if gf_families else ""
-    )
-
-    html = []
-    html.append("""<!doctype html>
-<html lang="es">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Apariencia</title>
-  <link rel="manifest" href="/static/manifest.json">
-  <meta name="theme-color" content="#2E3B8E">
-  <link rel="apple-touch-icon" href="/static/icon-192.png">
-  <link rel="stylesheet" href="/static/portal-theme.css">
-""" + fonts_preview_link + """
-  <style>
-    .opciones{display:flex; flex-wrap:wrap; gap:10px; margin:10px 0 4px 0}
-    .chip{
-      display:inline-flex; align-items:center; gap:10px;
-      border:1px solid var(--line); border-radius:999px; padding:10px 16px;
-      cursor:pointer; font-size:14px; color:var(--text); user-select:none;
-    }
-    .chip:hover{border-color:var(--accent)}
-    .chip:has(input:checked){border-color:var(--accent); background:rgba(244,196,48,.08)}
-    .chip input{width:auto; accent-color:var(--accent)}
-    .chip .muestra{
-      width:34px; height:22px; border-radius:6px; display:inline-block;
-      border:1px solid rgba(255,255,255,.25); position:relative; overflow:hidden; flex:none;
-    }
-    .chip .muestra i{
-      position:absolute; left:5px; top:5px; right:5px; bottom:5px;
-      border-radius:4px; display:block;
-    }
-    .seccion{margin-top:24px}
-    .seccion h3{margin:0 0 4px 0}
-    .ayuda{font-size:13px; color:var(--text-muted); margin:2px 0 6px 0}
-    .avatar-prev{
-      width:64px; height:64px; border-radius:50%; object-fit:cover;
-      border:2px solid var(--line); vertical-align:middle; margin-right:10px;
-    }
-    input[type=file]{width:auto; max-width:100%}
-    .muestrario{
-      border:1px dashed var(--line); border-radius:var(--radius);
-      padding:18px; margin-top:10px;
-    }
-    .muestrario .fila{display:flex; gap:14px; align-items:center; flex-wrap:wrap; margin-top:12px}
-  </style>
-</head>
-<body>
-  <div class="top-logo">
-    <img src="/static/icon-192.png" alt="SIA Sueldos">
-    <span class="top-logo-text">SIA</span>
-  </div>
-
-  <div class="container">
-    <div class="header">
-      <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:16px">
-        <div>
-          <h1>🎨 Apariencia</h1>
-          <div class="subtitle">Personalizá cómo ves tu portal. Solo lo ves vos, y los cambios se previsualizan al instante.</div>
-        </div>
-        <div><a href="/portal" class="btn">← Volver al inicio</a></div>
-      </div>
-    </div>
-""")
-
-    if msg in MSGS:
-        css, texto = MSGS[msg]
-        html.append(f"<div class='alert {css}'>{texto}</div>")
-
-    html.append("<form method='post' enctype='multipart/form-data' class='card'>")
-
-    # --- Fondo ---
-    html.append("<div class='seccion'><h3>🌌 Fondo</h3>")
-    html.append("<div class='ayuda'>Elegí tu paleta. Tocá una y mirá cómo cambia toda la página.</div>")
-    html.append("<div class='opciones'>")
-    for t in PORTAL_THEMES:
-        ck = " checked" if cur_theme == t["key"] else ""
-        bg_show = t["bg"] or "#0f1629"
-        card_show = t["card"] or "#1a2342"
-        html.append(
-            f"<label class='chip'><input type='radio' name='theme' value='{t['key']}'{ck}>"
-            f"<span class='muestra' style='background:{bg_show}'><i style='background:{card_show}'></i></span>"
-            f"{esc(t['label'])}</label>"
-        )
-    html.append("</div></div>")
-
-    # --- Tipografía ---
-    html.append("<div class='seccion'><h3>🔤 Tipografía</h3>")
-    html.append("<div class='ayuda'>Cada opción está escrita en su propia letra.</div>")
-    html.append("<div class='opciones'>")
-    for f in PORTAL_FONTS:
-        ck = " checked" if cur_font == f["key"] else ""
-        style = f" style=\"font-family:{esc(f['stack'])}\"" if f["stack"] else ""
-        html.append(
-            f"<label class='chip'{style}><input type='radio' name='font' value='{f['key']}'{ck}>{esc(f['label'])}</label>"
-        )
-    html.append("</div></div>")
-
-    # --- Tamaño ---
-    html.append("<div class='seccion'><h3>🔍 Tamaño de letra</h3>")
-    html.append("<div class='opciones'>")
-    for s in PORTAL_FONT_SIZES:
-        ck = " checked" if cur_size == s["key"] else ""
-        html.append(f"<label class='chip'><input type='radio' name='font_size' value='{s['key']}'{ck}>{esc(s['label'])}</label>")
-    html.append("</div></div>")
-
-    # --- Densidad ---
-    html.append("<div class='seccion'><h3>📐 Densidad</h3>")
-    html.append("<div class='ayuda'>Compacta = más información en pantalla (ideal para las tablas de recibos).</div>")
-    html.append("<div class='opciones'>")
-    for d in PORTAL_DENSITIES:
-        ck = " checked" if cur_density == d["key"] else ""
-        html.append(f"<label class='chip'><input type='radio' name='density' value='{d['key']}'{ck}>{esc(d['label'])}</label>")
-    html.append("</div></div>")
-
-    # --- Animaciones ---
-    html.append("<div class='seccion'><h3>✨ Animaciones</h3>")
-    html.append("<div class='opciones'>")
-    for m in PORTAL_MOTION:
-        ck = " checked" if cur_motion == m["key"] else ""
-        html.append(f"<label class='chip'><input type='radio' name='motion' value='{m['key']}'{ck}>{esc(m['label'])}</label>")
-    html.append("</div></div>")
-
-    # --- Foto ---
-    html.append("<div class='seccion'><h3>📷 Tu foto</h3>")
-    html.append("<div class='ayuda'>Aparece al lado del logo, arriba de todas las páginas.</div>")
-    if p.get("has_avatar"):
-        v = int(p.get("updated_at") or 0)
-        html.append(f"<img class='avatar-prev' id='avatar-prev' src='/portal/avatar?v={v}' alt='Tu foto'>")
-        html.append("<label style='display:inline-flex;align-items:center;gap:6px;cursor:pointer;text-transform:none'>"
-                    "<input type='checkbox' name='clear_avatar' value='1' id='clear-avatar' style='width:auto'> Quitar foto</label><br>")
-    html.append("<input type='file' name='avatar' id='avatar-file' accept='.png,.jpg,.jpeg,.webp'>")
-    html.append("<div class='ayuda'>PNG, JPG o WebP · máximo 300 KB · ideal cuadrada.</div>")
-    html.append("</div>")
-
-    # --- Muestrario para la vista previa ---
-    html.append("""
-    <div class='seccion'><h3>👀 Así se ve</h3>
-    <div class='muestrario'>
-      <h3 style='margin:0'>Recibos de sueldo</h3>
-      <div class='subtitle'>Un ejemplo de cómo queda tu portal con lo que elegiste.</div>
-      <div class='fila'>
-        <button type='button' class='btn primary'>Descargar recibo</button>
-        <button type='button' class='btn'>Ver historial</button>
-        <span class='badge badge-success'>✓ Firmado</span>
-      </div>
-      <div class='stat' style='max-width:220px; margin-top:14px'>
-        <div class='stat-value'>98%</div>
-        <div class='stat-label'>Tasa de firma</div>
-      </div>
-    </div>
-    </div>
-""")
-
-    html.append("<button class='btn primary' type='submit' style='margin-top:22px'>💾 Guardar</button>")
-    html.append("<span class='ayuda' style='margin-left:12px'>La vista previa no se guarda hasta que toques Guardar.</span>")
-    html.append("</form>")
-    html.append("</div>")
-
-    # Vista previa en vivo: mismo CSS que inyecta el servidor, armado en el navegador.
-    script = (_APARIENCIA_PREVIEW_JS
-              .replace("__THEMES__", json.dumps({t["key"]: t for t in PORTAL_THEMES}))
-              .replace("__FONTS__", json.dumps({f["key"]: {"stack": f["stack"], "gf": f["gf"]} for f in PORTAL_FONTS}))
-              .replace("__SIZES__", json.dumps({s["key"]: s["zoom"] for s in PORTAL_FONT_SIZES}))
-              .replace("__LIGHT__", json.dumps(PORTAL_LIGHT_EXTRA_CSS))
-              .replace("__COMPACT__", json.dumps(PORTAL_COMPACT_CSS))
-              .replace("__NOMOTION__", json.dumps(PORTAL_NOMOTION_CSS)))
-    html.append(script)
-    html.append("</body></html>")
-    return Response("".join(html), mimetype="text/html")
 
 
 # =========================
@@ -8000,52 +5539,29 @@ def portal_apariencia():
 def root():
     tok = request.args.get("token", "")
     if tok:
-        return redirect("/admin")
-    # El dominio publico (portalsia.com.ar) manda a la home del portal.
-    # Cualquier otro host (URL interna de Render, localhost, etc.) sigue yendo a /admin.
-    host = (request.host or "").split(":")[0].lower()
-    if host == "portalsia.com.ar" or host.endswith(".portalsia.com.ar"):
-        return redirect("/portal")
+        return redirect(f"/admin?token={tok}")
     return redirect("/admin")
-
-
-# --- iconos pedidos por el browser en la raíz ---
-from flask import send_from_directory
-
-@app.get("/favicon.ico")
-def favicon_root():
-    return send_from_directory(
-        app.static_folder, "favicon.ico", mimetype="image/vnd.microsoft.icon"
-    )
-
-@app.get("/apple-touch-icon.png")
-@app.get("/apple-touch-icon-precomposed.png")
-def apple_touch_icon_root():
-    return send_from_directory(
-        app.static_folder, "apple-touch-icon.png", mimetype="image/png"
-    )
 
 def save_template_sid(tenant: str, cuil: str, period: str, to_whatsapp: str, sid: str, nombre: str = ""):
     now = int(time.time())
     conn = get_db_connection()
     cur = conn.cursor()
     cur.execute("""
-        INSERT INTO message_status
+        INSERT OR IGNORE INTO message_status
         (message_sid, to_whatsapp, tenant, cuil, period, nombre, kind, created_at, last_status, last_status_at)
-        VALUES (%s, %s, %s, %s, %s, %s, 'template', %s, 'sent', %s)
-        ON CONFLICT (message_sid) DO NOTHING
+        VALUES (?, ?, ?, ?, ?, ?, 'template', ?, 'sent', ?)
     """, (sid, to_whatsapp, tenant, cuil, period, nombre, now, now))
     conn.commit()
     conn.close()
 
 def already_sent_template(tenant: str, cuil: str, period: str, to_whatsapp: str) -> bool:
-    conn = get_db_connection()
+    conn = sqlite3.connect(DB_PATH)
     try:
         cur = conn.cursor()
         cur.execute("""
             SELECT 1
             FROM message_status
-            WHERE tenant=%s AND cuil=%s AND period=%s AND to_whatsapp=%s AND kind='template'
+            WHERE tenant=? AND cuil=? AND period=? AND to_whatsapp=? AND kind='template'
             LIMIT 1
         """, (tenant, cuil, period, to_whatsapp))
 
@@ -8053,88 +5569,6 @@ def already_sent_template(tenant: str, cuil: str, period: str, to_whatsapp: str)
     finally:
         conn.close()
 
-
-
-@app.route("/admin/login", methods=["GET", "POST"])
-def admin_login():
-    # Si ya hay sesión activa, vamos directo al destino.
-    nxt = request.args.get("next") or request.form.get("next") or "/admin"
-    # Anti open-redirect: solo permitimos rutas internas.
-    if not nxt.startswith("/") or nxt.startswith("//"):
-        nxt = "/admin"
-
-    if admin_session_active():
-        return redirect(nxt)
-
-    error = ""
-    if request.method == "POST":
-        pwd = (request.form.get("password") or "").strip()
-        if not ADMIN_TOKEN:
-            error = "El admin no está configurado (falta ADMIN_TOKEN en el servidor)."
-        elif pwd and hmac.compare_digest(pwd, ADMIN_TOKEN):
-            session["admin_authed"] = True
-            session["admin_authed_at"] = int(time.time())
-            session.permanent = False
-            log.info("ADMIN LOGIN OK desde %s", request.remote_addr)
-            return redirect(nxt)
-        else:
-            time.sleep(0.8)  # frena fuerza bruta contra el formulario
-            error = "Clave incorrecta."
-            log.warning("ADMIN LOGIN fallido desde %s", request.remote_addr)
-
-    error_html = f"<div class='err'>{esc(error)}</div>" if error else ""
-    page = f"""<!doctype html>
-<html lang="es"><head>
-<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Admin · Ingresar</title>
-<style>
-  :root {{ --bg:#0b1220; --text:#e8eefc; --line:rgba(255,255,255,.12); --accent:#5aa7ff; }}
-  *{{box-sizing:border-box}}
-  body{{margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;
-    font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;
-    background:radial-gradient(1000px 600px at 30% -10%, rgba(90,167,255,.20), transparent 60%), var(--bg);
-    color:var(--text);padding:20px;}}
-  .card{{width:100%;max-width:380px;border:1px solid var(--line);border-radius:16px;
-    background:rgba(255,255,255,.04);padding:28px;box-shadow:0 20px 60px rgba(0,0,0,.4);}}
-  h1{{font-size:20px;margin:0 0 6px}}
-  p.sub{{margin:0 0 20px;color:#9fb2d6;font-size:14px}}
-  label{{display:block;font-size:13px;margin-bottom:6px;color:#cdd9f0}}
-  input[type=password]{{width:100%;padding:12px 14px;border-radius:10px;border:1px solid var(--line);
-    background:rgba(0,0,0,.25);color:var(--text);font-size:15px;}}
-  button{{margin-top:16px;width:100%;padding:12px;border:0;border-radius:10px;cursor:pointer;
-    background:var(--accent);color:#04122b;font-weight:600;font-size:15px;}}
-  .err{{margin-bottom:14px;padding:10px 12px;border-radius:10px;background:rgba(248,113,113,.15);
-    border:1px solid rgba(248,113,113,.4);color:#fecaca;font-size:14px;}}
-</style></head>
-<body>
-  <form class="card" method="post" action="/admin/login">
-    <h1>🔐 Panel de administración</h1>
-    <p class="sub">Ingresá la clave de acceso para continuar.</p>
-    {error_html}
-    <input type="hidden" name="next" value="{esc(nxt)}">
-    <label for="password">Clave</label>
-    <input id="password" name="password" type="password" autofocus autocomplete="current-password">
-    <button type="submit">Ingresar</button>
-  </form>
-</body></html>"""
-    return Response(page, mimetype="text/html")
-
-
-@app.get("/admin/logout")
-def admin_logout():
-    session.pop("admin_authed", None)
-    session.pop("admin_authed_at", None)
-    return redirect("/admin/login")
-
-
-@app.get("/admin/sentry_test")
-def admin_sentry_test():
-    # Dispara un error a propósito para verificar el circuito de alertas.
-    # Solo accesible con sesión de admin (o header X-Admin-Token).
-    auth = require_admin()
-    if auth:
-        return auth
-    raise RuntimeError("Prueba de Sentry: si ves este error en sentry.io, las alertas funcionan")
 
 
 @app.get("/admin")
@@ -8286,9 +5720,7 @@ def admin_home():
     html.append("<div class='row' style='gap:10px;justify-content:flex-end'>")
     html.append("<button class='eye-btn' type='button' id='eyeAll' title='Mostrar/ocultar todas'>👁️</button>")
     html.append(f"<div class='muted'>Token: <code>{esc(token)}</code></div>")
-    html.append("<a href='/admin/portal_users' class='btn'>👥 Usuarios del Portal</a>")
-    html.append("<a href='/admin/portal_activity' class='btn'>🕑 Actividad del Portal</a>")
-    html.append("<a href='/admin/logout' class='btn secondary' style='float:right'>Salir</a>")
+    html.append("<a href='/admin/portal_users?token=" + esc(token) + "' class='btn'>👥 Usuarios del Portal</a>")
     html.append("</div>")
 
     html.append("</div>")  # topbar
@@ -8319,8 +5751,8 @@ def admin_home():
         for t in tenants:
             slug = t["slug"]
             name = t.get("display_name") or slug
-            panel_url = f"/admin/panel?tenant={esc(slug)}"
-            test_url = f"/admin/send_test?tenant={esc(slug)}"
+            panel_url = f"/admin/panel?tenant={esc(slug)}&token={esc(token)}"
+            test_url = f"/admin/send_test?tenant={esc(slug)}&token={esc(token)}"
 
             html.append(f"""
               <div class="tile" data-name="{esc(name).lower()} {esc(slug).lower()}" data-tenant="{esc(slug)}">
@@ -8526,7 +5958,7 @@ def admin_verifications_import():
     import pandas as pd
     df = pd.read_excel(f)
     if df is None or df.empty:
-        return redirect(f"/admin/panel?tenant={tenant}&msg=verif_import_empty")
+        return redirect(f"/admin/panel?tenant={tenant}&token={token}&msg=verif_import_empty")
 
     df.columns = [str(c).strip().lower() for c in df.columns]
 
@@ -8573,7 +6005,7 @@ def admin_verifications_import():
         # Import: marca como verificado "sin DNI" (solo vínculo número<->cuil)
         cur.execute("""
             INSERT INTO verifications (tenant, cuil, to_whatsapp, nombre, dni_hash, dni_last4, verified_at, updated_at)
-            VALUES (%s, %s, %s, %s, NULL, NULL, %s, %s)
+            VALUES (?, ?, ?, ?, NULL, NULL, ?, ?)
             ON CONFLICT(tenant, cuil, to_whatsapp)
             DO UPDATE SET
                 nombre=excluded.nombre,
@@ -8585,7 +6017,7 @@ def admin_verifications_import():
     conn.commit()
     conn.close()
 
-    return redirect(f"/admin/panel?tenant={tenant}&msg=verif_import_ok&n={ok}&skipped={skipped}")
+    return redirect(f"/admin/panel?tenant={tenant}&token={token}&msg=verif_import_ok&n={ok}&skipped={skipped}")
 
 
 @app.post("/admin/verifications_update")
@@ -8593,7 +6025,7 @@ def admin_verifications_import():
 def admin_verifications_update():
     token = _get_admin_token_from_request()
     tenant = (request.form.get("tenant") or "").strip().lower()
-    return redirect(f"/admin/panel?tenant={tenant}&msg=verif_update_disabled")
+    return redirect(f"/admin/panel?tenant={tenant}&token={token}&msg=verif_update_disabled")
 
 
 @app.post("/admin/verifications_delete")
@@ -8611,13 +6043,13 @@ def admin_verifications_delete():
     cur = conn.cursor()
     cur.execute("""
     DELETE FROM verifications
-    WHERE tenant=%s AND cuil=%s AND to_whatsapp=%s
+    WHERE tenant=? AND cuil=? AND to_whatsapp=?
     """, (tenant, cuil, to_whatsapp))
 
     conn.commit()
     conn.close()
 
-    return redirect(f"/admin/panel?tenant={tenant}&msg=verif_deleted")
+    return redirect(f"/admin/panel?tenant={tenant}&token={token}&msg=verif_deleted")
 
 from io import BytesIO
 from openpyxl import Workbook
@@ -8642,7 +6074,7 @@ def ts_to_str(ts) -> str:
 
         return dt.datetime.fromtimestamp(int(ts_f)).strftime("%d/%m/%Y %H:%M:%S")
     except Exception as e:
-        log.exception("%s %s %s", "ts_to_str ERROR:", ts, repr(e))
+        print("ts_to_str ERROR:", ts, repr(e))
         return ""
 
 
@@ -8655,6 +6087,7 @@ def generate_excel_report_v2(tenant: str, period_filter: str = "") -> BytesIO:
     period_filter = norm_period_label(period_filter)
 
     conn = get_db_connection()
+    conn.row_factory = sqlite3.Row
     cur = conn.cursor()
 
     # message_status
@@ -8663,17 +6096,15 @@ def generate_excel_report_v2(tenant: str, period_filter: str = "") -> BytesIO:
             to_whatsapp, tenant, cuil, period, nombre, kind,
             created_at, delivered_at, read_at, failed_at
         FROM message_status
-        WHERE tenant = %s
+        WHERE tenant = ?
     """, (tenant,))
     msg_rows = cur.fetchall()
 
-    # pending_views (último period por whatsapp)
+    # pending_views (último period por (whatsapp,cuil))
     cur.execute("""
-        SELECT DISTINCT ON (to_whatsapp)
-            to_whatsapp, tenant, cuil, period, created_at AS last_ts
+        SELECT to_whatsapp, tenant, cuil, period, MAX(created_at) as last_ts
         FROM pending_views
-        WHERE tenant = %s
-        ORDER BY to_whatsapp, created_at DESC
+        WHERE tenant = ?
     """, (tenant,))
     pv_rows = cur.fetchall()
 
@@ -8688,7 +6119,7 @@ def generate_excel_report_v2(tenant: str, period_filter: str = "") -> BytesIO:
     cur.execute("""
         SELECT tenant, cuil, period, estado, updated_at
         FROM recibo_estado
-        WHERE tenant = %s
+        WHERE tenant = ?
     """, (tenant,))
     estado_rows = cur.fetchall()
 
@@ -8696,7 +6127,7 @@ def generate_excel_report_v2(tenant: str, period_filter: str = "") -> BytesIO:
     cur.execute("""
         SELECT tenant,cuil,period,to_whatsapp,request_count,last_requested_at
         FROM receipt_requests
-        WHERE tenant = %s
+        WHERE tenant = ?
     """, (tenant,))
     rr_rows = cur.fetchall()
 
@@ -8882,7 +6313,7 @@ def find_pdf_with_retry(tenant, cuil, period, tries=4):
                 continue
             raise
     # si agotó reintentos, devolvemos None (no tumbamos la cola)
-    log.info("%s %s %s %s %s", "DRIVE RETRY EXHAUSTED:", tenant, cuil, period, last)
+    print("DRIVE RETRY EXHAUSTED:", tenant, cuil, period, last)
     return None
 
 def get_queue_stats(tenant: str, period: str) -> dict:
@@ -8891,10 +6322,10 @@ def get_queue_stats(tenant: str, period: str) -> dict:
     cur.execute("""
       SELECT status, COUNT(*) as n
       FROM template_send_queue
-      WHERE tenant=%s AND period=%s
+      WHERE tenant=? AND period=?
       GROUP BY status
     """, (tenant, period))
-    d = {r['status']: r['n'] for r in cur.fetchall()}
+    d = {r[0]: r[1] for r in cur.fetchall()}
     conn.close()
     # asegurar claves
     for k in ("PENDING","SENT","FAILED","SKIPPED"):
@@ -8994,9 +6425,7 @@ def admin_seguimiento():
     select, input{
       background:rgba(0,0,0,.25);border:1px solid var(--line);
       color:var(--text);padding:10px;border-radius:12px;outline:none;
-      color-scheme:dark;
     }
-    select option{background-color:#0f1b33;color:var(--text)}
     .sep{height:1px;background:var(--line);margin:12px 0}
     table{width:100%;border-collapse:separate;border-spacing:0}
     th, td{padding:10px;border-bottom:1px solid var(--line);font-size:13px}
@@ -9024,13 +6453,14 @@ def admin_seguimiento():
     html.append(f"<div class='subtitle'><b>Empresa:</b> {esc(t.get('display_name',''))}</div>")
     html.append("</div>")
     html.append("<div class='row'>")
-    html.append(f"<a class='btn secondary' href='/admin/panel?tenant={esc(tenant)}'>← Volver al panel</a>")
+    html.append(f"<a class='btn secondary' href='/admin/panel?tenant={esc(tenant)}&token={esc(token)}'>← Volver al panel</a>")
     html.append("</div>")
     html.append("</div>")
 
     # Selector de período
     html.append("<div class='card'>")
     html.append("<form method='get'>")
+    html.append(f"<input type='hidden' name='token' value='{esc(token)}'>")
     html.append(f"<input type='hidden' name='tenant' value='{esc(tenant)}'>")
     html.append("<div class='row'>")
     html.append("<div>")
@@ -9291,9 +6721,7 @@ def admin_panel():
       border-radius:12px;
       outline:none;
       min-width: 180px;
-      color-scheme:dark;
     }
-    select option{background-color:#0f1b33;color:var(--text)}
     label{font-size:12px;color:var(--muted)}
     .badge{
       display:inline-flex;align-items:center;gap:6px;
@@ -9304,7 +6732,7 @@ def admin_panel():
     }
     .badge b{color:var(--text)}
     .badge.ok{border-color:rgba(52,211,153,.35)}
-    .badge.warn{border-color:rgba(251,191,36,.35)}ff
+    .badge.warn{border-color:rgba(251,191,36,.35)}
     .badge.bad{border-color:rgba(251,113,133,.35)}
     .sep{height:1px;background:var(--line);margin:12px 0}
     table{width:100%;border-collapse:separate;border-spacing:0}
@@ -9316,18 +6744,7 @@ def admin_panel():
     }
     th{font-size:12px;color:var(--muted);text-align:left}
     tr:hover td{background:rgba(255,255,255,.02)}
-    .table-wrap{
-    overflow:auto;
-    max-height:360px;
-    border:1px solid var(--line);
-    border-radius:14px;
-    }
-    .table-wrap thead th{
-    position:sticky;
-    top:0;
-    background:#0f1b33;
-    z-index:1;
-    }
+    .table-wrap{overflow:auto;border:1px solid var(--line);border-radius:14px}
     .right{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
     .hint{font-size:12px;color:var(--muted);margin-top:6px}
     .kpi{display:flex;gap:8px;flex-wrap:wrap;margin-top:8px}
@@ -9345,12 +6762,11 @@ def admin_panel():
     html.append(f"<div class='subtitle'><b>Empresa:</b> {esc(t.get('display_name',''))} · <span class='pill'>slug <code>{esc(t.get('slug',''))}</code></span></div>")
     html.append("</div>")
     html.append("<div class='right'>")
-    html.append(f"<a class='btn secondary' href='/admin'>← Volver</a>")
-    html.append(f"<a class='btn' href='/admin/reenviar_template'>📤 Reenviar template</a>")
-    html.append(f"<a class='btn' href='/admin/send_test?tenant={esc(tenant)}'>📤 Envío individual</a>")
-    html.append(f"<a class='btn' href='/admin/reenviar_fallidos'>🔄 Reenviar fallidos</a>")
-    html.append(f"<a class='btn' href='/admin/seguimiento?tenant={esc(tenant)}'>⚠️ Seguimiento</a>")
-    html.append(f"<a class='btn' href='/admin/branding?tenant={esc(tenant)}'>🎨 Personalización</a>")
+    html.append(f"<a class='btn secondary' href='/admin?token={esc(token)}'>← Volver</a>")
+    html.append(f"<a class='btn' href='/admin/reenviar_template?token={esc(token)}'>📤 Reenviar template</a>")
+    html.append(f"<a class='btn' href='/admin/send_test?tenant={esc(tenant)}&token={esc(token)}'>📤 Envío individual</a>")
+    html.append(f"<a class='btn' href='/admin/reenviar_fallidos?token={esc(token)}'>🔄 Reenviar fallidos</a>")
+    html.append(f"<a class='btn' href='/admin/seguimiento?tenant={esc(tenant)}&token={esc(token)}'>⚠️ Seguimiento</a>")
     html.append("</div>")
     html.append("</div>")
 
@@ -9364,6 +6780,7 @@ def admin_panel():
 
     # Start queue
     html.append("<form method='post' action='/admin/send_template_queue_start'>")
+    html.append(f"<input type='hidden' name='token' value='{esc(token)}'>")
     html.append(f"<input type='hidden' name='tenant' value='{esc(tenant)}'>")
     html.append("<div class='row'>")
     html.append("<div>")
@@ -9384,6 +6801,94 @@ def admin_panel():
     html.append("<button class='btn' type='submit'>🚀 Encolar envío a toda la empresa</button>")
     html.append("</div>")
     html.append("</form>")
+    html.append("""
+    <div class="sep"></div>
+    <h3>👀 Preview de destinatarios</h3>
+    <div id="previewMeta" class="muted">Cargando...</div>
+
+    <div class="table-wrap" style="margin-top:10px">
+    <table>
+        <thead>
+        <tr><th>Nombre</th><th>WhatsApp</th><th>CUIL</th></tr>
+        </thead>
+        <tbody id="previewBody">
+        <tr><td colspan="3" class="muted">Cargando...</td></tr>
+        </tbody>
+    </table>
+    </div>
+
+    <div class="hint">Se actualiza al cambiar Período o Límite.</div>
+
+    <script>
+    (async function(){
+    const tenant = %s;
+    const token  = %s;
+
+    const elPeriod = document.getElementById('massPeriod');
+    const elLimit  = document.getElementById('massLimit');
+    const meta = document.getElementById('previewMeta');
+    const body = document.getElementById('previewBody');
+
+    function escapeHtml(s){
+        return String(s ?? '')
+        .replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('>','&gt;')
+        .replaceAll('"','&quot;').replaceAll("'","&#39;");
+    }
+
+    async function refresh(){
+        const period = (elPeriod.value || '').trim();
+        const limit  = (elLimit.value || '0').trim();
+
+        meta.textContent = "Cargando preview...";
+        body.innerHTML = "<tr><td colspan='3' class='muted'>Cargando...</td></tr>";
+
+        const qs = new URLSearchParams({tenant, token, period, limit, require_pdf:'true'});
+
+        try{
+        const r = await fetch('/admin/send_template_preview?' + qs.toString(), {
+            headers: {'Accept': 'application/json'}
+        });
+        const j = await r.json();
+        if(!j.ok){
+            meta.textContent = "Error: " + (j.error || "preview");
+            body.innerHTML = "<tr><td colspan='3' class='muted'>No disponible</td></tr>";
+            return;
+        }
+
+        meta.textContent = `Coinciden: ${j.total_match} · Mostrando: ${j.showing}` +
+            ((j.limit && j.limit > 0) ? ` · Limit: ${j.limit}` : "");
+
+        const rows = j.recipients || [];
+        if(rows.length === 0){
+            body.innerHTML = "<tr><td colspan='3' class='muted'>No hay destinatarios.</td></tr>";
+            return;
+        }
+
+        body.innerHTML = rows.map(x => (
+            `<tr>
+            <td>${escapeHtml(x.nombre)}</td>
+            <td>${escapeHtml(x.whatsapp)}</td>
+            <td>${escapeHtml(x.cuil)}</td>
+            </tr>`
+        )).join('');
+
+        }catch(e){
+        meta.textContent = "Error cargando preview";
+        body.innerHTML = "<tr><td colspan='3' class='muted'>Error</td></tr>";
+        }
+    }
+
+    elPeriod.addEventListener('change', refresh);
+    elLimit.addEventListener('input', () => {
+        clearTimeout(window.__pv_t);
+        window.__pv_t = setTimeout(refresh, 250);
+    });
+
+    refresh();
+    })();
+    </script>
+    """ % (repr(tenant), repr(token)))
+
     # Queue section
     html.append("<div class='sep'></div>")
     html.append("<h3>⏳ Cola de envíos</h3>")
@@ -9398,6 +6903,7 @@ def admin_panel():
         html.append("</div>")
 
         html.append("<form method='post' action='/admin/send_template_queue_tick' style='margin-top:10px;'>")
+        html.append(f"<input type='hidden' name='token' value='{esc(token)}'>")
         html.append(f"<input type='hidden' name='tenant' value='{esc(tenant)}'>")
         html.append(f"<input type='hidden' name='period' value='{esc(panel_period)}'>")
         html.append("<div class='row'>")
@@ -9413,6 +6919,7 @@ def admin_panel():
 
         # NUEVO: Botón de envío automático
         html.append("<form method='post' action='/admin/send_auto' style='margin-top:10px;'>")
+        html.append(f"<input type='hidden' name='token' value='{esc(token)}'>")
         html.append(f"<input type='hidden' name='tenant' value='{esc(tenant)}'>")
         html.append(f"<input type='hidden' name='period' value='{esc(panel_period)}'>")
         html.append("<input type='hidden' name='batch_size' value='10'>")
@@ -9420,7 +6927,7 @@ def admin_panel():
         html.append("</form>")
 
         html.append("<div class='hint'>Cron URL (POST) sugerida:</div>")
-        html.append(f"<div class='hint mono'><code>/admin/send_template_queue_tick?tenant={esc(tenant)}&period={esc(panel_period)}&batch_size=10&mode=json&token=TU_ADMIN_TOKEN</code> · para el cron: reemplazá TU_ADMIN_TOKEN por el valor real (o mandalo por header X-Admin-Token y ni siquiera queda en los access logs)</div>")
+        html.append(f"<div class='hint mono'><code>/admin/send_template_queue_tick?tenant={esc(tenant)}&period={esc(panel_period)}&batch_size=10&token={esc(token)}&mode=json</code></div>")
     else:
         html.append("<div class='muted'>Elegí un período en Reportes para ver la cola y poder procesarla.</div>")
 
@@ -9433,6 +6940,7 @@ def admin_panel():
     html.append("<div class='sep'></div>")
 
     html.append("<form method='get' action='/admin/panel'>")
+    html.append(f"<input type='hidden' name='token' value='{esc(token)}'>")
     html.append(f"<input type='hidden' name='tenant' value='{esc(tenant)}'>")
     html.append("<label>Período</label><br>")
     html.append("<div class='row' style='margin-top:6px'>")
@@ -9449,13 +6957,13 @@ def admin_panel():
     html.append("<div class='sep'></div>")
     html.append("<div class='row'>")
     html.append(
-        f"<a class='btn' href='/admin/report_recibos.xlsx?tenant={esc(tenant)}&period={period_q}'>📄 Reporte recibos (XLSX)</a>"
+        f"<a class='btn' href='/admin/report_recibos.xlsx?tenant={esc(tenant)}&period={period_q}&token={esc(token)}'>📄 Reporte recibos (XLSX)</a>"
     )
     html.append(
-        f"<a class='btn' href='/admin/report_recibos.pdf?tenant={esc(tenant)}&period={period_q}'>🧾 Informe (PDF)</a>"
+        f"<a class='btn' href='/admin/report_recibos.pdf?tenant={esc(tenant)}&period={period_q}&token={esc(token)}'>🧾 Informe (PDF)</a>"
     )
     html.append(
-        f"<a class='btn secondary' href='/admin/report_envios.csv?tenant={esc(tenant)}'>📤 Envíos (CSV)</a>"
+        f"<a class='btn secondary' href='/admin/report_envios.csv?tenant={esc(tenant)}&token={esc(token)}'>📤 Envíos (CSV)</a>"
     )
     html.append("</div>")
 
@@ -9463,6 +6971,7 @@ def admin_panel():
     html.append("<h3>🔎 Buscar períodos por CUIL</h3>")
     html.append(f"""
       <form method="get" action="/admin/periodos">
+        <input type="hidden" name="token" value="{esc(token)}">
         <input type="hidden" name="tenant" value="{esc(tenant)}">
         <label>CUIL</label><br>
         <div class="row" style="margin-top:6px">
@@ -9477,6 +6986,7 @@ def admin_panel():
     html.append("<div class='muted'>Borra <code>pending_views</code> y <code>recibo_estado</code> para esta empresa (y período si lo completás).</div>")
     html.append(f"""
       <form method="post" action="/admin/reset" onsubmit="return confirm('¿Seguro? Esto borra pending y estados.');" style="margin-top:10px">
+        <input type="hidden" name="token" value="{esc(token)}">
         <input type="hidden" name="tenant" value="{esc(tenant)}">
         <label>Período (opcional, mm/aaaa)</label><br>
         <div class="row" style="margin-top:6px">
@@ -9504,7 +7014,8 @@ def admin_panel():
         html.append(f"""
           <form id="bulkForm" method="post" action="/admin/verifications_delete_bulk"
                 onsubmit="return confirm('¿Borrar verificaciones seleccionadas?');">
-                <input type="hidden" name="tenant" value="{esc(tenant)}">
+            <input type="hidden" name="token" value="{esc(token)}">
+            <input type="hidden" name="tenant" value="{esc(tenant)}">
           </form>
         """)
 
@@ -9539,7 +7050,8 @@ def admin_panel():
             html.append(f"""
               <form method="post" action="/admin/verifications_delete"
                     onsubmit="return confirm('¿Borrar verificación?');" style="margin:0">
-                        <input type="hidden" name="tenant" value="{esc(tenant)}">
+                <input type="hidden" name="token" value="{esc(token)}">
+                <input type="hidden" name="tenant" value="{esc(tenant)}">
                 <input type="hidden" name="cuil" value="{esc(r['cuil'])}">
                 <input type="hidden" name="to_whatsapp" value="{esc(r['to_whatsapp'])}">
                 <button class="btn small danger" type="submit">Borrar</button>
@@ -9562,6 +7074,7 @@ def admin_panel():
       <h3>📥 Importar verificaciones</h3>
       <div class="muted">Subí un Excel con columnas: <code>cuil</code>, <code>whatsapp</code> (o teléfono). Opcional: <code>dni</code>.</div>
       <form method="post" action="/admin/verifications_import" enctype="multipart/form-data" style="margin-top:10px">
+        <input type="hidden" name="token" value="{esc(token)}">
         <input type="hidden" name="tenant" value="{esc(tenant)}">
         <div class="row">
           <input type="file" name="file" accept=".xlsx" required>
@@ -9579,11 +7092,11 @@ def admin_panel():
     html.append("<h3>👀 Preview Excel de envíos</h3>")
     html.append(f"<div class='muted'>Filas: <b>{len(envios_rows)}</b></div>")
     html.append("</div>")
-    html.append(f"<a class='btn secondary' href='/admin/panel?tenant={esc(tenant)}&refresh=1&period={esc(selected_period or '')}'>🔄 Refrescar</a>")
+    html.append(f"<a class='btn secondary' href='/admin/panel?tenant={esc(tenant)}&token={esc(token)}&refresh=1&period={esc(selected_period or '')}'>🔄 Refrescar</a>")
     html.append("</div>")
     html.append("<div class='sep'></div>")
 
-    sample = envios_rows
+    sample = envios_rows[:10]
     if sample:
         cols = list(sample[0].keys())
         html.append("<div class='table-wrap'>")
@@ -9636,17 +7149,17 @@ def admin_portal_users():
             else:
                 msg = f"error&details={result['message']}"
             
-            return redirect(f"/admin/portal_users?msg={msg}")
+            return redirect(f"/admin/portal_users?token={token}&msg={msg}")
         
         elif action == "toggle":
             user_id = int(request.form.get("user_id", 0))
             toggle_client_user_active(user_id)
-            return redirect(f"/admin/portal_users?msg=toggled")
+            return redirect(f"/admin/portal_users?token={token}&msg=toggled")
         
         elif action == "delete":
             user_id = int(request.form.get("user_id", 0))
             delete_client_user(user_id)
-            return redirect(f"/admin/portal_users?msg=deleted")
+            return redirect(f"/admin/portal_users?token={token}&msg=deleted")
     
     # Listar usuarios
     users = get_all_client_users()
@@ -9685,9 +7198,7 @@ def admin_portal_users():
     input, select{
       background:rgba(0,0,0,.25); border:1px solid var(--line);
       color:var(--text); padding:10px; border-radius:8px; margin:5px 0;
-      color-scheme:dark;
     }
-    select option{background-color:#0f1b33;color:var(--text)}
     .btn{
       display:inline-block; padding:10px 16px; border-radius:8px;
       border:1px solid var(--line); background:rgba(255,255,255,.06);
@@ -9708,7 +7219,7 @@ def admin_portal_users():
 <div class="wrap">
 """)
     
-    html.append(f"<a href='/admin' class='btn'>← Volver al admin</a>")
+    html.append(f"<a href='/admin?token={esc(token)}' class='btn'>← Volver al admin</a>")
     
     html.append("<div class='card'>")
     html.append("<h2>👥 Usuarios del Portal</h2>")
@@ -9735,6 +7246,7 @@ def admin_portal_users():
     html.append("<div class='card'>")
     html.append("<h3>➕ Crear nuevo usuario</h3>")
     html.append(f"<form method='post'>")
+    html.append(f"<input type='hidden' name='token' value='{esc(token)}'>")
     html.append(f"<input type='hidden' name='action' value='create'>")
     
     html.append("<label>Empresa:</label><br>")
@@ -9744,7 +7256,10 @@ def admin_portal_users():
         html.append(f"<option value='{esc(t['slug'])}'>{esc(t['display_name'])}</option>")
     html.append("</select><br>")
     
-    html.append("<label>Email (será el usuario de acceso):</label><br>")
+    html.append("<label>Usuario (ej: rrhh.empresa):</label><br>")
+    html.append("<input type='text' name='username' required placeholder='rrhh.empresa' style='width:100%;max-width:400px'><br>")
+    
+    html.append("<label>Email:</label><br>")
     html.append("<input type='email' name='email' required placeholder='rrhh@empresa.com' style='width:100%;max-width:400px'><br>")
     
     html.append("<label>Nombre completo:</label><br>")
@@ -9753,6 +7268,7 @@ def admin_portal_users():
     html.append("<button type='submit' class='btn'>Crear usuario</button>")
     html.append("</form>")
     html.append("</div>")
+    
     # Lista de usuarios
     html.append("<div class='card'>")
     html.append(f"<h3>📋 Usuarios existentes ({len(users)})</h3>")
@@ -9779,6 +7295,7 @@ def admin_portal_users():
             
             # Toggle activo/inactivo
             html.append(f"<form method='post' style='display:inline'>")
+            html.append(f"<input type='hidden' name='token' value='{esc(token)}'>")
             html.append(f"<input type='hidden' name='action' value='toggle'>")
             html.append(f"<input type='hidden' name='user_id' value='{u['id']}'>")
             toggle_text = "Desactivar" if u['active'] else "Activar"
@@ -9787,6 +7304,7 @@ def admin_portal_users():
             
             # Eliminar
             html.append(f"<form method='post' style='display:inline' onsubmit='return confirm(\"¿Eliminar usuario?\")'>")
+            html.append(f"<input type='hidden' name='token' value='{esc(token)}'>")
             html.append(f"<input type='hidden' name='action' value='delete'>")
             html.append(f"<input type='hidden' name='user_id' value='{u['id']}'>")
             html.append(f"<button type='submit' class='btn danger'>Eliminar</button>")
@@ -9803,104 +7321,7 @@ def admin_portal_users():
     
     html.append("</div></body></html>")
     return Response("".join(html), mimetype="text/html")
-@app.route("/admin/portal_activity")
-def admin_portal_activity():
-    """Historial de actividad de los usuarios del portal (vista admin)."""
-    auth = require_admin()
-    if auth:
-        return auth
 
-    filtro_tenant = (request.args.get("tenant") or "").strip().lower()
-    filtro_action = (request.args.get("action") or "").strip()
-
-    eventos = get_admin_audit_log(tenant=filtro_tenant, action=filtro_action, limit=300)
-    tenants = get_all_tenants()
-    acciones = ['login', 'logout', 'change_password', 'password_reset', 'delete_certificado']
-
-    html = []
-    html.append("""<!doctype html>
-<html lang="es">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Actividad del Portal</title>
-  <style>
-    :root{
-      --bg:#0b1220; --card:#0f1b33; --muted:#9fb2d0; --text:#eaf0ff;
-      --line:rgba(255,255,255,.08); --ok:#34d399; --bad:#fb7185;
-      --radius:14px; --mono: monospace;
-    }
-    *{box-sizing:border-box}
-    body{
-      margin:0; font-family:system-ui;
-      background: radial-gradient(1200px 700px at 20% -20%, rgba(90,167,255,.25), transparent 60%), var(--bg);
-      color:var(--text); padding:20px;
-    }
-    .wrap{max-width:1100px;margin:0 auto}
-    .card{ border:1px solid var(--line); background:rgba(255,255,255,.03); border-radius:var(--radius); padding:20px; margin-bottom:20px; }
-    h2{margin:0 0 10px 0}
-    .muted{color:var(--muted);font-size:13px}
-    select{ background:rgba(0,0,0,.25); border:1px solid var(--line); color:var(--text); padding:10px; border-radius:8px; margin:5px 0; color-scheme:dark; }
-    select option{ background-color:#0f1b33; color:var(--text); }
-    .btn{ display:inline-block; padding:10px 16px; border-radius:8px; border:1px solid var(--line); background:rgba(255,255,255,.06); cursor:pointer; font-weight:600; text-decoration:none; color:var(--text); margin:5px; }
-    .btn:hover{background:rgba(255,255,255,.1)}
-    table{width:100%; border-collapse:collapse; margin-top:15px}
-    th, td{padding:10px 12px; text-align:left; border-bottom:1px solid var(--line); font-size:13px}
-    th{color:var(--muted); font-size:12px}
-    .mono{font-family:var(--mono); font-size:12px; color:var(--muted)}
-  </style>
-</head>
-<body>
-<div class="wrap">
-""")
-    html.append("<a href='/admin' class='btn'>← Volver al admin</a>")
-
-    html.append("<div class='card'>")
-    html.append("<h2>🕑 Actividad del Portal</h2>")
-    html.append("<div class='muted'>Accesos y acciones de los usuarios de los clientes</div>")
-
-    # Filtros
-    html.append("<form method='get' style='margin-top:14px'>")
-    html.append("<select name='tenant'>")
-    html.append("<option value=''>-- Todas las empresas --</option>")
-    for t in tenants:
-        sel = " selected" if (t['slug'] == filtro_tenant) else ""
-        html.append(f"<option value='{esc(t['slug'])}'{sel}>{esc(t['display_name'])}</option>")
-    html.append("</select> ")
-    html.append("<select name='action'>")
-    html.append("<option value=''>-- Todas las acciones --</option>")
-    for a in acciones:
-        sel = " selected" if (a == filtro_action) else ""
-        html.append(f"<option value='{esc(a)}'{sel}>{esc(_accion_label(a))}</option>")
-    html.append("</select> ")
-    html.append("<button type='submit' class='btn'>Filtrar</button>")
-    html.append("</form>")
-    html.append("</div>")
-
-    # Tabla
-    html.append("<div class='card'>")
-    html.append(f"<h3>Últimos {len(eventos)} movimientos</h3>")
-    if eventos:
-        html.append("<table>")
-        html.append("<thead><tr><th>Fecha</th><th>Empresa</th><th>Usuario</th><th>Acción</th><th>Detalle</th><th>IP</th></tr></thead>")
-        html.append("<tbody>")
-        for e in eventos:
-            quien = e.get('full_name') or e.get('email') or e.get('username') or f"(user #{e.get('user_id','?')})"
-            html.append("<tr>")
-            html.append(f"<td>{esc(ts_str(e.get('created_at')))}</td>")
-            html.append(f"<td>{esc(e.get('tenant','') or '')}</td>")
-            html.append(f"<td>{esc(quien)}</td>")
-            html.append(f"<td>{esc(_accion_label(e.get('action','')))}</td>")
-            html.append(f"<td>{esc(e.get('details','') or '')}</td>")
-            html.append(f"<td class='mono'>{esc(e.get('ip_address','') or '')}</td>")
-            html.append("</tr>")
-        html.append("</tbody></table>")
-    else:
-        html.append("<div class='muted'>No hay actividad registrada con esos filtros.</div>")
-    html.append("</div>")
-
-    html.append("</div></body></html>")
-    return Response("".join(html), mimetype="text/html")
 
 @app.get("/admin/periodos")
 def admin_periodos():
@@ -9925,6 +7346,7 @@ def get_pending_views_over_7days(tenant: str, period: str) -> list:
     Devuelve personas que recibieron el template hace +7 días pero nunca pidieron el PDF.
     """
     conn = get_db_connection()
+    conn.row_factory = sqlite3.Row
     cur = conn.cursor()
     
     seven_days_ago = int(time.time()) - (7 * 24 * 60 * 60)
@@ -9938,10 +7360,10 @@ def get_pending_views_over_7days(tenant: str, period: str) -> list:
             ms.created_at as sent_at,
             ms.message_sid as sent_sid
         FROM message_status ms
-        WHERE ms.tenant = %s
-          AND ms.period = %s
+        WHERE ms.tenant = ?
+          AND ms.period = ?
           AND ms.kind = 'template'
-          AND ms.created_at < %s
+          AND ms.created_at < ?
           AND ms.created_at IS NOT NULL
           AND NOT EXISTS (
             SELECT 1 FROM sent_pdfs sp
@@ -9975,6 +7397,7 @@ def get_pending_signatures_over_7days(tenant: str, period: str) -> list:
     Devuelve personas que recibieron el PDF hace +7 días pero nunca firmaron ni observaron.
     """
     conn = get_db_connection()
+    conn.row_factory = sqlite3.Row
     cur = conn.cursor()
     
     seven_days_ago = int(time.time()) - (7 * 24 * 60 * 60)
@@ -9987,9 +7410,9 @@ def get_pending_signatures_over_7days(tenant: str, period: str) -> list:
             sp.created_at,
             sp.message_sid
         FROM sent_pdfs sp
-        WHERE sp.tenant = %s
-          AND sp.period = %s
-          AND sp.created_at < %s
+        WHERE sp.tenant = ?
+          AND sp.period = ?
+          AND sp.created_at < ?
           AND sp.created_at IS NOT NULL
           AND NOT EXISTS (
             SELECT 1 FROM recibo_estado re
@@ -10043,7 +7466,7 @@ def admin_resend_all_pending_views():
     pending = get_pending_views_over_7days(tenant, period)
     
     if not pending:
-        return redirect(f"/admin/seguimiento?tenant={tenant}&period={period}&msg=no_pending")
+        return redirect(f"/admin/seguimiento?tenant={tenant}&token={token}&period={period}&msg=no_pending")
     
     # Encolar todos para envío automático
     base_url = request.host_url.rstrip('/')
@@ -10078,8 +7501,8 @@ def admin_resend_all_pending_views():
                 cur = conn.cursor()
                 cur.execute("""
                     UPDATE pending_views
-                    SET origin = 'RESEND_MASS', created_at = %s
-                    WHERE tenant = %s AND cuil = %s AND period = %s AND to_whatsapp = %s
+                    SET origin = 'RESEND_MASS', created_at = ?
+                    WHERE tenant = ? AND cuil = ? AND period = ? AND to_whatsapp = ?
                 """, (int(time.time()), tenant, p['cuil'], period, p['whatsapp']))
                 
                 if cur.rowcount == 0:
@@ -10089,22 +7512,22 @@ def admin_resend_all_pending_views():
                 conn.close()
                 
                 sent += 1
-                log.info(f"[RESEND_MASS] Enviado a {p['cuil']}: {sid}")
+                print(f"[RESEND_MASS] Enviado a {p['cuil']}: {sid}")
                 
                 # Pausa entre envíos
                 time.sleep(1)
                 
             except Exception as e:
                 failed += 1
-                log.exception(f"[RESEND_MASS] Error enviando a {p['cuil']}: {e}")
+                print(f"[RESEND_MASS] Error enviando a {p['cuil']}: {e}")
         
-        log.info(f"[RESEND_MASS] Completado. Enviados: {sent}, Fallidos: {failed}")
+        print(f"[RESEND_MASS] Completado. Enviados: {sent}, Fallidos: {failed}")
     
     # Disparar en background
     thread = threading.Thread(target=process_in_background, daemon=True)
     thread.start()
     
-    return redirect(f"/admin/seguimiento?tenant={tenant}&period={period}&msg=resend_started&total={len(pending)}")
+    return redirect(f"/admin/seguimiento?tenant={tenant}&token={token}&period={period}&msg=resend_started&total={len(pending)}")
 
 
 @app.post("/admin/remind_all_pending_signatures")
@@ -10127,7 +7550,7 @@ def admin_remind_all_pending_signatures():
     pending = get_pending_signatures_over_7days(tenant, period)
     
     if not pending:
-        return redirect(f"/admin/seguimiento?tenant={tenant}&period={period}&msg=no_pending")
+        return redirect(f"/admin/seguimiento?tenant={tenant}&token={token}&period={period}&msg=no_pending")
     
     # Verificar que exista el template de firma
     if not TWILIO_SIGN_TEMPLATE_SID:
@@ -10155,28 +7578,28 @@ def admin_remind_all_pending_signatures():
                 cur = conn.cursor()
                 cur.execute("""
                     INSERT INTO message_status (tenant, cuil, period, kind, message_sid, status, to_whatsapp, created_at)
-                    VALUES (%s, %s, %s, 'REMIND_SIGN_MASS', %s, 'sent', %s, %s)
+                    VALUES (?, ?, ?, 'REMIND_SIGN_MASS', ?, 'sent', ?, ?)
                 """, (tenant, p['cuil'], period, sid, p['whatsapp'], int(time.time())))
                 conn.commit()
                 conn.close()
                 
                 sent += 1
-                log.info(f"[REMIND_MASS] Enviado a {p['cuil']}: {sid}")
+                print(f"[REMIND_MASS] Enviado a {p['cuil']}: {sid}")
                 
                 # Pausa entre envíos
                 time.sleep(1)
                 
             except Exception as e:
                 failed += 1
-                log.exception(f"[REMIND_MASS] Error enviando a {p['cuil']}: {e}")
+                print(f"[REMIND_MASS] Error enviando a {p['cuil']}: {e}")
         
-        log.info(f"[REMIND_MASS] Completado. Enviados: {sent}, Fallidos: {failed}")
+        print(f"[REMIND_MASS] Completado. Enviados: {sent}, Fallidos: {failed}")
     
     # Disparar en background
     thread = threading.Thread(target=process_in_background, daemon=True)
     thread.start()
     
-    return redirect(f"/admin/seguimiento?tenant={tenant}&period={period}&msg=remind_started&total={len(pending)}")
+    return redirect(f"/admin/seguimiento?tenant={tenant}&token={token}&period={period}&msg=remind_started&total={len(pending)}")
 
 def get_envios_df_for_tenant(tenant_slug: str, force: bool = False) -> pd.DataFrame:
     """
@@ -10188,20 +7611,21 @@ def get_envios_df_for_tenant(tenant_slug: str, force: bool = False) -> pd.DataFr
 
 def get_estado_report(tenant: str, period: str | None = None):
     conn = get_db_connection()
+    conn.row_factory = sqlite3.Row
     cur = conn.cursor()
 
     if period:
         cur.execute("""
             SELECT cuil, period, estado, updated_at
             FROM recibo_estado
-            WHERE tenant = %s AND period = %s
+            WHERE tenant = ? AND period = ?
             ORDER BY cuil
         """, (tenant, period))
     else:
         cur.execute("""
             SELECT cuil, period, estado, updated_at
             FROM recibo_estado
-            WHERE tenant = %s
+            WHERE tenant = ?
             ORDER BY period DESC, cuil
         """, (tenant,))
 
@@ -10227,9 +7651,9 @@ def admin_reenviar_template():
     """
     Reenviar template INITIAL a personas específicas (override).
     """
-    auth = require_admin()
-    if auth:
-        return auth
+    token = request.args.get("token") or request.form.get("token")
+    if token != ADMIN_TOKEN:
+        return Response("Unauthorized", status=401)
     
     if request.method == "POST":
         tenant = request.form.get("tenant", "").strip()
@@ -10268,15 +7692,15 @@ def admin_reenviar_template():
                 conn = get_db_connection()
                 cur = conn.cursor()
                 cur.execute("""
-                    SELECT to_whatsapp FROM message_status
-                    WHERE tenant = %s AND cuil = %s
+                    SELECT to_whatsapp FROM message_status 
+                    WHERE tenant = ? AND cuil = ? 
                     ORDER BY created_at DESC LIMIT 1
                 """, (tenant, cuil))
                 row = cur.fetchone()
                 conn.close()
-
-                if row and row['to_whatsapp']:
-                    whatsapp = row['to_whatsapp']
+                
+                if row and row[0]:
+                    whatsapp = row[0]
                 else:
                     resultados.append(f"❌ {cuil} ({nombre}): Sin WhatsApp")
                     continue
@@ -10332,7 +7756,7 @@ def admin_reenviar_template():
         
         html += f"""
   <hr>
-  <p><a href="/admin/reenviar_template">← Volver</a></p>
+  <p><a href="/admin/reenviar_template?token={ADMIN_TOKEN}">← Volver</a></p>
 </body>
 </html>
 """
@@ -10438,6 +7862,7 @@ def admin_reenviar_template():
   </div>
   
   <form method="post">
+    <input type="hidden" name="token" value="{ADMIN_TOKEN}">
     
     <div class="card">
       <label>Tenant</label>
@@ -10464,7 +7889,7 @@ def admin_reenviar_template():
     </div>
   </form>
   
-  <p><a href="/admin">← Volver al admin</a></p>
+  <p><a href="/admin?token={ADMIN_TOKEN}">← Volver al admin</a></p>
 </body>
 </html>
 """
@@ -10507,7 +7932,7 @@ def admin_verifications_delete_bulk():
     keys = request.form.getlist("keys")
 
     if not tenant or not keys:
-        return redirect(f"/admin/panel?tenant={tenant}&msg=verif_bulk_empty")
+        return redirect(f"/admin/panel?tenant={tenant}&token={token}&msg=verif_bulk_empty")
 
     conn = get_db_connection()
     cur = conn.cursor()
@@ -10519,7 +7944,7 @@ def admin_verifications_delete_bulk():
         except Exception:
             continue
         cur.execute(
-            "DELETE FROM verifications WHERE tenant=%s AND cuil=%s AND to_whatsapp=%s",
+            "DELETE FROM verifications WHERE tenant=? AND cuil=? AND to_whatsapp=?",
             (tenant, cuil, to_whatsapp)
         )
         n += cur.rowcount
@@ -10527,7 +7952,7 @@ def admin_verifications_delete_bulk():
     conn.commit()
     conn.close()
 
-    return redirect(f"/admin/panel?tenant={tenant}&msg=verif_bulk_deleted&n={n}")
+    return redirect(f"/admin/panel?tenant={tenant}&token={token}&msg=verif_bulk_deleted&n={n}")
 
 
 
@@ -10557,11 +7982,12 @@ def admin_report_estado():
 
 def get_sent_pdfs_report(tenant: str):
     conn = get_db_connection()
+    conn.row_factory = sqlite3.Row
     cur = conn.cursor()
     cur.execute("""
         SELECT cuil, period, to_whatsapp, message_sid, created_at, sign_sent_at
         FROM sent_pdfs
-        WHERE tenant = %s
+        WHERE tenant = ?
         ORDER BY created_at DESC
     """, (tenant,))
     rows = cur.fetchall()
@@ -10664,156 +8090,7 @@ def _drive_find_child_folder_id(service, parent_id: str, folder_name: str) -> st
             return (c.get("id") or "").strip()
     return ""
 
-##############################################################
-def _drive_ensure_child_folder_shared(service, parent_id: str, folder_name: str) -> str:
-    """
-    Igual que _drive_ensure_child_folder pero con soporte de Shared Drives.
-    Busca la carpeta hija por nombre; si no existe, la crea. Devuelve su id.
-    """
-    # Buscar (con flags de shared drive)
-    safe_name = folder_name.replace("'", "\\'")
-    q = (
-        f"'{parent_id}' in parents "
-        f"and name = '{safe_name}' "
-        f"and mimeType = 'application/vnd.google-apps.folder' "
-        f"and trashed = false"
-    )
-    res = service.files().list(
-        q=q,
-        fields="files(id,name)",
-        pageSize=5,
-        supportsAllDrives=True,
-        includeItemsFromAllDrives=True,
-    ).execute()
-    files = res.get("files", [])
-    if files:
-        return (files[0].get("id") or "").strip()
- 
-    # Crear (con soporte shared drive)
-    metadata = {
-        "name": folder_name,
-        "mimeType": "application/vnd.google-apps.folder",
-        "parents": [parent_id],
-    }
-    folder = service.files().create(
-        body=metadata,
-        fields="id",
-        supportsAllDrives=True,
-    ).execute()
-    return (folder.get("id") or "").strip()
- 
-CERTIFICADOS_DRIVE_ID = os.environ.get("CERTIFICADOS_SHARED_DRIVE_ID", "").strip()
- 
- 
-# Nombre de la subcarpeta de Drive según el tipo de certificado.
-CERT_SUBCARPETA = {"medico": "Medicos", "familia": "Familia"}
 
-def get_certificados_folder_id(tenant_slug: str, tipo: str = "medico") -> str:
-    """
-    Devuelve (creando si hace falta) el id de la subcarpeta del tipo de
-    certificado, DENTRO de la carpeta del tenant, DENTRO del Shared Drive:
-        <SharedDrive>/<tenant>/<Medicos|Familia>/
-    """
-    if not CERTIFICADOS_DRIVE_ID:
-        raise RuntimeError("Falta CERTIFICADOS_SHARED_DRIVE_ID en ENV")
-
-    sub = CERT_SUBCARPETA.get(tipo, "Medicos")
-    service = drive_service()
-    # En un Shared Drive, el ID del drive funciona como id de la carpeta raíz.
-    tenant_folder = _drive_ensure_child_folder_shared(service, CERTIFICADOS_DRIVE_ID, tenant_slug)
-    return _drive_ensure_child_folder_shared(service, tenant_folder, sub)
- 
- 
-def upload_certificado_to_drive(tenant: str, cuil: str, data: bytes, content_type: str, tipo: str = "medico") -> tuple[str, str]:
-    """
-    Sube el certificado a <SharedDrive>/<tenant>/<Medicos|Familia>/<cuil>_<fecha>_<hora>.<ext>
-    Devuelve (file_id, file_name).
-    """
-    folder_id = get_certificados_folder_id(tenant, tipo)
-    if not folder_id:
-        raise RuntimeError(f"No se pudo obtener/crear carpeta certificados para tenant={tenant} tipo={tipo}")
- 
-    # extensión según content_type
-    if "pdf" in content_type:
-        ext = "pdf"
-    elif "jpeg" in content_type or "jpg" in content_type:
-        ext = "jpg"
-    elif "png" in content_type:
-        ext = "png"
-    else:
-        ext = "bin"
- 
-    now = time.localtime()
-    fecha = time.strftime("%Y-%m-%d", now)
-    hora = time.strftime("%H%M%S", now)
-    file_name = f"{cuil}_{fecha}_{hora}.{ext}"
- 
-    service = drive_service()
-    media = MediaIoBaseUpload(io.BytesIO(data), mimetype=content_type, resumable=False)
-    metadata = {"name": file_name, "parents": [folder_id]}
-    f = service.files().create(
-        body=metadata,
-        media_body=media,
-        fields="id",
-        supportsAllDrives=True,   # 👈 clave para Shared Drive
-    ).execute()
-    file_id = (f.get("id") or "").strip()
-    return file_id, file_name
- 
- 
- 
-def download_twilio_media(media_url: str) -> tuple[bytes, str]:
-    """
-    Descarga un archivo de media de Twilio (requiere auth con las credenciales).
-    Devuelve (bytes, content_type).
-    """
-    r = requests.get(
-        media_url,
-        auth=(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN),
-        timeout=30,
-    )
-    r.raise_for_status()
-    content_type = r.headers.get("Content-Type", "application/octet-stream")
-    return r.content, content_type
- 
-def save_certificado(tenant: str, cuil: str, nombre: str, to_whatsapp: str,
-                     file_id: str, file_name: str, mime_type: str, tipo: str = "medico"):
-    """Registra el certificado en la BD."""
-    conn = get_db_connection()
-    cur = conn.cursor()
-    now = int(time.time())
-    cur.execute("""
-        INSERT INTO certificados (tenant, cuil, nombre, to_whatsapp, file_id, file_name, mime_type, created_at, tipo)
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
-    """, (tenant, cuil, nombre, to_whatsapp, file_id, file_name, mime_type, now, tipo))
-    conn.commit()
-    conn.close()
-    log.info(f"✅ Certificado guardado: {tenant}/{cuil} tipo={tipo} -> {file_name} (file_id={file_id})")
- 
- 
-def get_certificados(tenant: str, limit: int = 500, tipo: str = "medico") -> list[dict]:
-    """Lista los certificados de un tenant y tipo, más recientes primero."""
-    conn = get_db_connection()
-    cur = conn.cursor()
-    cur.execute("""
-        SELECT id, tenant, cuil, nombre, to_whatsapp, file_id, file_name, mime_type, created_at, tipo
-        FROM certificados
-        WHERE tenant = %s AND COALESCE(tipo, 'medico') = %s
-        ORDER BY created_at DESC
-        LIMIT %s
-    """, (tenant, tipo, limit))
-    rows = cur.fetchall()
-    conn.close()
-    result = []
-    for r in rows:
-        try:
-            result.append(dict(r))
-        except Exception:
-            keys = ["id","tenant","cuil","nombre","to_whatsapp","file_id","file_name","mime_type","created_at"]
-            result.append(dict(zip(keys, r)))
-    return result
- 
-##############################################################
 def _drive_child_file_exists(service, parent_id: str, filename: str) -> bool:
     """
     True si existe un archivo con nombre exacto dentro de parent_id.
@@ -10913,14 +8190,14 @@ def find_pdf_file_id(tenant: str, cuil: str, period: str) -> str | None:
     """
     t = get_tenant(tenant)
     if not t:
-        log.error("%s %s", "❌ tenant inválido:", tenant)
+        print("❌ tenant inválido:", tenant)
         return None
 
     root_id = (t.get("drive_root_id") or t.get("recibos_root_id") or "").strip()
-    log.info("%s %s", "ROOT_ID:", root_id)
+    print("ROOT_ID:", root_id)
 
     if not root_id:
-        log.error("%s %s %s", "❌ tenant sin drive_root_id/recibos_root_id:", tenant, t)
+        print("❌ tenant sin drive_root_id/recibos_root_id:", tenant, t)
         return None
 
     cuil = strip_pdf(cuil).strip()
@@ -10934,7 +8211,7 @@ def find_pdf_file_id(tenant: str, cuil: str, period: str) -> str | None:
 
     # debug útil
     if not files:
-        log.info("%s %s %s %s", "🔎 NO ENCONTRÉ:", filename, "en root:", root_id)
+        print("🔎 NO ENCONTRÉ:", filename, "en root:", root_id)
 
     return files[0]["id"] if files else None
 
@@ -10957,9 +8234,7 @@ def admin_reset_tenant():
     # Siempre limpiar pendings del tenant
     conn = get_db_connection()
     cur = conn.cursor()
-    cur.execute("DELETE FROM pending_views WHERE tenant=%s;", (tenant,))
-    deleted_pending = cur.rowcount
-    log.info(f"RESET: DELETE FROM pending_views WHERE tenant=%s; args= ({tenant},) deleted= {deleted_pending}")
+    cur.execute("DELETE FROM pending_views WHERE tenant=?;", (tenant,))
 
     if period_raw:
         p_norm = norm_period_label(period_raw)  # MM/AAAA
@@ -10977,80 +8252,23 @@ def admin_reset_tenant():
 
         # borramos en todas las tablas por cada candidato
         for p in candidates:
-            cur.execute("DELETE FROM recibo_estado WHERE tenant=%s AND period=%s;", (tenant, p))
-            log.info(f"RESET: DELETE FROM recibo_estado WHERE tenant=%s AND period=%s; args= {(tenant, p)} deleted= {cur.rowcount}")
-            
-            cur.execute("DELETE FROM message_status WHERE tenant=%s AND period=%s;", (tenant, p))
-            log.info(f"RESET: DELETE FROM message_status WHERE tenant=%s AND period=%s; args= {(tenant, p)} deleted= {cur.rowcount}")
-            
-            cur.execute("DELETE FROM sent_pdfs WHERE tenant=%s AND period=%s;", (tenant, p))
-            log.info(f"RESET: DELETE FROM sent_pdfs WHERE tenant=%s AND period=%s; args= {(tenant, p)} deleted= {cur.rowcount}")
-            
-            cur.execute("DELETE FROM receipt_request_events WHERE tenant=%s AND period=%s;", (tenant, p))
-            log.info(f"RESET: DELETE FROM receipt_request_events WHERE tenant=%s AND period=%s; args= {(tenant, p)} deleted= {cur.rowcount}")
-            
-            cur.execute("DELETE FROM receipt_requests WHERE tenant=%s AND period=%s;", (tenant, p))
-            log.info(f"RESET: DELETE FROM receipt_requests WHERE tenant=%s AND period=%s; args= {(tenant, p)} deleted= {cur.rowcount}")
-            
-            cur.execute("DELETE FROM template_send_queue WHERE tenant=%s AND period=%s;", (tenant, p))
-            log.info(f"RESET: DELETE FROM template_send_queue WHERE tenant=%s AND period=%s; args= {(tenant, p)} deleted= {cur.rowcount}")
-            
-            # ✅ NUEVO: Borrar pending_terms de este tenant/período
-            cur.execute("DELETE FROM pending_terms WHERE tenant=%s AND period=%s;", (tenant, p))
-            log.info(f"RESET: DELETE FROM pending_terms WHERE tenant=%s AND period=%s; args= {(tenant, p)} deleted= {cur.rowcount}")
-        
-        # ✅ NUEVO: Borrar terms_accepted de usuarios de este tenant/período
-        cur.execute("""
-            DELETE FROM terms_accepted 
-            WHERE whatsapp IN (
-                SELECT DISTINCT to_whatsapp 
-                FROM message_status 
-                WHERE tenant = %s AND period IN ({})
-            )
-        """.format(','.join(['%s'] * len(candidates))), (tenant, *candidates))
-        log.info(f"RESET: DELETE FROM terms_accepted (tenant={tenant}, periods={candidates}); deleted= {cur.rowcount}")
-        
+            cur.execute("DELETE FROM recibo_estado WHERE tenant=? AND period=?;", (tenant, p))
+            cur.execute("DELETE FROM message_status WHERE tenant=? AND period=?;", (tenant, p))
+            cur.execute("DELETE FROM sent_pdfs WHERE tenant=? AND period=?;", (tenant, p))
+            cur.execute("DELETE FROM receipt_request_events WHERE tenant=? AND period=?;", (tenant, p))
     else:
-        # Sin período: borrar todo del tenant
-        cur.execute("DELETE FROM recibo_estado WHERE tenant=%s;", (tenant,))
-        log.info(f"RESET: DELETE FROM recibo_estado WHERE tenant=%s; args= ({tenant},) deleted= {cur.rowcount}")
-        
-        cur.execute("DELETE FROM message_status WHERE tenant=%s;", (tenant,))
-        log.info(f"RESET: DELETE FROM message_status WHERE tenant=%s; args= ({tenant},) deleted= {cur.rowcount}")
-        
-        cur.execute("DELETE FROM sent_pdfs WHERE tenant=%s;", (tenant,))
-        log.info(f"RESET: DELETE FROM sent_pdfs WHERE tenant=%s; args= ({tenant},) deleted= {cur.rowcount}")
-        
-        cur.execute("DELETE FROM receipt_request_events WHERE tenant=%s;", (tenant,))
-        log.info(f"RESET: DELETE FROM receipt_request_events WHERE tenant=%s; args= ({tenant},) deleted= {cur.rowcount}")
-        
-        cur.execute("DELETE FROM receipt_requests WHERE tenant=%s;", (tenant,))
-        log.info(f"RESET: DELETE FROM receipt_requests WHERE tenant=%s; args= ({tenant},) deleted= {cur.rowcount}")
-        
-        cur.execute("DELETE FROM template_send_queue WHERE tenant=%s;", (tenant,))
-        log.info(f"RESET: DELETE FROM template_send_queue WHERE tenant=%s; args= ({tenant},) deleted= {cur.rowcount}")
-        
-        # ✅ NUEVO: Borrar pending_terms de este tenant (sin período)
-        cur.execute("DELETE FROM pending_terms WHERE tenant=%s;", (tenant,))
-        log.info(f"RESET: DELETE FROM pending_terms WHERE tenant=%s; args= ({tenant},) deleted= {cur.rowcount}")
-        
-        # ✅ NUEVO: Borrar terms_accepted de usuarios de este tenant (sin período)
-        cur.execute("""
-            DELETE FROM terms_accepted 
-            WHERE whatsapp IN (
-                SELECT DISTINCT to_whatsapp 
-                FROM message_status 
-                WHERE tenant = %s
-            )
-        """, (tenant,))
-        log.info(f"RESET: DELETE FROM terms_accepted (tenant={tenant}, all periods); deleted= {cur.rowcount}")
+        cur.execute("DELETE FROM recibo_estado WHERE tenant=?;", (tenant,))
+        cur.execute("DELETE FROM message_status WHERE tenant=?;", (tenant,))
+        cur.execute("DELETE FROM sent_pdfs WHERE tenant=?;", (tenant,))
+        cur.execute("DELETE FROM receipt_request_events WHERE tenant=?;", (tenant,))
 
     conn.commit()
     conn.close()
 
     # devolvemos SIEMPRE el normalizado para que el panel quede prolijo
     p_show = norm_period_label(period_raw) if period_raw else ""
-    return redirect(f"/admin/panel?tenant={tenant}&msg=reset_ok&period={p_show or period_raw}")
+    return redirect(f"/admin/panel?tenant={tenant}&token={token}&msg=reset_ok&period={p_show or period_raw}")
+
 
 from flask import redirect
 
@@ -11088,57 +8306,31 @@ def admin_reset():
 
     def _del(sql, args):
         cur.execute(sql, args)
-        log.info("%s %s %s %s %s %s", "RESET:", sql.split("\n")[0][:80], "args=", args, "deleted=", cur.rowcount)
+        print("RESET:", sql.split("\n")[0][:80], "args=", args, "deleted=", cur.rowcount)
 
-    _del("DELETE FROM pending_views WHERE tenant=%s;", (tenant,))
+    _del("DELETE FROM pending_views WHERE tenant=?;", (tenant,))
 
     if periods:
         for p in periods:
-            _del("DELETE FROM recibo_estado WHERE tenant=%s AND period=%s;", (tenant, p))
-            _del("DELETE FROM message_status WHERE tenant=%s AND period=%s;", (tenant, p))
-            _del("DELETE FROM sent_pdfs WHERE tenant=%s AND period=%s;", (tenant, p))
-            _del("DELETE FROM receipt_request_events WHERE tenant=%s AND period=%s;", (tenant, p))
-            _del("DELETE FROM receipt_requests WHERE tenant=%s AND period=%s;", (tenant, p))
-            _del("DELETE FROM template_send_queue WHERE tenant=%s AND period=%s;", (tenant, p))
-            _del("DELETE FROM pending_terms WHERE tenant=%s AND period=%s;", (tenant, p))  # ✅ NUEVO
-        
-        # ✅ NUEVO: Borrar terms_accepted de usuarios de este tenant/período
-        placeholders = ','.join('%s' for _ in periods)
-        cur.execute(f"""
-            DELETE FROM terms_accepted 
-            WHERE whatsapp IN (
-                SELECT DISTINCT to_whatsapp 
-                FROM message_status 
-                WHERE tenant = %s AND period IN ({placeholders})
-            )
-        """, (tenant, *periods))
-        log.info(f"RESET: DELETE FROM terms_accepted (tenant={tenant}, periods={periods}); deleted= {cur.rowcount}")
-        
+            _del("DELETE FROM recibo_estado WHERE tenant=? AND period=?;", (tenant, p))
+            _del("DELETE FROM message_status WHERE tenant=? AND period=?;", (tenant, p))
+            _del("DELETE FROM sent_pdfs WHERE tenant=? AND period=?;", (tenant, p))
+            _del("DELETE FROM receipt_request_events WHERE tenant=? AND period=?;", (tenant, p))
+            _del("DELETE FROM receipt_requests WHERE tenant=? AND period=?;", (tenant, p))
+            _del("DELETE FROM template_send_queue WHERE tenant=? AND period=?;", (tenant, p))
     else:
-        _del("DELETE FROM recibo_estado WHERE tenant=%s;", (tenant,))
-        _del("DELETE FROM message_status WHERE tenant=%s;", (tenant,))
-        _del("DELETE FROM sent_pdfs WHERE tenant=%s;", (tenant,))
-        _del("DELETE FROM receipt_request_events WHERE tenant=%s;", (tenant,))
-        _del("DELETE FROM receipt_requests WHERE tenant=%s;", (tenant,))
-        _del("DELETE FROM template_send_queue WHERE tenant=%s;", (tenant,))
-        _del("DELETE FROM pending_terms WHERE tenant=%s;", (tenant,))  # ✅ NUEVO
-        
-        # ✅ NUEVO: Borrar terms_accepted de usuarios de este tenant
-        cur.execute("""
-            DELETE FROM terms_accepted 
-            WHERE whatsapp IN (
-                SELECT DISTINCT to_whatsapp 
-                FROM message_status 
-                WHERE tenant = %s
-            )
-        """, (tenant,))
-        log.info(f"RESET: DELETE FROM terms_accepted (tenant={tenant}, all periods); deleted= {cur.rowcount}")
+        _del("DELETE FROM recibo_estado WHERE tenant=?;", (tenant,))
+        _del("DELETE FROM message_status WHERE tenant=?;", (tenant,))
+        _del("DELETE FROM sent_pdfs WHERE tenant=?;", (tenant,))
+        _del("DELETE FROM receipt_request_events WHERE tenant=?;", (tenant,))
+        _del("DELETE FROM receipt_requests WHERE tenant=?;", (tenant,))
+        _del("DELETE FROM template_send_queue WHERE tenant=?;", (tenant,))
 
     conn.commit()
     conn.close()
 
     p_show = norm_period_label(period_raw) if period_raw else ""
-    url = f"/admin/panel?tenant={tenant}&msg=reset_ok"
+    url = f"/admin/panel?tenant={tenant}&token={token}&msg=reset_ok"
     if p_show:
         url += f"&period={p_show}"
     return redirect(url)
@@ -11159,7 +8351,7 @@ def queue_template_send(tenant: str, period: str, to_whatsapp: str, cuil: str,
       INSERT INTO template_send_queue
         (tenant, period, to_whatsapp, cuil, nombre, require_pdf, status, created_at, updated_at, error)
       VALUES
-        (%s, %s, %s, %s, %s, %s, 'PENDING', %s, %s, '')
+        (?, ?, ?, ?, ?, ?, 'PENDING', ?, ?, '')
       ON CONFLICT(tenant, period, to_whatsapp, cuil) DO UPDATE SET
         nombre=excluded.nombre,
         require_pdf=excluded.require_pdf,
@@ -11172,16 +8364,15 @@ def queue_template_send(tenant: str, period: str, to_whatsapp: str, cuil: str,
           WHEN template_send_queue.status IN ('SKIPPED','FAILED') THEN ''
           ELSE template_send_queue.error
         END
-    """, (tenant, period, to_whatsapp, cuil, (nombre or ""), bool(require_pdf), now, now))
+    """, (tenant, period, to_whatsapp, cuil, (nombre or ""), 1 if require_pdf else 0, now, now))
 
     # Determinar resultado
     cur.execute("""
       SELECT status FROM template_send_queue
-      WHERE tenant=%s AND period=%s AND to_whatsapp=%s AND cuil=%s
+      WHERE tenant=? AND period=? AND to_whatsapp=? AND cuil=?
       LIMIT 1
     """, (tenant, period, to_whatsapp, cuil))
-    _row = cur.fetchone()
-    status = _row['status'] if _row else ""
+    status = (cur.fetchone() or [""])[0]
 
     conn.commit()
     conn.close()
@@ -11199,10 +8390,10 @@ def count_queue_status(tenant: str, period: str) -> dict:
     cur.execute("""
       SELECT status, COUNT(*) as n
       FROM template_send_queue
-      WHERE tenant=%s AND period=%s
+      WHERE tenant=? AND period=?
       GROUP BY status
     """, (tenant, period))
-    d = {r['status']: r['n'] for r in cur.fetchall()}
+    d = {r[0]: r[1] for r in cur.fetchall()}
     conn.close()
     return d
 
@@ -11295,7 +8486,7 @@ def admin_send_template_queue_start():
 
     stats = count_queue_status(tenant, period)
     return redirect(
-        f"/admin/panel?tenant={tenant}&msg=queue_enqueued"
+        f"/admin/panel?tenant={tenant}&token={token}&msg=queue_enqueued"
         f"&period={period}&enqueued={enqueued}&dup={skipped_dup}&bad={skipped_bad}"
         f"&pending={stats.get('PENDING',0)}&sent={stats.get('SENT',0)}"
         f"&failed={stats.get('FAILED',0)}&skipped={stats.get('SKIPPED',0)}"
@@ -11307,11 +8498,12 @@ def _fetch_queue_batch(tenant: str, period: str, batch_size: int = 10) -> list[d
     cur.execute("""
       SELECT id, tenant, period, to_whatsapp, cuil, nombre, require_pdf
       FROM template_send_queue
-      WHERE tenant=%s AND period=%s AND status='PENDING'
+      WHERE tenant=? AND period=? AND status='PENDING'
       ORDER BY id ASC
-      LIMIT %s
+      LIMIT ?
     """, (tenant, period, batch_size))
-    rows = [dict(r) for r in cur.fetchall()]
+    cols = [c[0] for c in cur.description]
+    rows = [dict(zip(cols, r)) for r in cur.fetchall()]
     conn.close()
     return rows
 
@@ -11322,81 +8514,17 @@ def _mark_queue_row(row_id: int, status: str, error: str = "", sent_sid: str | N
     cur = conn.cursor()
     cur.execute("""
       UPDATE template_send_queue
-      SET status=%s, error=%s, updated_at=%s, sent_sid=COALESCE(%s, sent_sid),
-          sent_at=CASE WHEN %s IS NOT NULL THEN %s ELSE sent_at END
-      WHERE id=%s
+      SET status=?, error=?, updated_at=?, sent_sid=COALESCE(?, sent_sid),
+          sent_at=CASE WHEN ? IS NOT NULL THEN ? ELSE sent_at END
+      WHERE id=?
     """, (status, (error or ""), now, sent_sid, sent_sid, now, row_id))
     conn.commit()
     conn.close()
 
-def notify_billing_batch_done(tenant: str, period: str, enviados: int) -> None:
-    """
-    Avisa por mail (1 sola vez por tanda) que terminó el envío INITIAL de un período.
-    El candado en template_batch_notice evita duplicar el aviso si el tick se vuelve
-    a ejecutar con la cola ya vacía.
-    """
-    if not BILLING_NOTIFY_EMAIL:
-        return
 
-    now = int(time.time())
-
-    conn = get_db_connection()
-    cur = conn.cursor()
-
-    # Self-healing: asegura la tabla candado si init_db no la creó todavía.
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS template_batch_notice (
-            tenant TEXT NOT NULL,
-            period TEXT NOT NULL,
-            enviados INTEGER,
-            notified_at BIGINT NOT NULL,
-            PRIMARY KEY (tenant, period)
-        )
-    """)
-
-    # Claim atómico: si la fila ya existe, no reenviamos.
-    cur.execute("""
-        INSERT INTO template_batch_notice (tenant, period, enviados, notified_at)
-        VALUES (%s, %s, %s, %s)
-        ON CONFLICT (tenant, period) DO NOTHING
-    """, (tenant, period, enviados, now))
-    claimed = (cur.rowcount == 1)
-    conn.commit()
-    conn.close()
-
-    if not claimed:
-        return  # ya se había avisado para esta tanda
-
-    t = get_tenant(tenant)
-    empresa = (t.get("display_name") if t else tenant) or tenant
-    momento = ts_str(now)
-
-    subject = f"[Facturación] Envío completado · {empresa} · {period}"
-    html_body = f"""
-    <div style="font-family:system-ui,Arial,sans-serif;font-size:15px;color:#1a1a1a">
-      <h2 style="margin:0 0 12px">Envío de recibos completado</h2>
-      <table cellpadding="6" style="border-collapse:collapse">
-        <tr><td><strong>Empresa</strong></td><td>{esc(empresa)}</td></tr>
-        <tr><td><strong>Período</strong></td><td>{esc(period)}</td></tr>
-        <tr><td><strong>Momento</strong></td><td>{esc(momento)}</td></tr>
-        <tr><td><strong>Mensajes enviados</strong></td><td>{enviados}</td></tr>
-      </table>
-    </div>
-    """
-    try:
-        send_email(BILLING_NOTIFY_EMAIL, subject, html_body)
-        log.info(f"📧 Aviso de facturación enviado: {empresa} {period} ({enviados} msgs)")
-    except Exception as e:
-        log.exception(f"No se pudo enviar el aviso de facturación: {e}")
-        
 @app.post("/admin/send_template_queue_tick")
+@admin_required
 def admin_send_template_queue_tick():
-    # Único endpoint del panel que acepta token por URL/form: lo usan el cron
-    # (query string) y el self-call del envío automático (form). También valen
-    # la sesión (humano) y el header X-Admin-Token (otras automatizaciones).
-    if not (admin_authenticated() or admin_token_valid()):
-        return Response("Unauthorized", status=401)
-
     token = _get_admin_token_from_request()
 
     tenant = (request.form.get("tenant") or request.args.get("tenant") or "").strip().lower()
@@ -11432,7 +8560,7 @@ def admin_send_template_queue_tick():
         to_whatsapp = (r["to_whatsapp"] or "").strip()
         cuil = (r["cuil"] or "").strip()
         nombre = (r.get("nombre") or "").strip()
-        require_pdf = bool(r.get("require_pdf", True))
+        require_pdf = bool(r.get("require_pdf", 1))
 
         try:
             # 1) Si require_pdf, validamos que exista PDF
@@ -11475,10 +8603,6 @@ def admin_send_template_queue_tick():
 
     stats = count_queue_status(tenant, period)
 
-    # 🧾 Facturación: si la cola quedó vacía, avisar (1 sola vez) que terminó la tanda
-    if stats.get("PENDING", 0) == 0 and stats.get("SENT", 0) > 0:
-        notify_billing_batch_done(tenant, period, stats.get("SENT", 0))
-
     if (request.form.get("mode") or request.args.get("mode") or "").lower() == "json":
         return {
             "tenant": tenant,
@@ -11491,22 +8615,18 @@ def admin_send_template_queue_tick():
         }
 
     return redirect(
-        f"/admin/panel?tenant={tenant}&msg=queue_tick"
+        f"/admin/panel?tenant={tenant}&token={token}&msg=queue_tick"
         f"&period={period}&processed={processed}&sent={sent}&skipped={skipped}&failed={failed}"
         f"&pending={stats.get('PENDING',0)}"
     )
 
 @app.post("/admin/send_auto")
-@admin_required
 def admin_send_auto():
     """
     Procesa la cola automáticamente en background usando threading.
     Versión simple sin Celery - gratis pero con límite de ~30 minutos.
     """
-    # Token para el self-call de background a /send_template_queue_tick.
-    # Si el admin disparó esto por sesión (sin token en el form), usamos el ADMIN_TOKEN real:
-    # el thread no tiene sesión, así que necesita autenticarse por token.
-    token = _get_admin_token_from_request() or ADMIN_TOKEN
+    token = _get_admin_token_from_request()
     
     tenant = (request.form.get("tenant") or "").strip().lower()
     period = (request.form.get("period") or "").strip()
@@ -11556,7 +8676,7 @@ def admin_send_auto():
                 )
                 
                 if response.status_code != 200:
-                    log.error(f"[AUTO] Error HTTP {response.status_code}")
+                    print(f"[AUTO] Error HTTP {response.status_code}")
                     break
                 
                 data = response.json()
@@ -11566,21 +8686,21 @@ def admin_send_auto():
                 processed_total += processed
                 sent_total += sent
                 
-                log.info(f"[AUTO] Iteración {iterations}: procesados={processed}, enviados={sent}, total={sent_total}")
+                print(f"[AUTO] Iteración {iterations}: procesados={processed}, enviados={sent}, total={sent_total}")
                 
                 # Si no procesó nada, terminamos
                 if processed == 0:
-                    log.info(f"[AUTO] Completado. Total enviados: {sent_total}")
+                    print(f"[AUTO] Completado. Total enviados: {sent_total}")
                     break
                 
                 # Pausa de 2 segundos entre lotes
                 time.sleep(5)
                 
             except Exception as e:
-                log.exception(f"[AUTO] Error: {e}")
+                print(f"[AUTO] Error: {e}")
                 break
         
-        log.info(f"[AUTO] Finalizó. Iteraciones: {iterations}, Total enviado: {sent_total}")
+        print(f"[AUTO] Finalizó. Iteraciones: {iterations}, Total enviado: {sent_total}")
     
     # Disparar el thread en background
     thread = threading.Thread(target=process_in_background, daemon=True)
@@ -11588,7 +8708,7 @@ def admin_send_auto():
     
     # Respuesta inmediata al usuario
     return redirect(
-        f"/admin/panel?tenant={tenant}&msg=auto_started"
+        f"/admin/panel?tenant={tenant}&token={token}&msg=auto_started"
         f"&period={period}"
     )
 
@@ -11606,26 +8726,33 @@ def debug_list_root_pdfs(tenant: str, limit=20):
         pageSize=limit
     ).execute()
 
-    log.info("\n=== ROOT FILES ===")
+    print("\n=== ROOT FILES ===")
     for f in res.get("files", []):
-        log.info("%s %s", f["name"], f["mimeType"])
+        print(f["name"], f["mimeType"])
 
 from io import BytesIO
 from flask import send_file
-
+import sqlite3
 import pandas as pd
 import time
 
 def _db_row_to_dict(r):
-    return dict(r) if r is not None else None
+    # r puede ser sqlite3.Row o tupla
+    if r is None:
+        return None
+    if isinstance(r, sqlite3.Row):
+        return dict(r)
+    # fallback: si fuera tupla (no debería si usás row_factory)
+    return {str(i): v for i, v in enumerate(r)}
 
 def _get_last_msg_status(tenant: str, cuil: str, period: str, kind: str):
     conn = get_db_connection()
+    conn.row_factory = sqlite3.Row
     cur = conn.cursor()
     cur.execute("""
         SELECT *
         FROM message_status
-        WHERE tenant=%s AND cuil=%s AND period=%s AND kind=%s
+        WHERE tenant=? AND cuil=? AND period=? AND kind=?
         ORDER BY COALESCE(created_at, 0) DESC, id DESC
         LIMIT 1
     """, (tenant, cuil, period, kind))
@@ -11635,18 +8762,16 @@ def _get_last_msg_status(tenant: str, cuil: str, period: str, kind: str):
 
 
 
-@app.route("/admin/send_test", methods=["GET", "POST"])
+@app.get("/admin/send_test")
 def admin_send_test():
     auth = require_admin()
     if auth:
         return auth
 
-    # request.values lee de la query (GET) y del form (POST) por igual.
-    token = request.values.get("token", "")
-    tenant = (request.values.get("tenant") or "").strip().lower()
-    cuil = (request.values.get("cuil") or "").strip()
-    period = (request.values.get("period") or "").strip()
-    whatsapp_override = (request.values.get("whatsapp_override") or "").strip()
+    token = request.args.get("token", "")
+    tenant = (request.args.get("tenant") or "").strip().lower()
+    cuil = (request.args.get("cuil") or "").strip()
+    period = (request.args.get("period") or "").strip()
 
     t = get_tenant(tenant)
     if not t:
@@ -11655,7 +8780,7 @@ def admin_send_test():
     html = []
     html.append("<h2>Envío individual a persona específica</h2>")
     html.append(f"<p><b>Empresa:</b> {esc(t['display_name'])}</p>")
-    html.append(f"<p><a href='/admin/panel?tenant={esc(tenant)}'>← volver al panel</a></p>")
+    html.append(f"<p><a href='/admin/panel?tenant={esc(tenant)}&token={esc(token)}'>← volver al panel</a></p>")
 
     html.append(f"""
     <style>
@@ -11674,7 +8799,7 @@ def admin_send_test():
 
     html.append("<div class='card'>")
     html.append(f"""
-    <form method="post">
+    <form method="get">
       <input type="hidden" name="tenant" value="{esc(tenant)}">
       <input type="hidden" name="token" value="{esc(token)}">
 
@@ -11684,22 +8809,12 @@ def admin_send_test():
       <label>Período (mm/aaaa)</label>
       <input type="text" name="period" value="{esc(period)}" placeholder="04/2025" required>
 
-      <label>WhatsApp (opcional — solo si cambió de número)</label>
-      <input type="text" name="whatsapp_override" value="{esc(whatsapp_override)}" placeholder="+54 9 11 1234-5678 (dejar vacío = usar el del Excel)">
-
       <button type="submit">🔍 Buscar y enviar</button>
     </form>
     """)
     html.append("</div>")
 
-    # El envío solo se dispara por POST (botón del form) o con ADMIN_TOKEN por
-    # header X-Admin-Token (automatización). Un GET con la sesión activa NO envía:
-    # evita que un link malicioso dispare mensajes usando la cookie del admin (CSRF).
-    _envio_ok = (request.method == "POST") or admin_token_valid_header()
-    if cuil and period and not _envio_ok:
-        html.append("<div class='card'><div class='info'>ℹ️ Por seguridad, el envío se confirma desde el botón del formulario.</div></div>")
-
-    if cuil and period and _envio_ok:
+    if cuil and period:
         html.append("<div class='card'>")
         html.append("<h3>Resultado del envío</h3>")
 
@@ -11718,13 +8833,6 @@ def admin_send_test():
             return Response("".join(html) + "</div></body></html>", mimetype="text/html")
 
         to_whatsapp = person.get("to_whatsapp", "")
-        if whatsapp_override:
-            ow = normalize_whatsapp(whatsapp_override)
-            if not ow:
-                html.append("<div class='error'>❌ El WhatsApp ingresado no es válido.</div>")
-                return Response("".join(html) + "</div></body></html>", mimetype="text/html")
-            to_whatsapp = ow
-            html.append(f"<div class='info'>📱 Enviando al número ingresado manualmente: <span class='mono'>{esc(to_whatsapp)}</span> (no al del Excel).</div>")
         if not to_whatsapp:
             html.append("<div class='error'>❌ Esa persona no tiene WhatsApp configurado en el Excel.</div>")
             return Response("".join(html) + "</div></body></html>", mimetype="text/html")
@@ -11773,8 +8881,8 @@ def admin_send_test():
             cur = conn.cursor()
             cur.execute("""
                 UPDATE template_send_queue
-                SET status = 'SENT', sent_at = %s, sent_sid = %s
-                WHERE tenant = %s AND cuil = %s AND period = %s AND to_whatsapp = %s
+                SET status = 'SENT', sent_at = ?, sent_sid = ?
+                WHERE tenant = ? AND cuil = ? AND period = ? AND to_whatsapp = ?
             """, (int(time.time()), sid_tpl, tenant, cuil_digits, period, to_whatsapp))
             conn.commit()
             conn.close()
@@ -11832,8 +8940,8 @@ def admin_resend_template():
         cur = conn.cursor()
         cur.execute("""
             UPDATE pending_views
-            SET origin = 'RESEND', created_at = %s
-            WHERE tenant = %s AND cuil = %s AND period = %s AND to_whatsapp = %s
+            SET origin = 'RESEND', created_at = ?
+            WHERE tenant = ? AND cuil = ? AND period = ? AND to_whatsapp = ?
         """, (int(time.time()), tenant, cuil, period, whatsapp))
         
         # Si no existía, crear uno
@@ -11848,7 +8956,7 @@ def admin_resend_template():
     except Exception as e:
         msg = f"resend_error&error={str(e)[:100]}"
     
-    return redirect(f"/admin/panel?tenant={tenant}&period={period}&msg={msg}")
+    return redirect(f"/admin/panel?tenant={tenant}&token={token}&period={period}&msg={msg}")
 
 
 @app.post("/admin/remind_signature")
@@ -11894,7 +9002,7 @@ def admin_remind_signature():
         cur = conn.cursor()
         cur.execute("""
             INSERT INTO message_status (tenant, cuil, period, kind, message_sid, status, to_whatsapp, created_at)
-            VALUES (%s, %s, %s, 'REMIND_SIGN', %s, 'sent', %s, %s)
+            VALUES (?, ?, ?, 'REMIND_SIGN', ?, 'sent', ?, ?)
         """, (tenant, cuil, period, sid, whatsapp, int(time.time())))
         conn.commit()
         conn.close()
@@ -11904,7 +9012,7 @@ def admin_remind_signature():
     except Exception as e:
         msg = f"remind_error&error={str(e)[:100]}"
     
-    return redirect(f"/admin/panel?tenant={tenant}&period={period}&msg={msg}")
+    return redirect(f"/admin/panel?tenant={tenant}&token={token}&period={period}&msg={msg}")
 
 # =========================
 # Twilio inbound: VIEW_NOW + firma/observa
@@ -11924,190 +9032,13 @@ from twilio.rest import Client
 
 WHATSAPP_MENU_CONTENT_SID = os.getenv("WHATSAPP_MENU_CONTENT_SID", "")
 
-# ============================================================================
-
-TERMS_TEMPLATE_SID = os.getenv("TWILIO_TERMS_TEMPLATE_SID", "")
-TERMS_PDF_FILE_ID = os.getenv("TERMS_PDF_FILE_ID", "")
-
-# =========================
-# TÉRMINOS Y CONDICIONES
-# =========================
-
-def has_accepted_terms(whatsapp: str) -> bool:
-    """Verifica si el usuario ya aceptó los T&C."""
-    conn = get_db_connection()
-    cur = conn.cursor()
-    cur.execute("SELECT 1 FROM terms_accepted WHERE whatsapp = %s LIMIT 1", (whatsapp,))
-    exists = cur.fetchone() is not None
-    conn.close()
-    return exists
-
-
-def save_terms_acceptance(whatsapp: str):
-    """Guarda que el usuario aceptó los T&C."""
-    conn = get_db_connection()
-    cur = conn.cursor()
-    now = int(time.time())
-    cur.execute("""
-        INSERT INTO terms_accepted (whatsapp, accepted_at)
-        VALUES (%s, %s)
-        ON CONFLICT (whatsapp) DO UPDATE SET
-            accepted_at = EXCLUDED.accepted_at
-    """, (whatsapp, now))
-    conn.commit()
-    conn.close()
-    log.info(f"✅ T&C aceptados: {whatsapp}")
-
-
-def set_pending_terms_acceptance(whatsapp: str, tenant: str, cuil: str, period: str, origin: str = "INITIAL"):
-    """Marca que el usuario está esperando aceptar T&C."""
-    conn = get_db_connection()
-    cur = conn.cursor()
-    now = int(time.time())
-    cur.execute("""
-        INSERT INTO pending_terms (whatsapp, tenant, cuil, period, origin, created_at)
-        VALUES (%s, %s, %s, %s, %s, %s)
-        ON CONFLICT (whatsapp) DO UPDATE SET
-            tenant = EXCLUDED.tenant,
-            cuil = EXCLUDED.cuil,
-            period = EXCLUDED.period,
-            origin = EXCLUDED.origin,
-            created_at = EXCLUDED.created_at
-    """, (whatsapp, tenant, cuil, period, origin, now))
-    conn.commit()
-    conn.close()
-    log.info(f"✅ Pending T&C: {whatsapp} -> {tenant}/{cuil}/{period}")
-
-
-def get_pending_terms(whatsapp: str):
-    """Obtiene los datos del usuario que está esperando aceptar T&C."""
-    conn = get_db_connection()
-    cur = conn.cursor()
-    cur.execute("""
-        SELECT tenant, cuil, period, origin FROM pending_terms WHERE whatsapp = %s LIMIT 1
-    """, (whatsapp,))
-    row = cur.fetchone()
-    conn.close()
-    
-    if row:
-        return {"tenant": row['tenant'], "cuil": row['cuil'], "period": row['period'], "origin": row['origin']}
-    return None
-
-
-def clear_pending_terms(whatsapp: str):
-    """Limpia el estado de espera después de aceptar."""
-    conn = get_db_connection()
-    cur = conn.cursor()
-    cur.execute("DELETE FROM pending_terms WHERE whatsapp = %s", (whatsapp,))
-    conn.commit()
-    conn.close()
-    log.info(f"✅ Cleared pending T&C: {whatsapp}")
-
-@app.get("/media/terms")
-def media_terms():
-    """Sirve el PDF de Términos y Condiciones."""
-    token = request.args.get("token", "").strip()
-    if not check_media_token(token, "terms"):
-        return Response("Unauthorized", status=401)
-    
-    if not TERMS_PDF_FILE_ID:
-        return Response("T&C PDF no configurado", status=404)
-    
-    try:
-        service = drive_service()
-        
-        # Obtener metadata
-        file_metadata = service.files().get(fileId=TERMS_PDF_FILE_ID, fields='size,name').execute()
-        file_size = int(file_metadata.get('size', 0))
-        
-        # Descargar con chunks
-        req = service.files().get_media(fileId=TERMS_PDF_FILE_ID)
-        fh = io.BytesIO()
-        downloader = MediaIoBaseDownload(fh, req, chunksize=5*1024*1024)
-        
-        done = False
-        while not done:
-            status, done = downloader.next_chunk()
-        
-        fh.seek(0)
-        data = fh.read()
-        
-        resp = Response(data, mimetype="application/pdf")
-        resp.headers["Content-Disposition"] = 'inline; filename="terminos-y-condiciones.pdf"'
-        resp.headers["Content-Length"] = str(len(data))
-        resp.headers["Cache-Control"] = "public, max-age=86400"  # 24h cache
-        
-        return resp
-        
-    except Exception as e:
-        log.exception(f"❌ Error descargando T&C: {e}")
-        return Response("Error descargando PDF de T&C", status=500)
-
-
-def send_terms_and_conditions(to_whatsapp: str, tenant: str, cuil: str, period: str):
-    """Envía el PDF de T&C con template de aceptación."""
-    try:
-        # Validar que estén configuradas las variables
-        if not TERMS_TEMPLATE_SID:
-            log.error(f"❌ ERROR: TERMS_TEMPLATE_SID no está configurado")
-            return None
-        
-        if not TERMS_PDF_FILE_ID:
-            log.error(f"❌ ERROR: TERMS_PDF_FILE_ID no está configurado")
-            return None
-        
-        client = _twilio_client()  # ✅ Usar la función correcta
-        
-        # Preparar payload del PDF
-        payload_pdf = {
-            "to": to_whatsapp,
-            "body": "📄 Antes de continuar, por favor leé nuestros Términos y Condiciones adjuntos.",
-            "media_url": [f"{request.host_url.rstrip('/')}/media/terms?token={make_media_token('terms')}"],
-        }
-        
-        # Preparar payload del botón
-        payload_button = {
-            "to": to_whatsapp,
-            "content_sid": TERMS_TEMPLATE_SID,
-        }
-        
-        # Agregar from_ o messaging_service_sid (mismo patrón que send_whatsapp_pdf)
-        if TWILIO_MESSAGING_SERVICE_SID:
-            payload_pdf["messaging_service_sid"] = TWILIO_MESSAGING_SERVICE_SID
-            payload_button["messaging_service_sid"] = TWILIO_MESSAGING_SERVICE_SID
-        elif TWILIO_WHATSAPP_FROM:
-            payload_pdf["from_"] = TWILIO_WHATSAPP_FROM
-            payload_button["from_"] = TWILIO_WHATSAPP_FROM
-        else:
-            log.error(f"❌ ERROR: No hay TWILIO_WHATSAPP_FROM ni TWILIO_MESSAGING_SERVICE_SID configurado")
-            return None
-        
-        # Agregar status callback si existe
-        if STATUS_CALLBACK_URL:
-            payload_pdf["status_callback"] = STATUS_CALLBACK_URL
-            payload_button["status_callback"] = STATUS_CALLBACK_URL
-        
-        # 1. Enviar PDF de T&C
-        msg_pdf = client.messages.create(**payload_pdf)
-        
-        # 2. Enviar template con botón "Acepto"
-        msg_button = client.messages.create(**payload_button)
-        
-        log.info(f"✅ T&C enviados a {to_whatsapp}: PDF={msg_pdf.sid}, Button={msg_button.sid}")
-        return msg_button.sid
-        
-    except Exception as e:
-        log.exception(f"❌ Error enviando T&C: {type(e).__name__}: {e}")
-        return None
-# ============================================================================
-
 def send_whatsapp_menu_template(to_whatsapp: str, nombre: str = "") -> str | None:
     """
     Envía la plantilla del menú (Quick Reply) vía Content API.
     Devuelve Message SID o None.
     """
     if not WHATSAPP_MENU_CONTENT_SID:
-        log.error("ERROR: falta WHATSAPP_MENU_CONTENT_SID")
+        print("ERROR: falta WHATSAPP_MENU_CONTENT_SID")
         return None
 
     client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
@@ -12126,7 +9057,7 @@ def send_whatsapp_menu_template(to_whatsapp: str, nombre: str = "") -> str | Non
         )
         return msg.sid
     except Exception as e:
-        log.exception("%s %s %s %s", "ERROR send_whatsapp_menu_template:", e, "vars_=", vars_)
+        print("ERROR send_whatsapp_menu_template:", e, "vars_=", vars_)
         return None
 
 def list_previous_periods_excluding_current(tenant: str, cuil: str, limit: int = 3) -> list[str]:
@@ -12142,7 +9073,7 @@ def list_previous_periods_excluding_current(tenant: str, cuil: str, limit: int =
     # ahora periods[0] es el último real anterior al mes actual
     return periods[:limit]
 
-
+# ============================================================================
 # FUNCIONES MULTI-TENANT
 # ============================================================================
 
@@ -12170,7 +9101,7 @@ def find_all_tenants_for_whatsapp(whatsapp: str) -> List[dict]:
         try:
             envios = load_envios_rows(tenant_slug)
         except Exception as e:
-            log.exception(f"Error loading envios for {tenant_slug}: {e}")
+            print(f"Error loading envios for {tenant_slug}: {e}")
             continue
         
         for row in envios:
@@ -12241,7 +9172,7 @@ def save_multi_tenant_selection_state(whatsapp: str, tenants: List[dict] = None,
     cur = conn.cursor()
     cur.execute("""
         INSERT INTO multi_tenant_selection (whatsapp, tenants_json, created_at, expires_at)
-        VALUES (%s, %s, %s, %s)
+        VALUES (?, ?, ?, ?)
         ON CONFLICT(whatsapp) DO UPDATE SET
             tenants_json = excluded.tenants_json,
             created_at = excluded.created_at,
@@ -12259,7 +9190,7 @@ def get_multi_tenant_selection_state(whatsapp: str) -> Optional[dict]:
     cur.execute("""
         SELECT tenants_json, created_at
         FROM multi_tenant_selection
-        WHERE whatsapp = %s AND expires_at > %s
+        WHERE whatsapp = ? AND expires_at > ?
         LIMIT 1
     """, (whatsapp, now))
     
@@ -12270,24 +9201,24 @@ def get_multi_tenant_selection_state(whatsapp: str) -> Optional[dict]:
         return None
     
     try:
-        data = json.loads(row['tenants_json'])
+        data = json.loads(row[0])
         # Compatibilidad con formato antiguo
         if isinstance(data, list):
             return {
-                "tenants": data,
-                "action": "RESEND",
+                "tenants": data, 
+                "action": "RESEND", 
                 "period_offset": 0,
-                "created_at": row['created_at']
+                "created_at": row[1]
             }
         # Formato nuevo
         return {
             "tenants": data.get("tenants", []),
             "action": data.get("action", "RESEND"),
             "period_offset": data.get("period_offset", 0),
-            "created_at": row['created_at']
+            "created_at": row[1]
         }
     except Exception as e:
-        log.exception(f"Error parsing multi_tenant_selection: {e}")
+        print(f"Error parsing multi_tenant_selection: {e}")
         return None
     
 def show_previous_periods_paginated(from_whatsapp: str, tenant: str, cuil: str, offset: int = 0):
@@ -12317,13 +9248,13 @@ def show_previous_periods_paginated(from_whatsapp: str, tenant: str, cuil: str, 
     cur = conn.cursor()
     cur.execute("""
         UPDATE pending_views 
-        SET period_offset = %s 
-        WHERE id = %s
+        SET period_offset = ? 
+        WHERE id = ?
     """, (offset, pending["id"]))
     conn.commit()
     conn.close()
     
-    log.info(f"✅ SAVED OFFSET IN PENDING: {offset}")  # Debug
+    print(f"✅ SAVED OFFSET IN PENDING: {offset}")  # Debug
     
     # Construir mensaje
     msg = "🗂️ Períodos anteriores:\n\n"
@@ -12342,13 +9273,16 @@ def clear_multi_tenant_selection_state(whatsapp: str):
     """Limpia el estado de selección después de que el usuario eligió."""
     conn = get_db_connection()
     cur = conn.cursor()
-    cur.execute("DELETE FROM multi_tenant_selection WHERE whatsapp = %s", (whatsapp,))
+    cur.execute("DELETE FROM multi_tenant_selection WHERE whatsapp = ?", (whatsapp,))
     conn.commit()
     conn.close()
 
 # ============================================================================
-# COMUNIDADES: mensaje parametrizado [slug] + período — identificación SOLO por padrón
+# COMUNIDADES: mensaje parametrizado [slug] + período — identificación SOLO por
+# padrón. Respuesta 204 inmediata a Twilio + trabajo en background (sin timeout).
 # ============================================================================
+
+import threading
 
 _COMMUNITY_TOKEN_RE = re.compile(r"\[([a-z0-9\-_]{2,60})\]", re.IGNORECASE)
 
@@ -12388,152 +9322,180 @@ def _extract_community_period(body: str) -> str:
     if not body:
         return ""
     low = body.lower()
-    # formato numérico MM/AAAA o MM-AAAA
     m = re.search(r"\b(0?[1-9]|1[0-2])\s*[/\-]\s*(20\d{2})\b", low)
     if m:
         return f"{int(m.group(1)):02d}/{m.group(2)}"
-    # formato 'mes de? año' (ej: 'junio 2026', 'junio de 2026')
     m = re.search(r"\b(" + "|".join(_MESES_ES) + r")\b(?:\s+de)?\s+(20\d{2})\b", low)
     if m:
         return f"{_MESES_ES[m.group(1)]:02d}/{m.group(2)}"
     return ""
 
 
-def _latest_period_for(tenant: str, cuil: str) -> str:
-    """Último período con recibo disponible para este cuil, '' si no hay."""
+def _community_send_text(to_whatsapp: str, text: str):
+    """Envía un texto de sesión por la API REST (no depende del webhook)."""
     try:
-        periods = list_periods_for_cuil(tenant, cuil) or []
+        kwargs = {"to": to_whatsapp, "body": text}
+        msid = os.getenv("TWILIO_MESSAGING_SERVICE_SID", "").strip()
+        if msid:
+            kwargs["messaging_service_sid"] = msid
+        else:
+            kwargs["from_"] = os.getenv("TWILIO_WHATSAPP_FROM", "")
+        client.messages.create(**kwargs)   # usar la misma instancia `client` que _send_pdf_flow
     except Exception:
-        log.exception("community: error listando períodos")
+        log.exception("community: error enviando texto a %s", to_whatsapp)
+
+
+def _community_find_in_padron(token: str, from_whatsapp: str) -> str:
+    """Busca el número SOLO en el padrón del colegio del token. Devuelve cuil o ''."""
+    me = norm_whatsapp(from_whatsapp)
+    try:
+        rows = load_envios_rows(token)
+    except Exception:
+        log.exception("community: error cargando padrón de %s", token)
         return ""
-    def _key(p):
-        try:
-            mm, yy = p.split("/")
-            return (int(yy), int(mm))
-        except Exception:
-            return (0, 0)
-    periods = sorted(periods, key=_key, reverse=True)
-    return periods[0] if periods else ""
+    for row in rows:
+        tel = str(row.get("telefono") or row.get("teléfono") or
+                  row.get("Telefono") or row.get("whatsapp") or
+                  row.get("celular") or row.get("phone") or "").strip()
+        if tel and norm_whatsapp(tel) == me:
+            return norm_cuil(str(row.get("cuil") or row.get("CUIL") or ""))
+    return ""
 
 
-def _community_deliver(from_whatsapp: str, tenant: str, cuil: str,
-                       period_hint: str = ""):
-    """
-    Entrega el recibo del período pedido (o dispara T&C si aún no aceptó).
-    Si el período pedido no está disponible, avisa y entrega el último.
-    Devuelve Response.
-    """
+def _community_worker(from_whatsapp: str, token: str, period_hint: str):
+    """Corre en background: identifica por padrón y entrega. Todo por API REST."""
     try:
-        available = list_periods_for_cuil(tenant, cuil) or []
+        cuil = _community_find_in_padron(token, from_whatsapp)
+        if not cuil:
+            _community_send_text(from_whatsapp, _COMMUNITY_REJECT_MSG)
+            log.info("COMMUNITY: %s no está en padrón de %s → rechazo", from_whatsapp, token)
+            return
+
+        try:
+            available = list_periods_for_cuil(token, cuil) or []
+        except Exception:
+            log.exception("community: error listando períodos")
+            available = []
+        if not available:
+            _community_send_text(from_whatsapp,
+                "📭 Todavía no hay recibos disponibles para vos en el sistema. "
+                "Apenas se cargue el próximo período te lo vamos a poder entregar. "
+                "Ante dudas, consultá en administración.")
+            return
+
+        def _key(p):
+            try:
+                mm, yy = p.split("/")
+                return (int(yy), int(mm))
+            except Exception:
+                return (0, 0)
+        latest = sorted(available, key=_key, reverse=True)[0]
+
+        if period_hint and period_hint in available:
+            period = period_hint
+        else:
+            period = latest
+            if period_hint:
+                _community_send_text(from_whatsapp,
+                    f"ℹ️ El recibo de {period_hint} todavía no está disponible. "
+                    f"Te envío el último cargado ({period}).")
+
+        if not has_accepted_terms(from_whatsapp):
+            send_terms_and_conditions(from_whatsapp, token, cuil, period)
+            log.info("COMMUNITY: T&C enviados a %s (%s %s)", from_whatsapp, token, period)
+            return
+
+        sid = _send_pdf_flow(from_whatsapp, token, cuil, period, origin="COMMUNITY")
+        if not sid:
+            _community_send_text(from_whatsapp,
+                "❌ Hubo un error enviando el recibo. Probá de nuevo en unos "
+                "minutos o consultá en administración.")
+        else:
+            log.info("COMMUNITY: PDF %s enviado a %s (%s %s)", sid, from_whatsapp, token, period)
     except Exception:
-        log.exception("community: error listando períodos")
-        available = []
-    if not available:
-        return twiml("📭 Todavía no hay recibos disponibles para vos en el sistema. "
-                     "Apenas se cargue el próximo período te lo vamos a poder entregar. "
-                     "Ante dudas, consultá en administración.")
-
-    latest = _latest_period_for(tenant, cuil)
-    fallback_note = ""
-    if period_hint and period_hint in available:
-        period = period_hint
-    else:
-        period = latest
-        if period_hint:  # pidió un período que (aún) no está
-            fallback_note = (f"ℹ️ El recibo de {period_hint} todavía no está "
-                             f"disponible. Te envío el último cargado ({period}).")
-
-    if not has_accepted_terms(from_whatsapp):
-        send_terms_and_conditions(from_whatsapp, tenant, cuil, period)
-        return Response("", status=204)
-
-    sid = _send_pdf_flow(from_whatsapp, tenant, cuil, period, origin="COMMUNITY")
-    if not sid:
-        return twiml("❌ Hubo un error enviando el recibo. Probá de nuevo en unos "
-                     "minutos o consultá en administración.")
-    if fallback_note:
-        return twiml(fallback_note)  # el PDF ya salió por API; esto llega como aviso
-    return Response("", status=204)
+        log.exception("community worker: error inesperado")
 
 
 def handle_community_request(from_whatsapp: str, body: str):
     """
-    Maneja el mensaje parametrizado de comunidades ([slug] + período).
-    Identificación EXCLUSIVA por padrón del Excel: si el número no figura
-    en el padrón del colegio del link, rechazo amable y nada más.
-    Devuelve un Response si el mensaje fue manejado acá, o None para que
-    siga el flujo normal del inbound (todo lo existente queda igual).
+    Si el mensaje trae un [slug] válido, dispara el worker en background y
+    responde 204 al instante (Twilio nunca espera). Si no hay token, devuelve
+    None y el inbound sigue su flujo normal, todo igual que hoy.
     """
     token = _extract_community_token(body)
     if not token:
-        return None  # sin [slug] válido → flujo normal actual, sin cambios
-
+        return None
     period_hint = _extract_community_period(body)
-
-    # ¿Este número figura en el padrón de ese colegio?
-    for t in find_all_tenants_for_whatsapp(from_whatsapp):
-        if t.get("tenant") == token:
-            return _community_deliver(from_whatsapp, token, t.get("cuil", ""),
-                                      period_hint=period_hint)
-
-    # Número no está en el padrón del colegio del link → rechazo amable, fin
-    return twiml(_COMMUNITY_REJECT_MSG)
+    threading.Thread(target=_community_worker,
+                     args=(from_whatsapp, token, period_hint),
+                     daemon=True).start()
+    return Response("", status=204)
 
 
 TWILIO_SIGN_TEMPLATE_SID = os.environ.get("TWILIO_SIGN_TEMPLATE_SID", "").strip()
 
+
+#############################################################################################################
+#############################################################################################################
+def set_pending_terms_acceptance(whatsapp: str, tenant: str, cuil: str, period: str):
+    """
+    Marca que el usuario está esperando aceptar T&C.
+    """
+    conn = get_db_connection()
+    cur = conn.cursor()
+    now = int(time.time())
+    cur.execute("""
+        INSERT OR REPLACE INTO pending_terms (whatsapp, tenant, cuil, period, created_at)
+        VALUES (?, ?, ?, ?, ?)
+    """, (whatsapp, tenant, cuil, period, now))
+    conn.commit()
+    conn.close()
+
+
+def get_pending_terms(whatsapp: str):
+    """
+    Obtiene los datos del usuario que está esperando aceptar T&C.
+    """
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT tenant, cuil, period FROM pending_terms WHERE whatsapp = ? LIMIT 1
+    """, (whatsapp,))
+    row = cur.fetchone()
+    conn.close()
+    
+    if row:
+        return {"tenant": row[0], "cuil": row[1], "period": row[2]}
+    return None
+
+
+def clear_pending_terms(whatsapp: str):
+    """
+    Limpia el estado de espera después de aceptar.
+    """
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute("DELETE FROM pending_terms WHERE whatsapp = ?", (whatsapp,))
+    conn.commit()
+    conn.close()
+#############################################################################################################
+#############################################################################################################
+
+
+
 @app.post("/twilio/inbound")
 def twilio_inbound():
-    if not _twilio_signature_ok():
-        log.warning("⚠️ /twilio/inbound: firma Twilio inválida, request rechazado")
-        return Response("Forbidden", status=403)
-
     from_whatsapp = (request.form.get("From") or "").strip()
     button = (request.form.get("ButtonPayload") or "").strip()
     body = (request.form.get("Body") or "").strip()
     in_sid = (request.form.get("MessageSid") or "").strip()
 
-    # ✅ List Picker manda el Item ID en Body (no en ButtonPayload como el Quick Reply).
-    # Si el body es un ID de opción conocido y no vino button, lo tratamos como button.
-    _MENU_IDS = {
-        "RESEND_LAST", "SEE_PREVIOUS", "MORE_OPTIONS",
-        "VIEW_NOW", "NO_NEED", "SIGN_OK", "SIGN_OBS", "ACCEPT_TERMS",
-        "CERT_MEDICO", "CERT_FAMILIA",
-    }
-    if not button and body in _MENU_IDS:
-        button = body
-        body = ""
-
-    log.info("%s %s %s %s %s %s %s %s", "INBOUND:", from_whatsapp, "MessageSid:", in_sid, "ButtonPayload:", button, "Body:", body)
+    print("INBOUND:", from_whatsapp, "MessageSid:", in_sid, "ButtonPayload:", button, "Body:", body)
 
     # ✅ DEDUP global: si Twilio reintenta el mismo inbound, no hacemos nada
-    # ✅ DEDUP global
     if inbound_seen(in_sid):
-        log.info("%s %s", "DEDUP inbound:", in_sid)
+        print("DEDUP inbound:", in_sid)
         return Response("OK", status=200)
-
-    # ============================================================================
-    # ✅ DETECTAR ACEPTACIÓN DE T&C
-    # ============================================================================
-    if button == "ACCEPT_TERMS" or "acepto" in body.lower():
-        pending_terms = get_pending_terms(from_whatsapp)
-        
-        if pending_terms:
-            save_terms_acceptance(from_whatsapp)
-            
-            tenant = pending_terms['tenant']
-            cuil = pending_terms['cuil']
-            period = pending_terms['period']
-            origin = pending_terms.get('origin', 'INITIAL')
-            
-            sid_pdf = _send_pdf_flow(from_whatsapp, tenant, cuil, period, origin=origin)
-            
-            clear_pending_terms(from_whatsapp)
-            
-            if not sid_pdf:
-                return twiml("❌ Hubo un error enviando el PDF. Intentá de nuevo o contactá a RRHH.")
-            
-            return Response("OK", status=200)
 
     def _is_receipt_request_text(t: str) -> bool:
         t = (t or "").strip().lower()
@@ -12549,7 +9511,7 @@ def twilio_inbound():
         return community_resp
 
     pending = get_latest_pending_view(from_whatsapp)
-    log.info("%s %s", "PENDING:", pending)
+    print("PENDING:", pending)
     
     # =========================
     # SEE_PREVIOUS debe funcionar incluso sin pending
@@ -12590,44 +9552,6 @@ def twilio_inbound():
         
         return twiml(msg)
 
-    # =========================================================================
-    # 🩺 CERT — botón "Certificado médico" (early, igual patrón que SEE_PREVIOUS)
-    # Funciona aunque no haya pending. Si está en varias empresas, pregunta a cuál.
-    # =========================================================================
-    if button in ("CERT_MEDICO", "CERT_FAMILIA"):
-        # El tipo viaja en origin para recordarlo hasta que llegue el archivo.
-        cert_tipo = "familia" if button == "CERT_FAMILIA" else "medico"
-        cert_origin = "CERT_FAMILIA" if cert_tipo == "familia" else "CERT"
-        cert_label = "certificado de asignaciones familiares" if cert_tipo == "familia" else "certificado médico"
-        cert_emoji = "🧑\u200d🧑\u200d🧒" if cert_tipo == "familia" else "🩺"
-
-        tenants_found = find_all_tenants_for_whatsapp(from_whatsapp)
-
-        if len(tenants_found) == 0:
-            return twiml("👋 Para enviar tu certificado, primero necesitás el mensaje inicial de RRHH. Si no lo tenés, avisá a RRHH.")
-
-        elif len(tenants_found) > 1:
-            # Multi-empresa: preguntar a cuál mandar el certificado (recordando el tipo)
-            save_multi_tenant_selection_state(from_whatsapp, tenants_found, action=cert_origin)
-
-            msg = "Trabajás en varias empresas. ¿A cuál querés enviar el certificado?\n\n"
-            for i, t in enumerate(tenants_found, 1):
-                msg += f"{i}️⃣ {t['display_name']}\n"
-            msg += "\nRespondé con el número."
-
-            return twiml(msg)
-
-        # Un solo tenant: armar pending y pasar a AWAIT_CERT
-        tenant0 = tenants_found[0]["tenant"]
-        cuil0 = tenants_found[0]["cuil"]
-        add_pending_view(from_whatsapp, tenant0, cuil0, "", origin=cert_origin)
-        p = get_latest_pending_view(from_whatsapp)
-        set_pending_step(p["id"], "AWAIT_CERT")
-        return twiml(
-            f"{cert_emoji} Mandame una *foto* o *PDF* de tu {cert_label}.\n\n"
-            "Si querés salir, escribí *CANCELAR*."
-        )
-
     # ============================================================================
     # MANEJO DE SELECCIÓN MULTI-TENANT (1, 2, 3, 4)
     # ============================================================================
@@ -12647,14 +9571,14 @@ def twilio_inbound():
                 cuil = tenant_info.get("cuil")
                 current_offset = multi_state.get("period_offset", 0)
                 
-                log.info(f"🔍 PAGING FORWARD: current_offset={current_offset}")
+                print(f"🔍 PAGING FORWARD: current_offset={current_offset}")
                 
                 msg, has_more = show_previous_periods_paginated(from_whatsapp, tenant, cuil, offset=current_offset)
                 
                 # Actualizar offset para próxima paginación
                 if has_more:
                     new_offset = current_offset + 3
-                    log.info(f"✅ SAVING NEXT OFFSET: {new_offset}")
+                    print(f"✅ SAVING NEXT OFFSET: {new_offset}")
                     save_multi_tenant_selection_state(
                         from_whatsapp,
                         tenants=[{"tenant": tenant, "cuil": cuil}],
@@ -12668,7 +9592,7 @@ def twilio_inbound():
                 return twiml(msg)
             else:
                 # Si no hay estado de paginación, buscar tenant del pending
-                log.warning(f"⚠️ NO PAGINATION STATE FOUND, using pending tenant/cuil")
+                print(f"⚠️ NO PAGINATION STATE FOUND, using pending tenant/cuil")
                 
                 if not pending:
                     return twiml("❌ Hubo un error. Por favor, pedí tus períodos anteriores nuevamente.")
@@ -12706,7 +9630,7 @@ def twilio_inbound():
                     tenant = selected["tenant"]
                     cuil = selected["cuil"]
                     
-                    log.info(f"🔍 MULTI-TENANT SELECT: tenant={tenant}, action={action}")
+                    print(f"🔍 MULTI-TENANT SELECT: tenant={tenant}, action={action}")
                     
                     # ============================================================
                     # ACCIÓN: SEE_PREVIOUS → Mostrar períodos anteriores
@@ -12715,11 +9639,11 @@ def twilio_inbound():
                         # ⚠️ NO limpiar aquí para SEE_PREVIOUS
                         msg, has_more = show_previous_periods_paginated(from_whatsapp, tenant, cuil, offset=0)
                         
-                        log.info(f"🔍 AFTER SELECT COMPANY: has_more={has_more}")
+                        print(f"🔍 AFTER SELECT COMPANY: has_more={has_more}")
                         
                         # Guardar estado para manejar "4" (ver más)
                         if has_more:
-                            log.info(f"✅ SAVING PAGINATION STATE: offset=3")
+                            print(f"✅ SAVING PAGINATION STATE: offset=3")
                             save_multi_tenant_selection_state(
                                 from_whatsapp,
                                 tenants=[{"tenant": tenant, "cuil": cuil}],
@@ -12731,33 +9655,17 @@ def twilio_inbound():
                             clear_multi_tenant_selection_state(from_whatsapp)
                         
                         return twiml(msg)
-
-                    # ========================================================
-                    # 🩺 CERT — ACCIÓN: eligió empresa para mandar certificado
-                    # ========================================================
-                    if action in ("CERT", "CERT_FAMILIA"):
-                        _tipo = "familia" if action == "CERT_FAMILIA" else "medico"
-                        _label = "certificado de asignaciones familiares" if _tipo == "familia" else "certificado médico"
-                        _emoji = "🧑\u200d🧑\u200d🧒" if _tipo == "familia" else "🩺"
-                        clear_multi_tenant_selection_state(from_whatsapp)
-                        add_pending_view(from_whatsapp, tenant, cuil, "", origin=action)
-                        p = get_latest_pending_view(from_whatsapp)
-                        set_pending_step(p["id"], "AWAIT_CERT")
-                        return twiml(
-                            f"{_emoji} Mandame una *foto* o *PDF* de tu {_label}.\n\n"
-                            "Si querés salir, escribí *CANCELAR*."
-                        )
-
+                    
                     # ============================================================
                     # ACCIÓN: RESEND → Enviar último recibo
                     # ============================================================
                     # Para RESEND sí limpiamos porque ya no necesitamos el estado
                     clear_multi_tenant_selection_state(from_whatsapp)
                     
-                    log.info(f"🔍 RESEND: tenant={tenant}, cuil={cuil}")
+                    print(f"🔍 RESEND: tenant={tenant}, cuil={cuil}")
                     
                     period = resolve_best_period_with_pdf(tenant, cuil)
-                    log.info(f"🔍 RESEND: period={period}")
+                    print(f"🔍 RESEND: period={period}")
                     
                     if not period:
                         _log_receipt_request_event(tenant, cuil, "", from_whatsapp, "MULTI_SELECT", "NO_PDF")
@@ -12767,24 +9675,24 @@ def twilio_inbound():
                     pending = get_latest_pending_view(from_whatsapp)
                     
                     cnt = get_receipt_request_count(tenant, cuil, period, from_whatsapp)
-                    log.info(f"🔍 RESEND: cnt={cnt}")
+                    print(f"🔍 RESEND: cnt={cnt}")
                     
                     if cnt >= 3:
                         _log_receipt_request_event(tenant, cuil, period, from_whatsapp, "MULTI_SELECT", "BLOCKED_LIMIT")
                         return twiml(f"⚠️ Ya pediste este recibo {cnt}/3 veces para {period}. Si necesitás más, avisá a RRHH.")
                     
                     is_verified = is_verified_contact(tenant, cuil, from_whatsapp)
-                    log.info(f"🔍 RESEND: is_verified={is_verified}")
+                    print(f"🔍 RESEND: is_verified={is_verified}")
                     
                     if not is_verified:
                         set_pending_step(pending["id"], "AWAIT_DNI")
                         _log_receipt_request_event(tenant, cuil, period, from_whatsapp, "MULTI_SELECT", "ASK_DNI")
                         return twiml("🔐 Para reenviar tu recibo, enviá tu DNI (solo números, sin puntos).")
                     
-                    log.info(f"🔍 RESEND: Calling _send_pdf_flow...")
+                    print(f"🔍 RESEND: Calling _send_pdf_flow...")
                     
                     sid_pdf = _send_pdf_flow(from_whatsapp, tenant, cuil, period, origin="RESEND_LAST")
-                    log.info(f"🔍 RESEND: sid_pdf={sid_pdf}")
+                    print(f"🔍 RESEND: sid_pdf={sid_pdf}")
                     
                     if not sid_pdf:
                         _log_receipt_request_event(tenant, cuil, period, from_whatsapp, "MULTI_SELECT", "ERROR")
@@ -12793,15 +9701,15 @@ def twilio_inbound():
                     n = inc_receipt_request_count(tenant, cuil, period, from_whatsapp)
                     _log_receipt_request_event(tenant, cuil, period, from_whatsapp, "MULTI_SELECT", "SENT", message_sid=sid_pdf)
                     
-                    log.info(f"✅ RESEND: PDF sent successfully, sid={sid_pdf}")
+                    print(f"✅ RESEND: PDF sent successfully, sid={sid_pdf}")
                     
                     return Response("OK", status=200)
                     
                 except Exception as e:
-                    log.exception(f"Error en selección multi-tenant: {e}")
+                    print(f"Error en selección multi-tenant: {e}")
                     clear_multi_tenant_selection_state(from_whatsapp)
                     return twiml("❌ Hubo un error. Por favor, pedí tu recibo nuevamente.")
-            
+
     # =========================
     # REGLA: cualquier texto (sin botón) dispara menú,
     # EXCEPTO cuando estamos esperando DNI o selección de períodos
@@ -12812,11 +9720,6 @@ def twilio_inbound():
 
         # AWAIT_DNI: dejamos pasar para que lo procese el bloque AWAIT_DNI
         if step_now == "AWAIT_DNI":
-            pass
-
-        # 🩺 CERT — AWAIT_CERT: dejamos pasar para que lo procese el bloque AWAIT_CERT
-        # (importante: si no, la FOTO dispararía el menú)
-        elif step_now == "AWAIT_CERT":
             pass
 
         # CHOOSE_PREVIOUS: si no es 1/2/3/4, devolvemos ayuda (no menú)
@@ -12969,19 +9872,19 @@ def twilio_inbound():
         # ✅ Leer offset directamente del pending
         current_offset = pending.get("period_offset", 0)
         
-        log.info(f"🔍 PAGINATION DEBUG: current_offset={current_offset} (from pending)")
+        print(f"🔍 PAGINATION DEBUG: current_offset={current_offset} (from pending)")
         
         # Obtener períodos desde el offset correcto
         all_prev = list_previous_periods_excluding_current(tenant, cuil, limit=20)
         prev = all_prev[current_offset:current_offset + 3]
         
-        log.info(f"🔍 PERIODS: all={all_prev[:10]}, showing={prev}")
+        print(f"🔍 PERIODS: all={all_prev[:10]}, showing={prev}")
         
         if idx >= len(prev):
             return twiml("❌ Opción inválida. Respondé con 1, 2 o 3.")
 
         chosen_period = prev[idx]
-        log.info(f"✅ SELECTED: idx={idx}, period={chosen_period}")
+        print(f"✅ SELECTED: idx={idx}, period={chosen_period}")
 
         # Limpiar estado de paginación
         clear_multi_tenant_selection_state(from_whatsapp)
@@ -13009,75 +9912,7 @@ def twilio_inbound():
         n = inc_receipt_request_count(tenant, cuil, chosen_period, from_whatsapp)
         _log_receipt_request_event(tenant, cuil, chosen_period, from_whatsapp, "CHOOSE_PREVIOUS", "SENT", message_sid=sid_pdf)
         return twiml(f"📄 Listo. Te reenvié el recibo {chosen_period}. (Pedido {n}/3)")
-
-    # =========================================================================
-    # 🩺 CERT — AWAIT_CERT: esperando el archivo del certificado médico
-    # (va ANTES de AWAIT_DNI)
-    # =========================================================================
-    if step == "AWAIT_CERT":
-        # ¿quiere cancelar?
-        if body.strip().lower() in ("cancelar", "cancel", "salir"):
-            set_pending_step(pending["id"], "READY")
-            return twiml("✅ Cancelado. Cuando quieras, volvé a abrir el menú.")
-
-        # ¿mandó un archivo? Twilio lo indica con NumMedia > 0
-        try:
-            num_media = int(request.form.get("NumMedia") or "0")
-        except ValueError:
-            num_media = 0
-
-        if num_media < 1:
-            # mandó texto en vez de archivo
-            return twiml(
-                "📎 Necesito una *foto* o *PDF* del certificado.\n\n"
-                "Si querés salir, escribí *CANCELAR*."
-            )
-
-        media_url = (request.form.get("MediaUrl0") or "").strip()
-        media_ct = (request.form.get("MediaContentType0") or "").strip().lower()
-
-        # validar tipo: solo imagen o pdf
-        if not (media_ct.startswith("image/") or "pdf" in media_ct):
-            return twiml(
-                "⚠️ Solo acepto *imágenes* o *PDF*. Probá de nuevo.\n\n"
-                "Si querés salir, escribí *CANCELAR*."
-            )
-
-        try:
-            # tipo según el origin guardado al iniciar el flujo (CERT_FAMILIA -> familia)
-            cert_tipo = "familia" if (pending.get("origin") or "") == "CERT_FAMILIA" else "medico"
-
-            # 1) descargar de Twilio
-            data, content_type = download_twilio_media(media_url)
-            if content_type == "application/octet-stream" and media_ct:
-                content_type = media_ct
-
-            # 2) subir a Drive (a la subcarpeta del tipo)
-            file_id, file_name = upload_certificado_to_drive(tenant, cuil, data, content_type, cert_tipo)
-
-            # 3) registrar en BD
-            nombre = pending.get("nombre", "") or get_nombre_for_cuil(tenant, cuil)
-            save_certificado(tenant, cuil, nombre, from_whatsapp, file_id, file_name, content_type, cert_tipo)
-
-            # 3.b) notificar por email a RRHH (en segundo plano para no demorar la respuesta a WhatsApp)
-            try:
-                threading.Thread(
-                    target=send_certificado_notification,
-                    args=(tenant, nombre, cuil, cert_tipo),
-                    daemon=True
-                ).start()
-            except Exception as e:
-                log.warning(f"No se pudo lanzar la notificación de certificado: {e}")
-            # 4) volver a READY y confirmar
-            set_pending_step(pending["id"], "READY")
-            return twiml("✅ Recibí tu certificado. RRHH lo va a revisar. ¡Gracias!")
-
-        except Exception as e:
-            log.exception(f"❌ Error guardando certificado: {type(e).__name__}: {e}")
-            return twiml(
-                "❌ Hubo un error guardando tu certificado. Probá de nuevo en un momento, o avisá a RRHH."
-            )
-
+    
     # =========================
     # AWAIT_DNI
     # =========================
@@ -13109,21 +9944,6 @@ def twilio_inbound():
             consume_pending_view(pending["id"])
             return twiml(f"⚠️ Ya pediste este recibo {cnt}/3 veces para {period}. Si necesitás más, avisá a RRHH.")
 
-        # ✅ VERIFICAR T&C antes de enviar PDF
-        already_accepted = has_accepted_terms(from_whatsapp)
-        log.info(f"🔍 T&C CHECK (AWAIT_DNI): whatsapp={from_whatsapp}, already_accepted={already_accepted}")
-        log.info(f"🔍 T&C CONFIG: TERMS_TEMPLATE_SID={TERMS_TEMPLATE_SID[:10] if TERMS_TEMPLATE_SID else 'EMPTY'}, TERMS_PDF_FILE_ID={TERMS_PDF_FILE_ID[:10] if TERMS_PDF_FILE_ID else 'EMPTY'}")
-        
-        if not already_accepted:
-            origin = (pending.get("origin") or "INITIAL")
-            log.info(f"🔍 T&C: Enviando T&C a {from_whatsapp}")
-            send_terms_and_conditions(from_whatsapp, tenant, cuil, period)
-            set_pending_terms_acceptance(from_whatsapp, tenant, cuil, period, origin)
-            _log_receipt_request_event(tenant, cuil, period, from_whatsapp, "DNI_OK", "SENT_TERMS")
-            return twiml("✅ DNI verificado.")
-        else:
-            log.info(f"🔍 T&C: Ya aceptó, enviando PDF directo")
-
         # ✅ usar origin del pending (INITIAL si vino del admin)
         origin = (pending.get("origin") or "INITIAL")
 
@@ -13142,20 +9962,12 @@ def twilio_inbound():
     if button == "VIEW_NOW" or body == "VIEW_NOW":
         if not is_verified_contact(tenant, cuil, from_whatsapp):
             set_pending_step(pending["id"], "AWAIT_DNI")
-            return twiml("🔐 Para confirmar tu identidad, enviá tu DNI (solo números, sin puntos).")
+            return twiml("🔐 Para cofirmar tu identidad, enviá tu DNI (solo números, sin puntos).")
 
         cnt = get_receipt_request_count(tenant, cuil, period, from_whatsapp)
         if cnt >= 3:
             _log_receipt_request_event(tenant, cuil, period, from_whatsapp, "VIEW_NOW", "BLOCKED_LIMIT")
             return twiml(f"⚠️ Ya pediste este recibo {cnt}/3 veces para {period}. Si necesitás más, avisá a RRHH.")
-
-        # ✅ VERIFICAR T&C antes de enviar PDF
-        if not has_accepted_terms(from_whatsapp):
-            origin = (pending.get("origin") or "INITIAL")
-            send_terms_and_conditions(from_whatsapp, tenant, cuil, period)
-            set_pending_terms_acceptance(from_whatsapp, tenant, cuil, period, origin)
-            _log_receipt_request_event(tenant, cuil, period, from_whatsapp, "VIEW_NOW", "SENT_TERMS")
-            return Response("OK", status=200)
 
         sid_pdf = _send_pdf_flow(from_whatsapp, tenant, cuil, period)
         if not sid_pdf:
@@ -13190,10 +10002,10 @@ def admin_reenviar_fallidos():
     """
     Reenviar PDFs a empleados específicos.
     """
-    auth = require_admin()
-    if auth:
-        return auth
-
+    token = request.args.get("token") or request.form.get("token")
+    if token != ADMIN_TOKEN:
+        return Response("Unauthorized", status=401)
+    
     if request.method == "POST":
         tenant = request.form.get("tenant", "").strip()
         period = request.form.get("period", "").strip()
@@ -13238,15 +10050,15 @@ def admin_reenviar_fallidos():
                 conn = get_db_connection()
                 cur = conn.cursor()
                 cur.execute("""
-                    SELECT to_whatsapp FROM message_status
-                    WHERE tenant = %s AND cuil = %s
+                    SELECT to_whatsapp FROM message_status 
+                    WHERE tenant = ? AND cuil = ? 
                     ORDER BY created_at DESC LIMIT 1
                 """, (tenant, cuil))
                 row = cur.fetchone()
                 conn.close()
-
-                if row and row['to_whatsapp']:
-                    whatsapp = row['to_whatsapp']
+                
+                if row and row[0]:
+                    whatsapp = row[0]
                 else:
                     resultados.append(f"❌ {cuil} ({nombre}): Sin WhatsApp en Excel ni BD")
                     continue
@@ -13294,7 +10106,7 @@ def admin_reenviar_fallidos():
         
         html += f"""
   <hr>
-  <p><a href="/admin/reenviar_fallidos">← Volver</a></p>
+  <p><a href="/admin/reenviar_fallidos?token={ADMIN_TOKEN}">← Volver</a></p>
 </body>
 </html>
 """
@@ -13393,6 +10205,7 @@ def admin_reenviar_fallidos():
   </div>
   
   <form method="post">
+    <input type="hidden" name="token" value="{ADMIN_TOKEN}">
     
     <div class="card">
       <label>Tenant</label>
@@ -13419,48 +10232,12 @@ def admin_reenviar_fallidos():
     </div>
   </form>
   
-  <p><a href="/admin">← Volver al admin</a></p>
+  <p><a href="/admin?token={ADMIN_TOKEN}">← Volver al admin</a></p>
 </body>
 </html>
 """
     
     return Response(html, mimetype="text/html")
-
-@app.get("/media/certificado")
-def media_certificado():
-    #"\"\"Sirve un certificado médico desde Drive (para el panel admin).\"\"\"
-    token = request.args.get("token", "").strip()
-    if not ADMIN_TOKEN or token != ADMIN_TOKEN:
-        # Fail-closed: sin ADMIN_TOKEN configurado este endpoint queda bloqueado.
-        return Response("Unauthorized", status=401)
- 
-    file_id = (request.args.get("file_id") or "").strip()
-    if not file_id:
-        return Response("Falta file_id", status=400)
- 
-    try:
-        service = drive_service()
-        meta = service.files().get(fileId=file_id, fields='name,mimeType').execute()
-        file_name = meta.get('name', 'certificado')
-        mime = meta.get('mimeType', 'application/octet-stream')
- 
-        req = service.files().get_media(fileId=file_id)
-        fh = io.BytesIO()
-        downloader = MediaIoBaseDownload(fh, req, chunksize=5*1024*1024)
-        done = False
-        while not done:
-            _, done = downloader.next_chunk()
-        fh.seek(0)
-        data = fh.read()
- 
-        resp = Response(data, mimetype=mime)
-        resp.headers["Content-Disposition"] = f'inline; filename="{file_name}"'
-        resp.headers["Content-Length"] = str(len(data))
-        resp.headers["Cache-Control"] = "private, max-age=60"
-        return resp
-    except Exception as e:
-        log.exception(f"❌ Error descargando certificado: {e}")
-        return Response("Error descargando certificado", status=500)
 
 
 def _send_pdf_flow(from_whatsapp: str, tenant: str, cuil: str, period: str, origin: str = "INITIAL") -> str | None:
@@ -13474,17 +10251,11 @@ def _send_pdf_flow(from_whatsapp: str, tenant: str, cuil: str, period: str, orig
         return None
 
 
-    # ✅ URL firmada y con vencimiento (ya no viaja ADMIN_TOKEN a Twilio)
-    t_q = (tenant or "").strip().lower()
-    c_q = (cuil or "").strip()
-    p_q = (period or "").strip()
-    qs = urlencode({
-        "tenant": t_q,
-        "cuil": c_q,
-        "period": p_q,
-        "token": make_media_token("pdf", tenant=t_q, cuil=c_q, period=p_q),
-    })
-    pdf_url = f"{request.host_url.rstrip('/')}/media/pdf?{qs}"
+    # ✅ URL optimizada de nuestro servidor (más rápido con chunks 5MB)
+    pdf_url = (
+        f"{request.host_url.rstrip('/')}/media/pdf"
+        f"?tenant={tenant}&cuil={cuil}&period={period}&token={ADMIN_TOKEN}"
+    )
     try:
         # ✅ Para controlar el orden:
         # - En INITIAL podemos incluir body (si querés).
@@ -13505,10 +10276,10 @@ def _send_pdf_flow(from_whatsapp: str, tenant: str, cuil: str, period: str, orig
         return sid_pdf
 
     except Exception as e:
-        log.exception("%s %s", "ERROR sending PDF:", e)
+        print("ERROR sending PDF:", e)
         return None
 
-@app.get("/admin/community_links")
+    @app.get("/admin/community_links")
 @admin_required
 def admin_community_links():
     from urllib.parse import quote
