@@ -13562,43 +13562,6 @@ def _send_pdf_flow(from_whatsapp: str, tenant: str, cuil: str, period: str, orig
         log.exception("%s %s", "ERROR sending PDF:", e)
         return None
 
-@app.get("/admin/community_links")
-@admin_required
-def admin_community_links():
-    from urllib.parse import quote
-    from datetime import datetime
-
-    _MES_NOMBRE = {1: "enero", 2: "febrero", 3: "marzo", 4: "abril", 5: "mayo",
-                   6: "junio", 7: "julio", 8: "agosto", 9: "septiembre",
-                   10: "octubre", 11: "noviembre", 12: "diciembre"}
-
-    # ?period=MM/AAAA — por defecto, el mes anterior al actual (el que se liquida)
-    period = (request.args.get("period") or "").strip()
-    if not re.fullmatch(r"(0[1-9]|1[0-2])/20\d{2}", period):
-        today = datetime.now()
-        mm = today.month - 1 or 12
-        yy = today.year if today.month > 1 else today.year - 1
-        period = f"{mm:02d}/{yy}"
-    mm, yy = int(period[:2]), period[3:]
-    period_legible = f"{_MES_NOMBRE[mm]} {yy}"
-
-    num = re.sub(r"\D", "", os.getenv("TWILIO_WHATSAPP_FROM", ""))
-    html = ["<html><body style='font-family:sans-serif;max-width:760px;margin:2em auto'>",
-            f"<h2>Links de comunidad — recibo de {period_legible}</h2>",
-            "<p>Cambiar período: agregá <code>?period=MM/AAAA</code> a la URL.</p>"]
-    for t in load_tenants():
-        slug = t.get("slug", "")
-        disp = t.get("display_name", slug)
-        text = f"Hola! Quiero mi recibo de {period_legible} [{slug}]"
-        link = f"https://wa.me/{num}?text={quote(text)}"
-        aviso = (f"📄 Ya está disponible tu recibo de {period_legible}.\n"
-                 f"Tocá acá para recibirlo por WhatsApp:\n{link}\n"
-                 f"(La primera vez te va a pedir tu CUIL y aceptar los T&C.)")
-        html.append(f"<h3>{disp}</h3><p><a href='{link}'>{link}</a></p>"
-                    f"<pre style='background:#f4f4f4;padding:1em;white-space:pre-wrap'>{aviso}</pre>")
-    html.append("</body></html>")
-    return Response("".join(html), mimetype="text/html")
-
 @app.get("/health")
 def health():
     return jsonify({"ok": True, "ts": int(time.time()), "db_path": DB_PATH})
