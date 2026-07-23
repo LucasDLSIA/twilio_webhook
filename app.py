@@ -12671,6 +12671,36 @@ def twilio_inbound():
     if community_resp is not None:
         return community_resp
 
+    # ✅ FIRMA: resolver contra el último recibo al que se le envió pedido de firma
+    # (fuente de verdad: sent_pdfs.sign_sent_at — funciona para COMMUNITY e INITIAL,
+    #  sin depender de pendientes viejos)
+    if button in ("SIGN_OK", "SIGN_OBS") or body in ("SIGN_OK", "SIGN_OBS"):
+        conn = get_db_connection(); cur = conn.cursor()
+        cur.execute("""
+            SELECT tenant, cuil, period FROM sent_pdfs
+            WHERE to_whatsapp = %s AND sign_sent_at IS NOT NULL
+            ORDER BY sign_sent_at DESC LIMIT 1
+        """, (from_whatsapp,))
+        sp = cur.fetchone(); cur.close(); conn.close()
+        if sp:
+            t0 = (sp["tenant"] or "").strip().lower()
+            c0 = norm_cuil(sp["cuil"])
+            p0 = norm_period_label(sp["period"] or "")
+            estado = get_recibo_estado(t0, c0, p0)
+            if estado in ("FIRMADO", "OBSERVADO"):
+                msg = "✅ Este recibo ya fue firmado." if estado == "FIRMADO" else "📝 Este recibo quedó como observado."
+                return twiml(msg)
+            if button == "SIGN_OK" or body == "SIGN_OK":
+                set_recibo_estado(t0, c0, p0, "FIRMADO")
+                return twiml(f"✅ Recibo {p0} firmado. ¡Gracias!")
+            else:
+                set_recibo_estado(t0, c0, p0, "OBSERVADO")
+                return twiml(f"📝 Recibo {p0} observado. Contacte RRHH para más información.")
+        # sin registro de firma enviada → sigue el flujo actual (pendientes)
+
+    pending = get_latest_pending_view(from_whatsapp)
+    log.info("%s %s", "PENDING:", pending)
+
     pending = get_latest_pending_view(from_whatsapp)
     log.info("%s %s", "PENDING:", pending)
     
