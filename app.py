@@ -12175,7 +12175,7 @@ def send_terms_and_conditions(to_whatsapp: str, tenant: str, cuil: str, period: 
         
         # 1. Enviar PDF de T&C
         msg_pdf = client.messages.create(**payload_pdf)
-        
+        time.sleep(2)
         # 2. Enviar template con botón "Acepto"
         msg_button = client.messages.create(**payload_button)
         
@@ -12604,7 +12604,7 @@ def _community_worker(from_whatsapp: str, token: str, period_hint: str):
         log.exception("community worker: error inesperado")
 
 
-        
+
 def handle_community_request(from_whatsapp: str, body: str):
     """
     Si el mensaje trae un [slug] v\u00e1lido, dispara el worker en background y
@@ -12653,29 +12653,30 @@ def twilio_inbound():
         log.info("%s %s", "DEDUP inbound:", in_sid)
         return Response("OK", status=200)
 
+
     # ============================================================================
     # ✅ DETECTAR ACEPTACIÓN DE T&C
     # ============================================================================
     if button == "ACCEPT_TERMS" or "acepto" in body.lower():
         pending_terms = get_pending_terms(from_whatsapp)
-        
+
         if pending_terms:
             save_terms_acceptance(from_whatsapp)
-            
+
             tenant = pending_terms['tenant']
             cuil = pending_terms['cuil']
             period = pending_terms['period']
             origin = pending_terms.get('origin', 'INITIAL')
-            
+
             sid_pdf = _send_pdf_flow(from_whatsapp, tenant, cuil, period, origin=origin)
-            
+
             clear_pending_terms(from_whatsapp)
-            
+
             if not sid_pdf:
                 return twiml("❌ Hubo un error enviando el PDF. Intentá de nuevo o contactá a RRHH.")
-            
-            return Response("OK", status=200)
 
+            return twiml(f"✅ ¡Gracias! Términos aceptados. Te estamos enviando tu recibo de {period} 📄")
+        
     def _is_receipt_request_text(t: str) -> bool:
         t = (t or "").strip().lower()
         if not t:
@@ -13261,7 +13262,7 @@ def twilio_inbound():
 
         if not dni_expected or len(dni_user) < 7:
             inc_pending_dni_attempts(pending["id"])
-            return twiml("🔐 Enviá tu DNI (solo números, sin puntos). Ej: 28169249")
+            return twiml("🔐 Enviá tu DNI (solo números, sin puntos). Ej: 12345678")
 
         if dni_user != dni_expected:
             tries = inc_pending_dni_attempts(pending["id"])
@@ -13287,11 +13288,12 @@ def twilio_inbound():
         
         if not already_accepted:
             origin = (pending.get("origin") or "INITIAL")
+            _community_send_text(from_whatsapp, "✅ DNI verificado.")
             log.info(f"🔍 T&C: Enviando T&C a {from_whatsapp}")
             send_terms_and_conditions(from_whatsapp, tenant, cuil, period)
             set_pending_terms_acceptance(from_whatsapp, tenant, cuil, period, origin)
             _log_receipt_request_event(tenant, cuil, period, from_whatsapp, "DNI_OK", "SENT_TERMS")
-            return twiml("✅ DNI verificado.")
+            return Response("", status=204)
         else:
             log.info(f"🔍 T&C: Ya aceptó, enviando PDF directo")
 
