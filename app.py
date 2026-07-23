@@ -12346,6 +12346,139 @@ def clear_multi_tenant_selection_state(whatsapp: str):
     conn.commit()
     conn.close()
 
+# ============================================================================
+# COMUNIDADES: mensaje parametrizado [slug] + período — identificación SOLO por padrón
+# ============================================================================
+
+_COMMUNITY_TOKEN_RE = re.compile(r"\[([a-z0-9\-_]{2,60})\]", re.IGNORECASE)
+
+_COMMUNITY_REJECT_MSG = (
+    "👋 Este es el canal de entrega de recibos de sueldo para el personal de "
+    "instituciones clientes de SIA. No encontramos tu número en el padrón. "
+    "Si sos empleado/a, pedí en administración que actualicen tu número de "
+    "WhatsApp. Si llegaste acá por error, ¡disculpá las molestias!"
+)
+
+_MESES_ES = {
+    "enero": 1, "febrero": 2, "marzo": 3, "abril": 4, "mayo": 5, "junio": 6,
+    "julio": 7, "agosto": 8, "septiembre": 9, "setiembre": 9, "octubre": 10,
+    "noviembre": 11, "diciembre": 12,
+}
+
+
+def _extract_community_token(body: str) -> str:
+    """Devuelve el slug del tenant si el body trae [slug] válido, sino ''."""
+    if not body:
+        return ""
+    m = _COMMUNITY_TOKEN_RE.search(body)
+    if not m:
+        return ""
+    candidate = m.group(1).strip().lower()
+    for t in load_tenants():
+        if (t.get("slug") or "").strip().lower() == candidate:
+            return candidate
+    return ""
+
+
+def _extract_community_period(body: str) -> str:
+    """
+    Lee el período del texto: 'junio 2026', '06/2026', '6/2026', '06-2026'.
+    Devuelve 'MM/AAAA' o '' si no se entiende.
+    """
+    if not body:
+        return ""
+    low = body.lower()
+    # formato numérico MM/AAAA o MM-AAAA
+    m = re.search(r"\b(0?[1-9]|1[0-2])\s*[/\-]\s*(20\d{2})\b", low)
+    if m:
+        return f"{int(m.group(1)):02d}/{m.group(2)}"
+    # formato 'mes de? año' (ej: 'junio 2026', 'junio de 2026')
+    m = re.search(r"\b(" + "|".join(_MESES_ES) + r")\b(?:\s+de)?\s+(20\d{2})\b", low)
+    if m:
+        return f"{_MESES_ES[m.group(1)]:02d}/{m.group(2)}"
+    return ""
+
+
+def _latest_period_for(tenant: str, cuil: str) -> str:
+    """Último período con recibo disponible para este cuil, '' si no hay."""
+    try:
+        periods = list_periods_for_cuil(tenant, cuil) or []
+    except Exception:
+        log.exception("community: error listando períodos")
+        return ""
+    def _key(p):
+        try:
+            mm, yy = p.split("/")
+            return (int(yy), int(mm))
+        except Exception:
+            return (0, 0)
+    periods = sorted(periods, key=_key, reverse=True)
+    return periods[0] if periods else ""
+
+
+def _community_deliver(from_whatsapp: str, tenant: str, cuil: str,
+                       period_hint: str = ""):
+    """
+    Entrega el recibo del período pedido (o dispara T&C si aún no aceptó).
+    Si el período pedido no está disponible, avisa y entrega el último.
+    Devuelve Response.
+    """
+    try:
+        available = list_periods_for_cuil(tenant, cuil) or []
+    except Exception:
+        log.exception("community: error listando períodos")
+        available = []
+    if not available:
+        return twiml("📭 Todavía no hay recibos disponibles para vos en el sistema. "
+                     "Apenas se cargue el próximo período te lo vamos a poder entregar. "
+                     "Ante dudas, consultá en administración.")
+
+    latest = _latest_period_for(tenant, cuil)
+    fallback_note = ""
+    if period_hint and period_hint in available:
+        period = period_hint
+    else:
+        period = latest
+        if period_hint:  # pidió un período que (aún) no está
+            fallback_note = (f"ℹ️ El recibo de {period_hint} todavía no está "
+                             f"disponible. Te envío el último cargado ({period}).")
+
+    if not has_accepted_terms(from_whatsapp):
+        send_terms_and_conditions(from_whatsapp, tenant, cuil, period)
+        return Response("", status=204)
+
+    sid = _send_pdf_flow(from_whatsapp, tenant, cuil, period, origin="COMMUNITY")
+    if not sid:
+        return twiml("❌ Hubo un error enviando el recibo. Probá de nuevo en unos "
+                     "minutos o consultá en administración.")
+    if fallback_note:
+        return twiml(fallback_note)  # el PDF ya salió por API; esto llega como aviso
+    return Response("", status=204)
+
+
+def handle_community_request(from_whatsapp: str, body: str):
+    """
+    Maneja el mensaje parametrizado de comunidades ([slug] + período).
+    Identificación EXCLUSIVA por padrón del Excel: si el número no figura
+    en el padrón del colegio del link, rechazo amable y nada más.
+    Devuelve un Response si el mensaje fue manejado acá, o None para que
+    siga el flujo normal del inbound (todo lo existente queda igual).
+    """
+    token = _extract_community_token(body)
+    if not token:
+        return None  # sin [slug] válido → flujo normal actual, sin cambios
+
+    period_hint = _extract_community_period(body)
+
+    # ¿Este número figura en el padrón de ese colegio?
+    for t in find_all_tenants_for_whatsapp(from_whatsapp):
+        if t.get("tenant") == token:
+            return _community_deliver(from_whatsapp, token, t.get("cuil", ""),
+                                      period_hint=period_hint)
+
+    # Número no está en el padrón del colegio del link → rechazo amable, fin
+    return twiml(_COMMUNITY_REJECT_MSG)
+
 
 TWILIO_SIGN_TEMPLATE_SID = os.environ.get("TWILIO_SIGN_TEMPLATE_SID", "").strip()
 
@@ -12409,6 +12542,11 @@ def twilio_inbound():
         if t.startswith("recibo"):
             return True
         return t in ("pdf", "reenviar", "reenviar recibo", "reenvio", "reenvío", "pedir recibo", "quiero mi recibo")
+
+    # ✅ COMUNIDADES: mensaje con token [slug] del deep link
+    community_resp = handle_community_request(from_whatsapp, body)
+    if community_resp is not None:
+        return community_resp
 
     pending = get_latest_pending_view(from_whatsapp)
     log.info("%s %s", "PENDING:", pending)
@@ -13370,6 +13508,42 @@ def _send_pdf_flow(from_whatsapp: str, tenant: str, cuil: str, period: str, orig
         log.exception("%s %s", "ERROR sending PDF:", e)
         return None
 
+@app.get("/admin/community_links")
+@admin_required
+def admin_community_links():
+    from urllib.parse import quote
+    from datetime import datetime
+
+    _MES_NOMBRE = {1: "enero", 2: "febrero", 3: "marzo", 4: "abril", 5: "mayo",
+                   6: "junio", 7: "julio", 8: "agosto", 9: "septiembre",
+                   10: "octubre", 11: "noviembre", 12: "diciembre"}
+
+    # ?period=MM/AAAA — por defecto, el mes anterior al actual (el que se liquida)
+    period = (request.args.get("period") or "").strip()
+    if not re.fullmatch(r"(0[1-9]|1[0-2])/20\d{2}", period):
+        today = datetime.now()
+        mm = today.month - 1 or 12
+        yy = today.year if today.month > 1 else today.year - 1
+        period = f"{mm:02d}/{yy}"
+    mm, yy = int(period[:2]), period[3:]
+    period_legible = f"{_MES_NOMBRE[mm]} {yy}"
+
+    num = re.sub(r"\D", "", os.getenv("TWILIO_WHATSAPP_FROM", ""))
+    html = ["<html><body style='font-family:sans-serif;max-width:760px;margin:2em auto'>",
+            f"<h2>Links de comunidad — recibo de {period_legible}</h2>",
+            "<p>Cambiar período: agregá <code>?period=MM/AAAA</code> a la URL.</p>"]
+    for t in load_tenants():
+        slug = t.get("slug", "")
+        disp = t.get("display_name", slug)
+        text = f"Hola! Quiero mi recibo de {period_legible} [{slug}]"
+        link = f"https://wa.me/{num}?text={quote(text)}"
+        aviso = (f"📄 Ya está disponible tu recibo de {period_legible}.\n"
+                 f"Tocá acá para recibirlo por WhatsApp:\n{link}\n"
+                 f"(La primera vez te va a pedir tu CUIL y aceptar los T&C.)")
+        html.append(f"<h3>{disp}</h3><p><a href='{link}'>{link}</a></p>"
+                    f"<pre style='background:#f4f4f4;padding:1em;white-space:pre-wrap'>{aviso}</pre>")
+    html.append("</body></html>")
+    return Response("".join(html), mimetype="text/html")
 
 @app.get("/health")
 def health():
