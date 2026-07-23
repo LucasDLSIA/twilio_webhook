@@ -4638,7 +4638,7 @@ def twilio_status():
             est = _est_row['estado'] if _est_row else None
 
             # Si es reenvío, NO firmar nunca
-            if origin != "INITIAL":
+            if origin not in ("INITIAL", "COMMUNITY"):
                 log.info("%s %s %s %s", "SKIP SIGN AFTER PDF (origin=", origin, "):", sid)
 
             elif est in ("FIRMADO", "OBSERVADO"):
@@ -10592,6 +10592,53 @@ def admin_report_estado():
         }
     )
 
+@app.get("/admin/report_retiros.csv")
+def admin_report_retiros():
+    auth = require_admin()
+    if auth:
+        return auth
+
+    tenant = (request.args.get("tenant") or "").strip().lower()
+    period = norm_period_label((request.args.get("period") or "").strip())
+    if not tenant or not period:
+        return Response("Faltan tenant y/o period (MM/AAAA)", status=400)
+
+    rows = load_envios_rows(tenant) or []
+
+    conn = get_db_connection(); cur = conn.cursor()
+    cur.execute("""
+        SELECT cuil, MIN(created_at) AS first_sent, MAX(origin) AS origin
+        FROM sent_pdfs WHERE tenant=%s AND period=%s GROUP BY cuil
+    """, (tenant, period))
+    entregados = {r["cuil"]: r for r in cur.fetchall()}
+    cur.execute("""
+        SELECT cuil, estado FROM recibo_estado WHERE tenant=%s AND period=%s
+    """, (tenant, period))
+    estados = {r["cuil"]: r["estado"] for r in cur.fetchall()}
+    cur.close(); conn.close()
+
+    out = ["nombre;cuil;telefono;retirado;fecha_retiro;via;estado"]
+    for r in rows:
+        cuil = norm_cuil(strip_pdf(r.get("archivo") or r.get("Archivo") or ""))
+        if not cuil:
+            continue
+        nombre = str(r.get("nombre") or r.get("Nombre") or "").strip()
+        tel = str(r.get("telefono") or r.get("teléfono") or r.get("Telefono") or "").strip()
+        ent = entregados.get(cuil)
+        fecha = (datetime.fromtimestamp(ent["first_sent"]).strftime("%d/%m/%Y %H:%M")
+                 if ent and ent.get("first_sent") else "")
+        out.append(";".join([
+            nombre, cuil, tel,
+            "SI" if ent else "NO",
+            fecha,
+            (ent.get("origin") or "") if ent else "",
+            estados.get(cuil, ""),
+        ]))
+    csv = "\n".join(out)
+    return Response(csv, mimetype="text/csv",
+                    headers={"Content-Disposition":
+                             f"attachment; filename=retiros_{tenant}_{period.replace('/','-')}.csv"})
+
 def get_sent_pdfs_report(tenant: str):
     conn = get_db_connection()
     cur = conn.cursor()
@@ -12519,13 +12566,24 @@ def _community_worker(from_whatsapp: str, token: str, period_hint: str):
                 log.info("COMMUNITY: T&C enviados a %s (%s %s)", from_whatsapp, token, period)
                 return
 
-            sid = _send_pdf_flow(from_whatsapp, token, cuil, period, origin="COMMUNITY")
+            sid = _send_pdf_flow(from_whatsapp, token, cuil, period, origin="COMMUNITY")   
             if not sid:
                 _community_send_text(from_whatsapp,
                     "❌ Hubo un error enviando el recibo. Probá de nuevo en unos "
                     "minutos o consultá en administración.")
             else:
                 log.info("COMMUNITY: PDF %s enviado a %s (%s %s)", sid, from_whatsapp, token, period)
+                # completar nombre para los reportes (Excel/PDF)
+                try:
+                    person = find_person_by_cuil(load_envios_rows(token), cuil)
+                    if person and person.get("nombre"):
+                        conn = get_db_connection(); cur = conn.cursor()
+                        cur.execute("""UPDATE message_status SET nombre=%s
+                                       WHERE message_sid=%s AND (nombre='' OR nombre IS NULL)""",
+                                    (person["nombre"], sid))
+                        conn.commit(); cur.close(); conn.close()
+                except Exception:
+                    log.exception("community: no pude completar nombre en message_status")
     except Exception:
         log.exception("community worker: error inesperado")
 
@@ -13554,7 +13612,7 @@ def _send_pdf_flow(from_whatsapp: str, tenant: str, cuil: str, period: str, orig
         # ✅ Para controlar el orden:
         # - En INITIAL podemos incluir body (si querés).
         # - En RESEND lo mandamos vacío y notificamos después del delivered desde /twilio/status.
-        body_text = f"Acá tenés tu recibo {period}." if origin == "INITIAL" else ""
+        body_text = f"Acá tenés tu recibo {period}." if origin in ("INITIAL", "COMMUNITY") else ""
 
         sid_pdf = send_whatsapp_pdf(
             from_whatsapp,
