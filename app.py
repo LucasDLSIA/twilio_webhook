@@ -10279,7 +10279,7 @@ def _send_pdf_flow(from_whatsapp: str, tenant: str, cuil: str, period: str, orig
         print("ERROR sending PDF:", e)
         return None
 
-    @app.get("/admin/community_links")
+@app.get("/admin/community_links")
 @admin_required
 def admin_community_links():
     from urllib.parse import quote
