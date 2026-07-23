@@ -12448,19 +12448,29 @@ def _community_send_text(to_whatsapp: str, text: str):
 
 
 def _community_find_in_padron(token: str, from_whatsapp: str) -> str:
-    """Busca el n\u00famero SOLO en el padr\u00f3n del colegio del token. Devuelve cuil o ''."""
+    """Busca el número SOLO en el padrón del colegio del token.
+    Devuelve el CUIL (extraído de la columna 'archivo', igual que
+    find_person_by_cuil) o '' si el número no está."""
     me = norm_whatsapp(from_whatsapp)
+    if not me:
+        return ""
     try:
         rows = load_envios_rows(token)
     except Exception:
-        log.exception("community: error cargando padr\u00f3n de %s", token)
+        log.exception("community: error cargando padrón de %s", token)
         return ""
     for row in rows:
-        tel = str(row.get("telefono") or row.get("tel\u00e9fono") or
+        tel = str(row.get("telefono") or row.get("teléfono") or
                   row.get("Telefono") or row.get("whatsapp") or
                   row.get("celular") or row.get("phone") or "").strip()
-        if tel and norm_whatsapp(tel) == me:
-            return norm_cuil(str(row.get("cuil") or row.get("CUIL") or ""))
+        if not tel or norm_whatsapp(tel) != me:
+            continue
+        archivo = strip_pdf(row.get("archivo") or row.get("Archivo") or "")
+        cuil = norm_cuil(archivo)
+        if cuil:
+            return cuil
+        log.warning("COMMUNITY: %s matcheó en %s pero la fila no tiene CUIL válido en 'archivo' (%r)",
+                    me, token, row.get("archivo"))
     return ""
 
 
