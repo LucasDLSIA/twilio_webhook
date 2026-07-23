@@ -8163,7 +8163,7 @@ def admin_community_links():
     for t in load_tenants():
         slug = t.get("slug", "")
         disp = t.get("display_name", slug)
-        text = f"Hola! Quiero mi recibo de {period_legible} [{slug}]"
+        text = f"Hola! Quiero mi recibo {period} [{slug}]"
         link = f"https://wa.me/{num}?text={_q(text)}"
         aviso = (f"\U0001F4C4 Ya est\u00e1 disponible tu recibo de {period_legible}.\n"
                  f"Toc\u00e1 ac\u00e1 para recibirlo por WhatsApp:\n{link}\n"
@@ -12484,7 +12484,7 @@ def _community_worker(from_whatsapp: str, token: str, period_hint: str):
             return
 
         try:
-            available = list_periods_for_cuil(token, cuil) or []
+            available = list_periods_for_cuil2(token, cuil) or []
         except Exception:
             log.exception("community: error listando per\u00edodos")
             available = []
