@@ -12561,13 +12561,28 @@ def _community_worker(from_whatsapp: str, token: str, period_hint: str):
                         f"ℹ️ El recibo de {period_hint} todavía no está disponible. "
                         f"Te envío el último cargado ({period}).")
 
+            # 🔐 Verificación de identidad (DNI) — una sola vez por número/tenant.
+            # Si no está verificado, sembramos AWAIT_DNI y la máquina de estados
+            # existente hace el resto: DNI → T&C (si faltan) → PDF → firma.
+            if not is_verified_contact(token, cuil, from_whatsapp):
+                add_pending_view(from_whatsapp, token, cuil, period, origin="COMMUNITY")
+                p = get_latest_pending_view(from_whatsapp)
+                if p:
+                    set_pending_step(p["id"], "AWAIT_DNI")
+                _community_send_text(from_whatsapp,
+                    "🔐 Para confirmar tu identidad y entregarte tu recibo, "
+                    "enviá tu DNI (solo números, sin puntos). Ej: 28169249")
+                log.info("COMMUNITY: %s sin verificar en %s -> AWAIT_DNI sembrado (%s)",
+                         from_whatsapp, token, period)
+                return
+
             if not has_accepted_terms(from_whatsapp):
                 send_terms_and_conditions(from_whatsapp, token, cuil, period)
                 set_pending_terms_acceptance(from_whatsapp, token, cuil, period, "COMMUNITY")
                 log.info("COMMUNITY: T&C enviados a %s (%s %s)", from_whatsapp, token, period)
                 return
-            
-            sid = _send_pdf_flow(from_whatsapp, token, cuil, period, origin="COMMUNITY")   
+
+            sid = _send_pdf_flow(from_whatsapp, token, cuil, period, origin="COMMUNITY")
             if not sid:
                 _community_send_text(from_whatsapp,
                     "❌ Hubo un error enviando el recibo. Probá de nuevo en unos "
@@ -12588,6 +12603,8 @@ def _community_worker(from_whatsapp: str, token: str, period_hint: str):
     except Exception:
         log.exception("community worker: error inesperado")
 
+
+        
 def handle_community_request(from_whatsapp: str, body: str):
     """
     Si el mensaje trae un [slug] v\u00e1lido, dispara el worker en background y
