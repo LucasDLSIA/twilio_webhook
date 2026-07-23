@@ -12563,9 +12563,10 @@ def _community_worker(from_whatsapp: str, token: str, period_hint: str):
 
             if not has_accepted_terms(from_whatsapp):
                 send_terms_and_conditions(from_whatsapp, token, cuil, period)
+                set_pending_terms_acceptance(from_whatsapp, token, cuil, period, "COMMUNITY")
                 log.info("COMMUNITY: T&C enviados a %s (%s %s)", from_whatsapp, token, period)
                 return
-
+            
             sid = _send_pdf_flow(from_whatsapp, token, cuil, period, origin="COMMUNITY")   
             if not sid:
                 _community_send_text(from_whatsapp,
@@ -13626,6 +13627,16 @@ def _send_pdf_flow(from_whatsapp: str, tenant: str, cuil: str, period: str, orig
     if not file_id:
         return None
 
+    # ✅ Guard: WhatsApp/Twilio rechaza media > 16 MB
+    try:
+        meta = drive_service().files().get(fileId=file_id, fields="size").execute()
+        size_mb = int(meta.get("size", 0)) / (1024 * 1024)
+        if size_mb > 15.5:
+            log.warning("PDF DEMASIADO GRANDE: %s %s %s = %.1f MB (límite 16)",
+                        tenant, cuil, period, size_mb)
+            return None
+    except Exception:
+        log.exception("No pude verificar tamaño del PDF %s", file_id)
 
     # ✅ URL firmada y con vencimiento (ya no viaja ADMIN_TOKEN a Twilio)
     t_q = (tenant or "").strip().lower()
