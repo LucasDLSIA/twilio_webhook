@@ -1469,13 +1469,24 @@ def portal_dashboard():
         conn = get_db_connection()
         cur = conn.cursor()
         
-        # KPIs actuales
+        # Base: empleados del padrón, con fallback a templates (períodos históricos)
         cur.execute("""
             SELECT COUNT(DISTINCT cuil) AS total
             FROM message_status
             WHERE tenant = %s AND period = %s AND kind = 'template'
         """, (tenant, selected_period))
-        enviados = cur.fetchone()['total'] or 0
+        templates_count = cur.fetchone()['total'] or 0
+
+        try:
+            padron_count = len({
+                norm_cuil(strip_pdf(r.get("archivo") or r.get("Archivo") or ""))
+                for r in (load_envios_rows(tenant) or [])
+                if norm_cuil(strip_pdf(r.get("archivo") or r.get("Archivo") or ""))
+            })
+        except Exception:
+            padron_count = 0
+
+        enviados = max(templates_count, padron_count)
 
         cur.execute("""
             SELECT COUNT(DISTINCT cuil) AS total
@@ -1493,15 +1504,15 @@ def portal_dashboard():
 
         # Tiempo promedio de firma
         cur.execute("""
-            SELECT AVG(re.updated_at - ms.created_at) / 86400.0 AS avg_days
+            SELECT AVG(re.updated_at - sp.first_sent) / 86400.0 AS avg_days
             FROM recibo_estado re
-            JOIN message_status ms ON ms.tenant = re.tenant
-                AND ms.cuil = re.cuil
-                AND ms.period = re.period
-                AND ms.kind = 'template'
+            JOIN (SELECT tenant, cuil, period, MIN(created_at) AS first_sent
+                  FROM sent_pdfs GROUP BY tenant, cuil, period) sp
+              ON sp.tenant = re.tenant AND sp.cuil = re.cuil AND sp.period = re.period
             WHERE re.tenant = %s AND re.period = %s
-                AND re.estado IN ('FIRMADO', 'OBSERVADO')
+              AND re.estado IN ('FIRMADO', 'OBSERVADO')
         """, (tenant, selected_period))
+        
         avg_days = cur.fetchone()['avg_days']
         avg_days = round(avg_days, 1) if avg_days else 0
         
@@ -1529,7 +1540,7 @@ def portal_dashboard():
                 FROM message_status
                 WHERE tenant = %s AND period = %s AND kind = 'template'
             """, (tenant, p))
-            env = cur.fetchone()['total'] or 0
+            env = max(cur.fetchone()['total'] or 0, padron_count)
 
             cur.execute("""
                 SELECT COUNT(DISTINCT cuil) AS total
@@ -1692,12 +1703,12 @@ def portal_dashboard():
         
         html.append("<div class='stat'>")
         html.append(f"<div class='stat-value'>{kpis['enviados']}</div>")
-        html.append("<div class='stat-label'>📤 Enviados</div>")
+        html.append("<div class='stat-label'>👥 Empleados</div>")
         html.append("</div>")
         
         html.append("<div class='stat'>")
         html.append(f"<div class='stat-value'>{kpis['pct_vistos']}%</div>")
-        html.append("<div class='stat-label'>👁️ Tasa de apertura</div>")
+        html.append("<div class='stat-label'>Recibieron el recibo</div>")
         html.append("</div>")
         
         html.append("<div class='stat'>")
@@ -3790,29 +3801,52 @@ def portal_pendientes():
     """
     Ver pendientes en el portal de clientes.
     """
-    # Verificar login
     auth = require_portal_login()
     if auth:
         return auth
-    
+
     user_id = session.get('portal_user_id')
     user = get_portal_user_by_id(user_id)
     tenant = user['tenant']
-    
+
     period = request.args.get("period", "")
-    
-    # Obtener info del tenant
+
     t = get_tenant(tenant)
     empresa_nombre = t.get('display_name', tenant) if t else tenant
-    
-    # Obtener pendientes
-    pending_views = []
+
+    # ✅ NUEVO: "no retiraron" = padrón sin PDF entregado en el período
+    no_retiraron = []
     pending_sigs = []
-    
+
     if period:
-        pending_views = get_pending_views_over_7days(tenant, period)
+        entregados = set()
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT DISTINCT cuil FROM sent_pdfs
+            WHERE tenant = %s AND period = %s
+        """, (tenant, norm_period_label(period)))
+        entregados = {norm_cuil(r["cuil"]) for r in cur.fetchall()}
+        cur.close()
+        conn.close()
+
+        try:
+            for r in (load_envios_rows(tenant) or []):
+                c = norm_cuil(strip_pdf(r.get("archivo") or r.get("Archivo") or ""))
+                if not c or c in entregados:
+                    continue
+                no_retiraron.append({
+                    "nombre": " ".join(str(r.get("nombre") or r.get("Nombre") or "").split()).title(),
+                    "cuil": c,
+                    "whatsapp": str(r.get("telefono") or r.get("teléfono") or
+                                    r.get("Telefono") or "").strip(),
+                })
+        except Exception:
+            log.exception("portal_pendientes: error cargando padrón de %s", tenant)
+
+        no_retiraron.sort(key=lambda x: x["nombre"])
         pending_sigs = get_pending_signatures_over_7days(tenant, period)
-    
+
     html = []
     html.append("""<!doctype html>
 <html lang="es">
@@ -3850,12 +3884,12 @@ def portal_pendientes():
     <img src="/static/icon-192.png" alt="SIA Sueldos">
     <span class="top-logo-text">SIA</span>
   </div>
-  
+
   <div class="container">
     <div class="header">
       <a href="/portal" class="btn">← Volver al dashboard</a>
     </div>
-    
+
     <div class="card">
       <h2>⚠️ Pendientes</h2>
       <div class="muted" style="margin-bottom:16px">
@@ -3863,41 +3897,40 @@ def portal_pendientes():
       </div>
     </div>
 """)
-    
-    # No vieron (>7 días)
+
+    # No retiraron su recibo
     html.append("<div class='card'>")
     html.append("<div class='section-header'>")
     html.append("<div>")
-    html.append("<h2>🔴 No vieron el recibo</h2>")
-    html.append("<div class='muted'>Template enviado hace más de 7 días, nunca pidieron el PDF</div>")
+    html.append("<h2>🔴 No retiraron su recibo</h2>")
+    html.append("<div class='muted'>Figuran en el padrón pero todavía no pidieron el PDF de este período</div>")
     html.append("</div>")
-    html.append(f"<span class='badge badge-error'>{len(pending_views)}</span>")
+    html.append(f"<span class='badge badge-error'>{len(no_retiraron)}</span>")
     html.append("</div>")
-    
-    if pending_views:
+
+    if no_retiraron:
         html.append("<table>")
         html.append("<thead><tr>")
-        html.append("<th>Empleado</th><th>CUIL</th><th>WhatsApp</th><th>Hace</th>")
+        html.append("<th>Empleado</th><th>CUIL</th><th>WhatsApp</th>")
         html.append("</tr></thead><tbody>")
-        
-        for p in pending_views[:20]:  # Limitar a 20
+
+        for p in no_retiraron[:20]:
             html.append("<tr>")
             html.append(f"<td>{esc(p.get('nombre', ''))}</td>")
             html.append(f"<td>{esc(p.get('cuil', ''))}</td>")
             html.append(f"<td>{esc(p.get('whatsapp', ''))}</td>")
-            html.append(f"<td>{p.get('days_ago', 0)} días</td>")
             html.append("</tr>")
-        
+
         html.append("</tbody></table>")
-        
-        if len(pending_views) > 20:
-            html.append(f"<div class='muted' style='margin-top:12px; text-align:center'>... y {len(pending_views) - 20} más</div>")
+
+        if len(no_retiraron) > 20:
+            html.append(f"<div class='muted' style='margin-top:12px; text-align:center'>... y {len(no_retiraron) - 20} más</div>")
     else:
-        html.append("<div class='empty'>✅ No hay pendientes en esta categoría</div>")
-    
+        html.append("<div class='empty'>✅ Todos retiraron su recibo</div>")
+
     html.append("</div>")
-    
-    # No firmaron (>7 días)
+
+    # No firmaron (>7 días) — igual que antes
     html.append("<div class='card'>")
     html.append("<div class='section-header'>")
     html.append("<div>")
@@ -3906,34 +3939,35 @@ def portal_pendientes():
     html.append("</div>")
     html.append(f"<span class='badge badge-warning'>{len(pending_sigs)}</span>")
     html.append("</div>")
-    
+
     if pending_sigs:
         html.append("<table>")
         html.append("<thead><tr>")
         html.append("<th>Empleado</th><th>CUIL</th><th>WhatsApp</th><th>Hace</th>")
         html.append("</tr></thead><tbody>")
-        
-        for p in pending_sigs[:20]:  # Limitar a 20
+
+        for p in pending_sigs[:20]:
             html.append("<tr>")
             html.append(f"<td>{esc(p.get('nombre', ''))}</td>")
             html.append(f"<td>{esc(p.get('cuil', ''))}</td>")
             html.append(f"<td>{esc(p.get('whatsapp', ''))}</td>")
             html.append(f"<td>{p.get('days_ago', 0)} días</td>")
             html.append("</tr>")
-        
+
         html.append("</tbody></table>")
-        
+
         if len(pending_sigs) > 20:
             html.append(f"<div class='muted' style='margin-top:12px; text-align:center'>... y {len(pending_sigs) - 20} más</div>")
     else:
         html.append("<div class='empty'>✅ No hay pendientes en esta categoría</div>")
-    
+
     html.append("</div>")
-    
+
     html.append("</div>")
     html.append("</body></html>")
-    
+
     return Response("".join(html), mimetype="text/html")
+
 
 @app.route("/portal/logout")
 def portal_logout():
@@ -8683,7 +8717,20 @@ def ts_to_str(ts) -> str:
         return ""
 
 
-
+def _fill_nombres_from_padron(tenant: str, agg: dict):
+    """Completa nombres vacíos en el agregado del reporte usando el padrón del Excel."""
+    try:
+        nombre_by_cuil = {}
+        for r in (load_envios_rows(tenant) or []):
+            c = norm_cuil(strip_pdf(r.get("archivo") or r.get("Archivo") or ""))
+            n = " ".join(str(r.get("nombre") or r.get("Nombre") or "").split())
+            if c and n:
+                nombre_by_cuil[c] = n.title()
+        for rec in agg.values():
+            if not (rec.get("nombre") or "").strip():
+                rec["nombre"] = nombre_by_cuil.get(rec.get("cuil", ""), "")
+    except Exception:
+        log.exception("No pude completar nombres desde el padrón (%s)", tenant)
 
 
 
@@ -8847,6 +8894,9 @@ def generate_excel_report_v2(tenant: str, period_filter: str = "") -> BytesIO:
         if rr:
             rec["pedidos_recibo"] = rr["count"]
             rec["ultimo_pedido"] = rr["last"]
+
+    # ✅ Completar nombres faltantes (envíos por comunidad) desde el padrón
+    _fill_nombres_from_padron(tenant, agg)
 
     # Excel
     wb = Workbook()
@@ -12571,7 +12621,7 @@ def _community_worker(from_whatsapp: str, token: str, period_hint: str):
                     set_pending_step(p["id"], "AWAIT_DNI")
                 _community_send_text(from_whatsapp,
                     "🔐 Para confirmar tu identidad y entregarte tu recibo, "
-                    "enviá tu DNI (solo números, sin puntos). Ej: 28169249")
+                    "enviá tu DNI (solo números, sin puntos). Ej: 40123456")
                 log.info("COMMUNITY: %s sin verificar en %s -> AWAIT_DNI sembrado (%s)",
                          from_whatsapp, token, period)
                 return
