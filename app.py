@@ -3474,22 +3474,33 @@ def portal_reports():
         if action == "export_all":
             ws.title = "Todos"
             ws.append(["Nombre", "CUIL", "WhatsApp", "Estado", "Enviado", "Visto", "Firmado"])
-            
-            # Obtener solo los CUILs que tienen template enviado
-            cur.execute("""
-                SELECT DISTINCT cuil FROM message_status
-                WHERE tenant = %s AND period = %s AND kind = 'template'
-                ORDER BY cuil
-            """, (tenant, period))
-            cuils = [r['cuil'] for r in cur.fetchall()]
+
+            # ✅ Base: todo el padrón del colegio
+            cuils, _seen = [], set()
+            for r in (load_envios_rows(tenant) or []):
+                c = norm_cuil(strip_pdf(r.get("archivo") or r.get("Archivo") or ""))
+                if c and c not in _seen:
+                    _seen.add(c)
+                    cuils.append(c)
             
         elif action == "export_pending_views":
-            ws.title = "No vieron"
-            ws.append(["Nombre", "CUIL", "WhatsApp", "Enviado hace", "Días sin ver"])
-            
-            pending = get_pending_views_over_7days(tenant, period)
-            cuils = [p['cuil'] for p in pending]
-            
+            ws.title = "No retiraron"
+            ws.append(["Nombre", "CUIL", "WhatsApp"])
+
+            # ✅ Padrón menos quienes ya recibieron el PDF del período
+            cur.execute("""
+                SELECT DISTINCT cuil FROM sent_pdfs
+                WHERE tenant = %s AND period = %s
+            """, (tenant, period))
+            entregados = {norm_cuil(r['cuil']) for r in cur.fetchall()}
+
+            cuils, _seen = [], set()
+            for r in (load_envios_rows(tenant) or []):
+                c = norm_cuil(strip_pdf(r.get("archivo") or r.get("Archivo") or ""))
+                if c and c not in _seen and c not in entregados:
+                    _seen.add(c)
+                    cuils.append(c)
+
         elif action == "export_pending_sigs":
             ws.title = "No firmaron"
             ws.append(["Nombre", "CUIL", "WhatsApp", "PDF enviado", "Días sin firmar"])
@@ -3544,7 +3555,7 @@ def portal_reports():
                     status = "ENVIADO"
                     firmado_fecha = ""
                 else:
-                    status = "NO_ENVIADO"
+                    status = "PENDIENTE"
                     firmado_fecha = ""
 
                 enviado_fecha = ts_str(template_row['created_at']) if template_row else ""
@@ -3553,18 +3564,7 @@ def portal_reports():
                 ws.append([nombre, cuil, whatsapp, status, enviado_fecha, visto_fecha, firmado_fecha])
             
             elif action == "export_pending_views":
-                # Solo los que no vieron
-                cur.execute("""
-                    SELECT created_at FROM message_status
-                    WHERE tenant = %s AND cuil = %s AND period = %s AND kind = 'template'
-                    LIMIT 1
-                """, (tenant, cuil, period))
-                template_row = cur.fetchone()
-                
-                enviado_fecha = ts_str(template_row['created_at']) if template_row else ""
-                days_ago = int((time.time() - template_row['created_at']) / 86400) if template_row else 0
-
-                ws.append([nombre, cuil, whatsapp, enviado_fecha, days_ago])
+                ws.append([nombre, cuil, whatsapp])
 
             elif action == "export_pending_sigs":
                 # Solo los que no firmaron
@@ -3611,7 +3611,18 @@ def portal_reports():
             SELECT COUNT(DISTINCT cuil) AS total FROM message_status
             WHERE tenant = %s AND period = %s AND kind = 'template'
         """, (tenant, period))
-        enviados = cur.fetchone()['total'] or 0
+        templates_count = cur.fetchone()['total'] or 0
+
+        try:
+            padron_count = len({
+                norm_cuil(strip_pdf(r.get("archivo") or r.get("Archivo") or ""))
+                for r in (load_envios_rows(tenant) or [])
+                if norm_cuil(strip_pdf(r.get("archivo") or r.get("Archivo") or ""))
+            })
+        except Exception:
+            padron_count = 0
+
+        enviados = max(templates_count, padron_count)
 
         cur.execute("""
             SELECT COUNT(DISTINCT cuil) AS total FROM sent_pdfs
@@ -3627,15 +3638,15 @@ def portal_reports():
 
         # Tiempo promedio de firma
         cur.execute("""
-            SELECT AVG(re.updated_at - ms.created_at) / 86400.0 AS avg_days
+            SELECT AVG(re.updated_at - sp.first_sent) / 86400.0 AS avg_days
             FROM recibo_estado re
-            JOIN message_status ms ON ms.tenant = re.tenant
-                AND ms.cuil = re.cuil
-                AND ms.period = re.period
-                AND ms.kind = 'template'
+            JOIN (SELECT tenant, cuil, period, MIN(created_at) AS first_sent
+                  FROM sent_pdfs GROUP BY tenant, cuil, period) sp
+              ON sp.tenant = re.tenant AND sp.cuil = re.cuil AND sp.period = re.period
             WHERE re.tenant = %s AND re.period = %s
-                AND re.estado IN ('FIRMADO', 'OBSERVADO')
+              AND re.estado IN ('FIRMADO', 'OBSERVADO')
         """, (tenant, period))
+
         avg_days = cur.fetchone()['avg_days']
         avg_days = round(avg_days, 1) if avg_days else 0
         
@@ -3723,12 +3734,12 @@ def portal_reports():
         
         html.append("<div class='stat'>")
         html.append(f"<div class='stat-value'>{stats['enviados']}</div>")
-        html.append("<div class='stat-label'>📤 Enviados</div>")
+        html.append("<div class='stat-label'>👥 Empleados</div>")
         html.append("</div>")
         
         html.append("<div class='stat'>")
         html.append(f"<div class='stat-value'>{stats['pct_vistos']}%</div>")
-        html.append("<div class='stat-label'>👁️ Tasa de apertura</div>")
+        html.append("<div class='stat-label'>📤Recibieron el recibo</div>")
         html.append("</div>")
         
         html.append("<div class='stat'>")
@@ -3773,8 +3784,8 @@ def portal_reports():
         
         html.append("<div class='download-card'>")
         html.append("<div class='download-info'>")
-        html.append("<h3>🔴 Excel - Solo no vieron</h3>")
-        html.append("<p>Empleados que no pidieron el PDF (>7 días)</p>")
+        html.append("<h3>🔴 Excel - No retiraron</h3>")
+        html.append("<p>Empleados del padrón que aún no pidieron su recibo</p>")
         html.append("</div>")
         html.append(f"<a href='/portal/reports?period={esc(period)}&action=export_pending_views' class='btn primary'>Descargar Excel</a>")
         html.append("</div>")
