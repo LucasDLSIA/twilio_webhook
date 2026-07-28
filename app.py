@@ -6212,6 +6212,20 @@ def generate_pdf_report_v2(tenant: str, period_filter: str = ""):
                 rec["Ultimo_pedido"] = ts_to_str(ts) if ts else ""
             rec["_last_ts"] = max(rec["_last_ts"], ts)
 
+    # ✅ Completar nombres faltantes (envíos por comunidad) desde el padrón
+    try:
+        nombre_by_cuil = {}
+        for r in (load_envios_rows(tenant) or []):
+            c = norm_cuil(strip_pdf(r.get("archivo") or r.get("Archivo") or ""))
+            n = " ".join(str(r.get("nombre") or r.get("Nombre") or "").split())
+            if c and n:
+                nombre_by_cuil[c] = n.title()
+        for rec in agg.values():
+            if not (rec.get("Nombre") or "").strip():
+                rec["Nombre"] = nombre_by_cuil.get(rec.get("CUIL", ""), "")
+    except Exception:
+        log.exception("PDF report: no pude completar nombres desde el padrón")
+        
     rows = list(agg.values())
 
     # ========= Estado ÚNICO con jerarquía =========
