@@ -8929,35 +8929,48 @@ def generate_excel_report_v2(tenant: str, period_filter: str = "") -> BytesIO:
     ws.title = "Recibos"
 
     headers = [
-        "Periodo","Nombre","CUIL","WhatsApp",
-        "Plantilla_enviada","Plantilla_entregada","Plantilla_leida","Plantilla_fallida",
-        "PDF_enviado","PDF_entregado","PDF_leido","PDF_fallido",
-        "Respuesta_usuario","Respuesta_timestamp",
-        "Pedidos_recibo","Ultimo_pedido"
+        "Periodo","Nombre","CUIL","WhatsApp","Estado",
+        "PDF_enviado","PDF_entregado","PDF_leido",
+        "Respuesta_fecha","Pedidos","Ultimo_pedido",
+        "Aviso_plantilla","Fallo"
     ]
     ws.append(headers)
+
+    def _estado_de(rec):
+        resp = (rec.get("respuesta_usuario") or "").strip().upper()
+        if resp in ("FIRMADO", "OBSERVADO", "NO_NEED"):
+            return resp
+        if rec.get("pdf_read_at"):
+            return "LEIDO"
+        if rec.get("pdf_delivered_at"):
+            return "ENTREGADO"
+        if rec.get("pdf_sent_at"):
+            return "ENVIADO"
+        if rec.get("pdf_failed_at") or rec.get("plantilla_failed_at"):
+            return "FALLIDO"
+        if rec.get("plantilla_sent_at"):
+            return "AVISADO"
+        return "PENDIENTE"
 
     items = list(agg.values())
     items.sort(key=lambda r: (r.get("periodo") or "", r.get("nombre") or "", r.get("whatsapp") or ""))
 
     for rec in items:
+        fallo = ts_to_str(rec.get("pdf_failed_at")) or ts_to_str(rec.get("plantilla_failed_at"))
         ws.append([
             rec.get("periodo",""),
             rec.get("nombre",""),
             rec.get("cuil",""),
             rec.get("whatsapp",""),
-            ts_to_str(rec.get("plantilla_sent_at")),
-            ts_to_str(rec.get("plantilla_delivered_at")),
-            ts_to_str(rec.get("plantilla_read_at")),
-            ts_to_str(rec.get("plantilla_failed_at")),
+            _estado_de(rec),
             ts_to_str(rec.get("pdf_sent_at")),
             ts_to_str(rec.get("pdf_delivered_at")),
             ts_to_str(rec.get("pdf_read_at")),
-            ts_to_str(rec.get("pdf_failed_at")),
-            rec.get("respuesta_usuario",""),
             ts_to_str(rec.get("respuesta_timestamp")),
             int(rec.get("pedidos_recibo") or 0),
             ts_to_str(rec.get("ultimo_pedido")),
+            ts_to_str(rec.get("plantilla_sent_at")),
+            fallo,
         ])
 
     for col in ws.columns:
