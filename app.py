@@ -1829,7 +1829,7 @@ new Chart(ctx1, {
         fill: true
       },
       {
-        label: 'Enviados',
+        label: 'Empleados',
         data: chartData.enviados,
         borderColor: colors.primary,
         backgroundColor: 'rgba(46, 59, 142, 0.1)',
@@ -6032,12 +6032,13 @@ def generate_pdf_report_v2(tenant: str, period_filter: str = ""):
     """
     Página 1: KPIs + 1 donut (Estados por jerarquía)
     Página 2+: Tabla con TODAS las personas (sin recortes) y sin duplicar "FIRMADO"
-    Jerarquía: FIRMADO > OBSERVADO > PEND. RESPUESTA > PEND. ENVÍO
-    Latest-wins por timestamps.
+    Jerarquía: FIRMADO > OBSERVADO > PEND. RESPUESTA > FALLIDO > PEND. RETIRO
+    Latest-wins por timestamps. Incluye padrón completo (personas sin actividad
+    aparecen como PEND. RETIRO) cuando hay period_filter.
     """
     from io import BytesIO
     import time
-    
+
 
     from reportlab.lib.pagesizes import A4, landscape
     from reportlab.lib.units import cm
@@ -6225,8 +6226,28 @@ def generate_pdf_report_v2(tenant: str, period_filter: str = ""):
                 rec["Nombre"] = nombre_by_cuil.get(rec.get("CUIL", ""), "")
     except Exception:
         log.exception("PDF report: no pude completar nombres desde el padrón")
-        
+
     rows = list(agg.values())
+
+    # ✅ Sembrar el padrón: personas sin actividad aparecen como PEND. RETIRO
+    if period_filter:
+        try:
+            existentes = {(rec.get("CUIL") or "") for rec in rows}
+            for r in (load_envios_rows(tenant) or []):
+                c = norm_cuil(strip_pdf(r.get("archivo") or r.get("Archivo") or ""))
+                if not c or c in existentes:
+                    continue
+                existentes.add(c)
+                nom = " ".join(str(r.get("nombre") or r.get("Nombre") or "").split()).title()
+                tel = str(r.get("telefono") or r.get("teléfono") or r.get("Telefono") or "").strip()
+                rows.append({
+                    "Periodo": period_filter, "Nombre": nom, "CUIL": c,
+                    "WhatsApp": tel, "Respuesta": "", "Pedidos": 0, "Ultimo_pedido": "",
+                    "_sent_ts": 0, "_delivered_ts": 0, "_read_ts": 0, "_failed_ts": 0,
+                    "_last_ts": 0,
+                })
+        except Exception:
+            log.exception("PDF report: no pude sembrar padrón")
 
     # ========= Estado ÚNICO con jerarquía =========
     def classify_status(r: dict) -> str:
@@ -6246,8 +6267,9 @@ def generate_pdf_report_v2(tenant: str, period_filter: str = ""):
 
         if any_sent:
             return "PEND. RESPUESTA"
-
-        return "PEND. ENVÍO"
+        if _safe_int(r.get("_failed_ts")) > 0:
+            return "FALLIDO"
+        return "PEND. RETIRO"
 
     for r in rows:
         r["_status"] = classify_status(r)
@@ -6258,9 +6280,8 @@ def generate_pdf_report_v2(tenant: str, period_filter: str = ""):
     c_firm = count_status("FIRMADO")
     c_obs = count_status("OBSERVADO")
     c_presp = count_status("PEND. RESPUESTA")
-    c_penv = count_status("PEND. ENVÍO")
-    c_plec = count_status("PEND. LECTURA")
-    c_ok = count_status("OK")
+    c_penv = count_status("PEND. RETIRO")
+    c_fall = count_status("FALLIDO")
 
     # ========= Donut estados =========
     def donut_png(labels, values, title):
@@ -6272,9 +6293,8 @@ def generate_pdf_report_v2(tenant: str, period_filter: str = ""):
             "Firmados": "#22c55e",
             "Observados": "#f59e0b",
             "Pend. respuesta": "#3b82f6",
-            "Pend. envío": "#ef4444",
-            "Pend. lectura": "#a855f7",
-            "OK": "#64748b",
+            "Pend. retiro": "#ef4444",
+            "Fallidos": "#7f1d1d",
             "Sin datos": "#cbd5e1",
         }
 
@@ -6345,14 +6365,11 @@ def generate_pdf_report_v2(tenant: str, period_filter: str = ""):
         buf.seek(0)
         return buf
 
-    labels_est = ["Firmados", "Observados", "Pend. respuesta", "Pend. envío"]
+    labels_est = ["Firmados", "Observados", "Pend. respuesta", "Pend. retiro"]
     values_est = [c_firm, c_obs, c_presp, c_penv]
-    if c_plec:
-        labels_est.append("Pend. lectura")
-        values_est.append(c_plec)
-    if c_ok:
-        labels_est.append("OK")
-        values_est.append(c_ok)
+    if c_fall:
+        labels_est.append("Fallidos")
+        values_est.append(c_fall)
 
     donut_estados = donut_png(labels_est, values_est, "Estados (jerarquía)")
 
@@ -6361,9 +6378,8 @@ def generate_pdf_report_v2(tenant: str, period_filter: str = ""):
         "FIRMADO": 1,
         "OBSERVADO": 2,
         "PEND. RESPUESTA": 3,
-        "PEND. ENVÍO": 4,
-        "PEND. LECTURA": 5,
-        "OK": 6,
+        "FALLIDO": 4,
+        "PEND. RETIRO": 5,
     }
     rows_sorted = sorted(
         rows,
@@ -6442,9 +6458,8 @@ def generate_pdf_report_v2(tenant: str, period_filter: str = ""):
         ("Firmados", c_firm),
         ("Observados", c_obs),
         ("Pend. respuesta", c_presp),
-        ("Pend. envío", c_penv),
-        ("Pend. lectura", c_plec),
-        ("OK", c_ok),
+        ("Pend. retiro", c_penv),
+        ("Fallidos", c_fall),
         ("Total", len(rows)),
     ])
 
@@ -6537,7 +6552,6 @@ def generate_pdf_report_v2(tenant: str, period_filter: str = ""):
     doc.build(story, onFirstPage=on_page, onLaterPages=on_page)
     out.seek(0)
     return out
-
 
 @app.get("/admin/report_recibos.pdf")
 @admin_required
