@@ -168,17 +168,17 @@ def norm_whatsapp(s: str) -> str:
     d = norm_digits(s)
     if not d:
         return ""
-
-    # ya viene correcto
     if d.startswith("549"):
         return "whatsapp:+" + d
-
-    # viene con 54 pero sin 9
     if d.startswith("54"):
         return "whatsapp:+549" + d[2:]
-
-    # número local
+    # ✅ internacional no argentino (595 Paraguay, 598 Uruguay, 1 US, etc.):
+    #    11+ dígitos = ya trae código de país
+    if len(d) >= 11:
+        return "whatsapp:+" + d
+    # número local argentino (10 dígitos o menos)
     return "whatsapp:+549" + d
+
 
 def parse_period_folder(name: str) -> Optional[str]:
     """
