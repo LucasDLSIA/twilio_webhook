@@ -8614,14 +8614,19 @@ def normalize_whatsapp(raw: str) -> str | None:
     return f"whatsapp:+549{d}"
 
 
-def ts_str(ts: int | None) -> str:
+from zoneinfo import ZoneInfo
+
+TZ_AR = ZoneInfo("America/Argentina/Buenos_Aires")
+
+def ts_str(ts) -> str:
+    try:
+        ts = int(ts or 0)
+    except Exception:
+        return ""
     if not ts:
         return ""
-    try:
-        return time.strftime("%d/%m/%Y %H:%M", time.gmtime(int(ts)))
-    except Exception:
-        return str(ts)
-
+    from datetime import datetime
+    return datetime.fromtimestamp(ts, TZ_AR).strftime("%d/%m/%Y %H:%M")
 
 @app.post("/admin/verifications_import")
 @admin_required
@@ -8750,11 +8755,10 @@ def ts_to_str(ts) -> str:
         if ts_f > 10_000_000_000:
             ts_f = ts_f / 1000.0
 
-        return dt.datetime.fromtimestamp(int(ts_f)).strftime("%d/%m/%Y %H:%M:%S")
+        return dt.datetime.fromtimestamp(int(ts_f), TZ_AR).strftime("%d/%m/%Y %H:%M:%S")
     except Exception as e:
         log.exception("%s %s %s", "ts_to_str ERROR:", ts, repr(e))
         return ""
-
 
 def _fill_nombres_from_padron(tenant: str, agg: dict):
     """Completa nombres vacíos en el agregado del reporte usando el padrón del Excel."""
@@ -10359,7 +10363,7 @@ def _fmt_ts(ts: int | None) -> str:
     if not ts:
         return ""
     # tu server está en UTC, si querés BA: ajustá acá (UTC-3) o dejalo así
-    return datetime.datetime.fromtimestamp(int(ts), datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+    return datetime.datetime.fromtimestamp(int(ts), TZ_AR).strftime("%Y-%m-%d %H:%M:%S")
 
 @app.route("/admin/reenviar_template", methods=["GET", "POST"])
 def admin_reenviar_template():
@@ -10929,9 +10933,9 @@ def upload_certificado_to_drive(tenant: str, cuil: str, data: bytes, content_typ
     else:
         ext = "bin"
  
-    now = time.localtime()
-    fecha = time.strftime("%Y-%m-%d", now)
-    hora = time.strftime("%H%M%S", now)
+    now = dt.datetime.now(TZ_AR)
+    fecha = now.strftime("%Y-%m-%d")
+    hora = now.strftime("%H%M%S")
     file_name = f"{cuil}_{fecha}_{hora}.{ext}"
  
     service = drive_service()
@@ -12320,7 +12324,7 @@ def send_whatsapp_menu_template(to_whatsapp: str, nombre: str = "") -> str | Non
 def list_previous_periods_excluding_current(tenant: str, cuil: str, limit: int = 3) -> list[str]:
     import datetime as _dt
 
-    now = _dt.datetime.now()
+    now = _dt.datetime.now(TZ_AR)
     current = f"{now.month:02d}/{now.year:04d}"   # ej "03/2026"
 
     periods = list_periods_for_cuil2(tenant, cuil) or []  # ya viene ordenado desc
